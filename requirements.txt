@@ -1,2 +1,2 @@
-python-telegram-bot>=21.10,<23
+python-telegram-bot[webhooks]>=21.10,<23
 psycopg[binary,pool]>=3.2,<4

@@ -15,17 +15,23 @@ logger = logging.getLogger("bpsc_nexus_bot")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+PORT = int(os.environ.get("PORT", "10000"))
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 pool: AsyncConnectionPool | None = None
 
 
 async def post_init(application: Application) -> None:
-    """Open the database pool and verify the connection at startup."""
     global pool
 
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is missing.")
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL environment variable is missing.")
+    if not RENDER_EXTERNAL_URL.startswith("https://"):
+        raise RuntimeError("RENDER_EXTERNAL_URL must be the HTTPS URL assigned by Render.")
+    if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 16:
+        raise RuntimeError("Set WEBHOOK_SECRET to a random string of at least 16 characters.")
 
     pool = AsyncConnectionPool(
         conninfo=DATABASE_URL,
@@ -42,7 +48,6 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    """Close database resources during a clean shutdown."""
     global pool
     if pool is not None:
         await pool.close()
@@ -51,10 +56,10 @@ async def post_shutdown(application: Application) -> None:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if user is None or update.effective_chat is None:
+    message = update.effective_message
+    if user is None or message is None:
         return
 
-    # Save/update the Telegram profile. Never ask users for a separate password.
     if pool is not None:
         async with pool.connection() as conn:
             await conn.execute(
@@ -68,7 +73,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 (user.id, user.first_name, user.username),
             )
 
-    await update.effective_message.reply_text(
+    await message.reply_text(
         "Welcome to BPSC Nexus | Prelims Test Series!\n\n"
         "Use /tests to browse published tests.\n"
         "Use /help to see available commands.\n\n"
@@ -77,20 +82,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "BPSC Nexus Test Series — commands\n\n"
-        "/start — Register and open the bot\n"
-        "/tests — Browse published tests\n"
-        "/help — Show this help\n\n"
-        "More features, including test attempts and result analysis, will be added next."
-    )
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "BPSC Nexus Test Series — commands\n\n"
+            "/start — Register and open the bot\n"
+            "/tests — Browse published tests\n"
+            "/help — Show this help\n\n"
+            "Interactive attempts, timers and detailed results are planned for the next stage."
+        )
 
 
 async def tests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
     if pool is None:
-        await update.effective_message.reply_text(
-            "The test catalogue is temporarily unavailable. Please try again shortly."
-        )
+        await message.reply_text("The test catalogue is temporarily unavailable. Please try again shortly.")
         return
 
     async with pool.connection() as conn:
@@ -106,9 +113,7 @@ async def tests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         tests = await cursor.fetchall()
 
     if not tests:
-        await update.effective_message.reply_text(
-            "No tests have been published yet. Please check again later."
-        )
+        await message.reply_text("No tests have been published yet. Please check again later.")
         return
 
     lines = ["Published tests", ""]
@@ -122,9 +127,8 @@ async def tests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if test["description"]:
             lines.append(str(test["description"])[:250])
         lines.append("")
-
-    lines.append("Test catalogue only — interactive attempts are the next development stage.")
-    await update.effective_message.reply_text("\n".join(lines))
+    lines.append("Interactive test attempts will be added in the next development stage.")
+    await message.reply_text("\n".join(lines))
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -136,6 +140,8 @@ def main() -> None:
         raise SystemExit("Set BOT_TOKEN in the hosting environment.")
     if not DATABASE_URL:
         raise SystemExit("Set DATABASE_URL in the hosting environment.")
+    if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 16:
+        raise SystemExit("Set WEBHOOK_SECRET to a random string of at least 16 characters.")
 
     application = (
         Application.builder()
@@ -149,8 +155,16 @@ def main() -> None:
     application.add_handler(CommandHandler("tests", tests_command))
     application.add_error_handler(error_handler)
 
-    logger.info("Starting BPSC Nexus Telegram bot.")
-    application.run_polling(drop_pending_updates=False)
+    logger.info("Starting BPSC Nexus Telegram bot in webhook mode.")
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path="telegram",
+        webhook_url=f"{RENDER_EXTERNAL_URL}/telegram",
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=False,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":

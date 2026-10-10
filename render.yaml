@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: bpsc-nexus-test-series
     runtime: python
     buildCommand: pip install -r requirements.txt
@@ -10,3 +10,5 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true

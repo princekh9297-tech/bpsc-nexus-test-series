@@ -1,5 +1,5 @@
--- Run this only in the dedicated BPSC Nexus Neon project.
--- If you already created these tables, do not run this file again unnecessarily.
+-- Run only in the dedicated BPSC Nexus Neon project.
+-- If these tables already exist, do not rerun unnecessarily.
 
 CREATE TABLE IF NOT EXISTS app_users (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -15,8 +15,7 @@ CREATE TABLE IF NOT EXISTS tests (
     description TEXT,
     test_type TEXT NOT NULL DEFAULT 'mock'
         CHECK (test_type IN ('pyq', 'subject', 'mock')),
-    duration_minutes INTEGER NOT NULL DEFAULT 120
-        CHECK (duration_minutes > 0),
+    duration_minutes INTEGER NOT NULL DEFAULT 120 CHECK (duration_minutes > 0),
     total_marks NUMERIC(8,2) NOT NULL DEFAULT 150,
     marks_per_correct NUMERIC(6,2) NOT NULL DEFAULT 1,
     negative_marks NUMERIC(6,2) NOT NULL DEFAULT 0,
@@ -29,13 +28,11 @@ CREATE TABLE IF NOT EXISTS questions (
     subject TEXT NOT NULL,
     question_en TEXT NOT NULL,
     question_hi TEXT NOT NULL,
-    options JSONB NOT NULL,
-    correct_option CHAR(1) NOT NULL
-        CHECK (correct_option IN ('A', 'B', 'C', 'D', 'E')),
+    options JSONB NOT NULL CHECK (jsonb_typeof(options) = 'object'),
+    correct_option CHAR(1) NOT NULL CHECK (correct_option IN ('A','B','C','D','E')),
     explanation_en TEXT,
     explanation_hi TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CHECK (jsonb_typeof(options) = 'object')
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS test_questions (
@@ -64,7 +61,7 @@ CREATE TABLE IF NOT EXISTS attempt_answers (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     attempt_id BIGINT NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
     question_id BIGINT NOT NULL REFERENCES questions(id) ON DELETE RESTRICT,
-    selected_option CHAR(1) CHECK (selected_option IN ('A', 'B', 'C', 'D', 'E')),
+    selected_option CHAR(1) CHECK (selected_option IN ('A','B','C','D','E')),
     is_correct BOOLEAN,
     answered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (attempt_id, question_id)
