@@ -131,7 +131,28 @@ async def _result_payload(conn, attempt_id: int, telegram_id: int):
 
 
 async def index(request):
-    return web.FileResponse(ROOT / "static" / "index.html")
+    # Resolve frontend relative to this file, not the process working directory.
+    page = ROOT / "static" / "index.html"
+    if not page.is_file():
+        log.error("Mini App frontend missing at %s", page)
+        return web.Response(
+            text="BPSC Nexus Mini App frontend is missing. Ensure static/index.html is committed to the deployment repository.",
+            status=500,
+            content_type="text/plain",
+        )
+    response = web.FileResponse(page)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+async def static_asset(request):
+    # Static assets are public; API routes remain protected by Telegram initData auth.
+    asset_path = (ROOT / "static" / request.match_info["filename"]).resolve()
+    static_root = (ROOT / "static").resolve()
+    if static_root not in asset_path.parents or not asset_path.is_file():
+        raise web.HTTPNotFound(text="Static asset not found")
+    return web.FileResponse(asset_path)
 
 
 async def health(request):
@@ -316,6 +337,7 @@ async def cleanup(app):
 def make_app():
     app = web.Application(middlewares=[telegram_auth], client_max_size=1024 * 1024)
     app.router.add_get("/", index)
+    app.router.add_get("/static/{filename}", static_asset)
     app.router.add_get("/healthz", health)
     app.router.add_get("/api/quizzes", list_quizzes)
     app.router.add_post("/api/attempts", start_attempt)
