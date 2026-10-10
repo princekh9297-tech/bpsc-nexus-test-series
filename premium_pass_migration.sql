@@ -193,7 +193,59 @@ CREATE TABLE IF NOT EXISTS bank_quiz_attempt_answers (
         question_id BIGINT NOT NULL REFERENCES question_bank(id) ON DELETE RESTRICT,
         selected_option TEXT,
         is_correct BOOLEAN,
+        is_marked_review BOOLEAN NOT NULL DEFAULT FALSE,
         PRIMARY KEY (attempt_id, question_id)
     );
 CREATE INDEX IF NOT EXISTS idx_bank_quizzes_published ON bank_quizzes(is_published, id DESC);
 CREATE INDEX IF NOT EXISTS idx_bank_attempts_user ON bank_quiz_attempts(telegram_id, started_at DESC);
+
+ALTER TABLE bank_quiz_attempt_answers ADD COLUMN IF NOT EXISTS is_marked_review BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Sequential Telegram group quiz sessions and poll-answer tracking.
+CREATE TABLE IF NOT EXISTS group_quiz_sessions (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  chat_id BIGINT NOT NULL,
+  chat_title TEXT,
+  quiz_id BIGINT NOT NULL REFERENCES bank_quizzes(id) ON DELETE RESTRICT,
+  quiz_title TEXT NOT NULL,
+  started_by BIGINT NOT NULL,
+  interval_seconds INTEGER NOT NULL CHECK (interval_seconds BETWEEN 5 AND 600),
+  questions_count INTEGER NOT NULL,
+  current_index INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','completed','failed','paused','cancelled')),
+  next_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_group_quiz_sessions_due ON group_quiz_sessions(status,next_at) WHERE status='active';
+CREATE TABLE IF NOT EXISTS group_quiz_session_questions (
+  session_id BIGINT NOT NULL REFERENCES group_quiz_sessions(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL,
+  question_id BIGINT NOT NULL,
+  question_en TEXT NOT NULL,
+  question_hi TEXT,
+  options JSONB NOT NULL,
+  option_letters JSONB NOT NULL,
+  correct_option TEXT NOT NULL,
+  explanation_en TEXT,
+  explanation_hi TEXT,
+  poll_id TEXT UNIQUE,
+  message_id BIGINT,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','posting','open','closed','failed')),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY(session_id,position)
+);
+ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS message_id BIGINT;
+ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+CREATE TABLE IF NOT EXISTS group_quiz_answers (
+  session_id BIGINT NOT NULL,
+  position INTEGER NOT NULL,
+  telegram_id BIGINT NOT NULL,
+  first_name TEXT,
+  username TEXT,
+  selected_letter TEXT,
+  answered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY(session_id,position,telegram_id),
+  FOREIGN KEY(session_id,position) REFERENCES group_quiz_session_questions(session_id,position) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_group_quiz_answers_session ON group_quiz_answers(session_id,telegram_id);

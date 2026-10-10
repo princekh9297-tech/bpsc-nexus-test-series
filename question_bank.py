@@ -104,9 +104,11 @@ DDL = [
         question_id BIGINT NOT NULL REFERENCES question_bank(id) ON DELETE RESTRICT,
         selected_option TEXT,
         is_correct BOOLEAN,
+        is_marked_review BOOLEAN NOT NULL DEFAULT FALSE,
         PRIMARY KEY (attempt_id, question_id)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_bank_quizzes_published ON bank_quizzes(is_published, id DESC)",
+    "ALTER TABLE bank_quiz_attempt_answers ADD COLUMN IF NOT EXISTS is_marked_review BOOLEAN NOT NULL DEFAULT FALSE",
     "CREATE INDEX IF NOT EXISTS idx_bank_attempts_user ON bank_quiz_attempts(telegram_id, started_at DESC)",
 ]
 

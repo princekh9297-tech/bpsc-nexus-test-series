@@ -7,8 +7,10 @@ from datetime import datetime, timedelta, timezone
 
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
+from telegram.ext import PollAnswerHandler
 import question_bank as qb
+import group_quiz as gq
 
 from telegram.ext import (
     Application,
@@ -30,6 +32,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+MINI_APP_URL = os.environ.get("MINI_APP_URL", "").rstrip("/")
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ADMIN_TELEGRAM_IDS = {
     item.strip()
@@ -199,11 +202,21 @@ async def post_init(application: Application) -> None:
         await conn.execute("SELECT 1")
     await ensure_schema()
     await qb.ensure_schema(pool)
-    logger.info("Database connection verified; Premium Pass and Question Bank migrations applied automatically.")
+    await gq.ensure_schema(pool)
+    application.bot_data["db_pool"] = pool
+    application.bot_data["group_quiz_scheduler_task"] = application.create_task(gq.scheduler(application, pool), name="bpsc-nexus-group-quiz-scheduler")
+    logger.info("Database connection verified; Premium Pass, Question Bank, and Group Quiz migrations applied automatically.")
 
 
 async def post_shutdown(application: Application) -> None:
     global pool
+    task = application.bot_data.get("group_quiz_scheduler_task")
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     if pool is not None:
         await pool.close()
         pool = None
@@ -342,8 +355,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Use the buttons below or commands /tests and /mypremium.",
     ]
     keyboard = [[InlineKeyboardButton("📚 Browse Tests", callback_data="user:tests")],
-                [InlineKeyboardButton("🧩 Take a Quiz", callback_data="user:quizzes")],
-                [InlineKeyboardButton("💎 My Membership", callback_data="user:premium")]]
+                [InlineKeyboardButton("🧩 Take a Quiz", callback_data="user:quizzes")]]
+    if MINI_APP_URL.startswith("https://"):
+        keyboard.append([InlineKeyboardButton("🚀 Open Personal CBT", web_app=WebAppInfo(url=MINI_APP_URL))])
+    keyboard.append([InlineKeyboardButton("💎 My Membership", callback_data="user:premium")])
     if is_admin(update):
         keyboard.append([InlineKeyboardButton("🛡️ Open Admin Panel", callback_data="adm:home")])
     await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
@@ -704,6 +719,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if query is None:
         return
     data = query.data or ""
+    if await gq.route_callback(update, context, pool):
+        return
     handled = await qb.route_callback(update, context, pool, admin_only(update))
     if handled:
         return
@@ -1096,6 +1113,8 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("tests", tests_command))
     application.add_handler(CommandHandler("quiz", quiz_command))
+    application.add_handler(CommandHandler("groupquiz", gq.group_quiz_command))
+    application.add_handler(PollAnswerHandler(gq.group_poll_answer))
     application.add_handler(CommandHandler("mypremium", mypremium_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(admin_callback))
