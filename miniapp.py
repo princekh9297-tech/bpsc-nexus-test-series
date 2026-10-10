@@ -73,7 +73,7 @@ def json_response(payload, status=200):
 
 async def _attempt_row(pool, attempt_id: int, telegram_id: int):
     async with pool.connection() as conn:
-        cur = await conn.execute("""SELECT a.*,q.title,q.subject,q.duration_minutes,q.positive_marks,q.negative_marks
+        cur = await conn.execute("""SELECT a.*,q.title,q.subject,q.duration_minutes,q.positive_marks,q.negative_marks,q.question_time_seconds,q.shuffle_options
             FROM bank_quiz_attempts a JOIN bank_quizzes q ON q.id=a.quiz_id
             WHERE a.id=%s AND a.telegram_id=%s""", (attempt_id, telegram_id))
         return await cur.fetchone()
@@ -89,10 +89,10 @@ async def _grade_attempt(pool, attempt_id: int, telegram_id: int):
             return None
         if attempt["submitted_at"]:
             return await _result_payload(conn, attempt_id, telegram_id)
-        cur = await conn.execute("""SELECT qb.id,qb.correct_option,aa.selected_option
-            FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
-            LEFT JOIN bank_quiz_attempt_answers aa ON aa.attempt_id=%s AND aa.question_id=qb.id
-            WHERE qq.quiz_id=%s ORDER BY qq.position""", (attempt_id, attempt["quiz_id"]))
+        cur = await conn.execute("""SELECT s.question_id AS id,s.correct_option,aa.selected_option
+            FROM bank_quiz_attempt_question_snapshots s
+            LEFT JOIN bank_quiz_attempt_answers aa ON aa.attempt_id=s.attempt_id AND aa.question_id=s.question_id
+            WHERE s.attempt_id=%s ORDER BY s.position""", (attempt_id,))
         rows = await cur.fetchall()
         correct = sum(1 for r in rows if r["selected_option"] and r["selected_option"] == r["correct_option"])
         incorrect = sum(1 for r in rows if r["selected_option"] and r["selected_option"] != r["correct_option"])
@@ -104,48 +104,56 @@ async def _grade_attempt(pool, attempt_id: int, telegram_id: int):
 
 
 async def _result_payload(conn, attempt_id: int, telegram_id: int):
-    cur = await conn.execute("""SELECT a.id,a.quiz_id,a.mode,a.total_questions,a.correct_count,a.incorrect_count,a.skipped_count,a.score,a.started_at,a.submitted_at,
+    cur = await conn.execute("""SELECT a.id,a.quiz_id,a.mode,a.quiz_settings,a.total_questions,a.correct_count,a.incorrect_count,a.skipped_count,a.score,a.started_at,a.submitted_at,
         q.title,q.subject,q.positive_marks,q.negative_marks
         FROM bank_quiz_attempts a JOIN bank_quizzes q ON q.id=a.quiz_id WHERE a.id=%s AND a.telegram_id=%s""", (attempt_id, telegram_id))
     attempt = await cur.fetchone()
     if not attempt:
         return None
-    cur = await conn.execute("""SELECT qb.id,qb.question_en,qb.question_hi,qb.options,qb.correct_option,qb.explanation_en,qb.explanation_hi,aa.selected_option
-        FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
-        LEFT JOIN bank_quiz_attempt_answers aa ON aa.attempt_id=%s AND aa.question_id=qb.id
-        WHERE qq.quiz_id=%s ORDER BY qq.position""", (attempt_id, attempt["quiz_id"]))
+    cur = await conn.execute("""SELECT s.question_id AS id,s.subject,s.question_en,s.question_hi,s.options,s.correct_option,s.explanation_en,s.explanation_hi,aa.selected_option
+        FROM bank_quiz_attempt_question_snapshots s
+        LEFT JOIN bank_quiz_attempt_answers aa ON aa.attempt_id=s.attempt_id AND aa.question_id=s.question_id
+        WHERE s.attempt_id=%s ORDER BY s.position""", (attempt_id,))
     review = []
     for r in await cur.fetchall():
         options = r["options"] if isinstance(r["options"], dict) else json.loads(r["options"] or "{}")
-        review.append({"id": r["id"], "question_en": r["question_en"], "question_hi": r["question_hi"], "options": options,
+        review.append({"id": r["id"], "subject": r["subject"], "question_en": r["question_en"], "question_hi": r["question_hi"], "options": options,
                        "selected_option": r["selected_option"], "correct_option": r["correct_option"],
                        "explanation_en": r["explanation_en"], "explanation_hi": r["explanation_hi"],
                        "is_correct": bool(r["selected_option"] and r["selected_option"] == r["correct_option"])})
     attempted = int(attempt["correct_count"] or 0) + int(attempt["incorrect_count"] or 0)
+    settings = attempt["quiz_settings"] if isinstance(attempt["quiz_settings"], dict) else json.loads(attempt["quiz_settings"] or "{}")
+    mode_label = settings.get("mode_label", attempt["mode"])
+    by_subject = {}
+    for item in review:
+        key = item.get("subject") or "Other / Unclassified"
+        agg = by_subject.setdefault(key, {"subject": key, "total": 0, "correct": 0, "incorrect": 0, "skipped": 0})
+        agg["total"] += 1
+        if not item["selected_option"]:
+            agg["skipped"] += 1
+        elif item["is_correct"]:
+            agg["correct"] += 1
+        else:
+            agg["incorrect"] += 1
+    subject_breakdown = sorted(by_subject.values(), key=lambda x: (-x["total"], x["subject"]))
     return {"submitted": True, "attempt_id": int(attempt["id"]), "title": attempt["title"], "subject": attempt["subject"],
-            "mode": attempt["mode"], "total_questions": int(attempt["total_questions"]), "correct": int(attempt["correct_count"] or 0),
+            "mode": attempt["mode"], "mode_label": mode_label, "total_questions": int(attempt["total_questions"]), "correct": int(attempt["correct_count"] or 0),
             "incorrect": int(attempt["incorrect_count"] or 0), "skipped": int(attempt["skipped_count"] or 0), "score": float(attempt["score"] or 0),
             "max_score": float(attempt["total_questions"]) * float(attempt["positive_marks"]),
             "accuracy": round(int(attempt["correct_count"] or 0) / attempted * 100, 1) if attempted else 0,
-            "negative_marks": float(attempt["negative_marks"]), "review": review}
+            "negative_marks": float(attempt["negative_marks"]), "subject_breakdown": subject_breakdown, "review": review}
 
 
 async def index(request):
     # Resolve frontend relative to this file, not the process working directory.
     page = ROOT / "static" / "index.html"
-    # Prefer the deployment's static/ directory, but support repositories that keep
-    # index.html at the project root (the earlier deployment layout) as a safe fallback.
     if not page.is_file():
-        root_page = ROOT / "index.html"
-        if root_page.is_file():
-            page = root_page
-        else:
-            log.error("Mini App frontend missing at %s and %s", page, root_page)
-            return web.Response(
-                text="BPSC Nexus Mini App frontend is missing. Commit static/index.html (or index.html at the project root).",
-                status=500,
-                content_type="text/plain",
-            )
+        log.error("Mini App frontend missing at %s", page)
+        return web.Response(
+            text="BPSC Nexus Mini App frontend is missing. Ensure static/index.html is committed to the deployment repository.",
+            status=500,
+            content_type="text/plain",
+        )
     response = web.FileResponse(page)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
@@ -167,16 +175,112 @@ async def health(request):
 
 async def list_quizzes(request):
     pool = request.app["pool"]
+    user_id = request["telegram_user"]["id"]
     async with pool.connection() as conn:
         cur = await conn.execute("""SELECT q.id,q.title,q.description,q.subject,q.duration_minutes,q.positive_marks,q.negative_marks,
-            COUNT(qq.question_id) AS total_questions FROM bank_quizzes q
+            q.question_time_seconds, q.shuffle_options, q.is_custom, COUNT(qq.question_id) AS total_questions FROM bank_quizzes q
             JOIN bank_quiz_questions qq ON qq.quiz_id=q.id
             JOIN question_bank qb ON qb.id=qq.question_id AND qb.status='ready'
-            WHERE q.is_published=TRUE GROUP BY q.id ORDER BY q.id DESC LIMIT 100""")
+            WHERE q.is_published=TRUE AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s)
+            GROUP BY q.id ORDER BY q.is_custom ASC,q.id DESC LIMIT 100""", (user_id,))
         rows = await cur.fetchall()
     return json_response({"quizzes": [{"id": int(r["id"]), "title": r["title"], "description": r["description"], "subject": r["subject"],
         "duration_minutes": int(r["duration_minutes"]), "positive_marks": float(r["positive_marks"]), "negative_marks": float(r["negative_marks"]),
+        "question_time_seconds": int(r["question_time_seconds"] or 0), "shuffle_options": bool(r["shuffle_options"]), "is_custom": bool(r["is_custom"]),
         "total_questions": int(r["total_questions"])} for r in rows]})
+
+
+async def quiz_builder_meta(request):
+    pool = request.app["pool"]
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT subject, COUNT(*) AS n FROM question_bank WHERE status='ready' GROUP BY subject ORDER BY subject")
+        subjects = [{"name": r["subject"], "count": int(r["n"])} for r in await cur.fetchall()]
+        cur = await conn.execute("SELECT DISTINCT topic FROM question_bank WHERE status='ready' AND NULLIF(BTRIM(topic),'') IS NOT NULL ORDER BY topic LIMIT 500")
+        topics = [r["topic"] for r in await cur.fetchall()]
+        cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status='ready'")
+        total = int((await cur.fetchone())["n"])
+    return json_response({"subjects": subjects, "topics": topics, "total_ready": total,
+        "selection_modes": ["random", "sequential", "unseen", "incorrect"]})
+
+
+async def quiz_builder_count(request):
+    user_id = request["telegram_user"]["id"]
+    subject = str(request.query.get("subject", "All subjects")).strip()
+    topic = str(request.query.get("topic", "")).strip()
+    selection = str(request.query.get("selection", "random"))
+    conditions = ["qb.status='ready'"]
+    params = []
+    if subject and subject != "All subjects":
+        conditions.append("qb.subject=%s"); params.append(subject)
+    if topic:
+        conditions.append("qb.topic=%s"); params.append(topic)
+    if selection == "unseen":
+        conditions.append("NOT EXISTS (SELECT 1 FROM bank_quiz_attempt_answers aa JOIN bank_quiz_attempts a ON a.id=aa.attempt_id WHERE aa.question_id=qb.id AND a.telegram_id=%s)"); params.append(user_id)
+    elif selection == "incorrect":
+        conditions.append("EXISTS (SELECT 1 FROM bank_quiz_attempt_answers aa JOIN bank_quiz_attempts a ON a.id=aa.attempt_id JOIN bank_quiz_attempt_question_snapshots ss ON ss.attempt_id=aa.attempt_id AND ss.question_id=aa.question_id WHERE aa.question_id=qb.id AND a.telegram_id=%s AND aa.selected_option IS NOT NULL AND aa.selected_option<>ss.correct_option)"); params.append(user_id)
+    async with request.app["pool"].connection() as conn:
+        cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank qb WHERE " + " AND ".join(conditions), tuple(params))
+        n = int((await cur.fetchone())["n"])
+    return json_response({"eligible_count": n})
+
+
+async def create_custom_quiz(request):
+    user = request["telegram_user"]
+    pool = request.app["pool"]
+    try:
+        body = await request.json()
+        subject = str(body.get("subject") or "All subjects").strip()
+        topic = str(body.get("topic") or "").strip()
+        count = int(body.get("count", 10))
+        duration = int(body.get("duration_minutes", 20))
+        question_time = int(body.get("question_time_seconds", 0))
+        selection = str(body.get("selection", "random"))
+        mode = str(body.get("mode", "practice"))
+        positive = float(body.get("positive_marks", 1))
+        negative = float(body.get("negative_marks", 1/3))
+        title = str(body.get("title") or "My Custom Quiz").strip()[:100]
+        shuffle_options = bool(body.get("shuffle_options", False))
+        if not 1 <= count <= 100: raise ValueError("Question count must be between 1 and 100.")
+        if not 1 <= duration <= 360: raise ValueError("Total duration must be between 1 and 360 minutes.")
+        if question_time not in (0, 10, 15, 20, 30, 45, 60, 90, 120): raise ValueError("Choose a supported per-question timer.")
+        if selection not in ("random", "sequential", "unseen", "incorrect"): raise ValueError("Invalid question selection method.")
+        if mode not in ("practice", "exam", "revision", "rapidfire"): raise ValueError("Choose a valid attempt mode.")
+        if not 0 <= negative <= 5 or not 0 < positive <= 10: raise ValueError("Invalid scoring settings.")
+    except ValueError as exc:
+        return json_response({"error": str(exc) or "Invalid quiz settings."}, 400)
+    except Exception:
+        return json_response({"error": "Invalid quiz builder settings."}, 400)
+
+    conditions = ["qb.status='ready'"]
+    params = []
+    if subject != "All subjects":
+        conditions.append("qb.subject=%s"); params.append(subject)
+    if topic:
+        conditions.append("qb.topic=%s"); params.append(topic)
+    if selection == "unseen":
+        conditions.append("NOT EXISTS (SELECT 1 FROM bank_quiz_attempt_answers aa JOIN bank_quiz_attempts a ON a.id=aa.attempt_id WHERE aa.question_id=qb.id AND a.telegram_id=%s)")
+        params.append(user["id"])
+    elif selection == "incorrect":
+        conditions.append("EXISTS (SELECT 1 FROM bank_quiz_attempt_answers aa JOIN bank_quiz_attempts a ON a.id=aa.attempt_id JOIN bank_quiz_attempt_question_snapshots ss ON ss.attempt_id=aa.attempt_id AND ss.question_id=aa.question_id WHERE aa.question_id=qb.id AND a.telegram_id=%s AND aa.selected_option IS NOT NULL AND aa.selected_option<>ss.correct_option)")
+        params.append(user["id"])
+    order = "RANDOM()" if selection in ("random", "incorrect") else "qb.id ASC"
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank qb WHERE " + " AND ".join(conditions), tuple(params))
+        eligible = int((await cur.fetchone())["n"])
+        if eligible < count:
+            return json_response({"error": f"Only {eligible} eligible questions match these filters. Reduce the count or change your filters.", "eligible_count": eligible}, 400)
+        cur = await conn.execute("SELECT qb.id FROM question_bank qb WHERE " + " AND ".join(conditions) + f" ORDER BY {order} LIMIT %s", tuple(params + [count]))
+        ids = [int(r["id"]) for r in await cur.fetchall()]
+        display_subject = subject if subject != "All subjects" else "Mixed Subjects"
+        title = title or "My Custom Quiz"
+        cur = await conn.execute("""INSERT INTO bank_quizzes(title,description,subject,created_by_telegram_id,is_published,duration_minutes,positive_marks,negative_marks,is_custom,custom_owner_telegram_id,question_time_seconds,shuffle_options,published_at)
+            VALUES(%s,%s,%s,%s,TRUE,%s,%s,%s,TRUE,%s,%s,%s,NOW()) RETURNING id""",
+            (title, f"Custom {mode} quiz · {count} questions", display_subject, user["id"], duration, positive, negative, user["id"], question_time, shuffle_options))
+        quiz_id = int((await cur.fetchone())["id"])
+        for position, question_id in enumerate(ids):
+            await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)", (quiz_id, position, question_id))
+    return json_response({"quiz_id": quiz_id, "title": title, "count": len(ids), "eligible_count": eligible, "mode": mode,
+        "message": "Custom quiz created from verified question-bank records."}, 201)
 
 
 async def start_attempt(request):
@@ -185,13 +289,14 @@ async def start_attempt(request):
     try:
         body = await request.json()
         quiz_id = int(body.get("quiz_id"))
-        mode = body.get("mode")
-        if mode not in ("practice", "exam"):
+        requested_mode = body.get("mode")
+        if requested_mode not in ("practice", "exam", "revision", "rapidfire"):
             raise ValueError()
+        mode = "practice" if requested_mode in ("revision", "rapidfire") else requested_mode
     except Exception:
         return json_response({"error": "Provide a valid quiz_id and mode."}, 400)
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT id,title,duration_minutes FROM bank_quizzes WHERE id=%s AND is_published=TRUE", (quiz_id,))
+        cur = await conn.execute("SELECT id,title,duration_minutes,question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)", (quiz_id, user["id"]))
         quiz = await cur.fetchone()
         if not quiz:
             return json_response({"error": "Quiz is unavailable."}, 404)
@@ -200,9 +305,13 @@ async def start_attempt(request):
         ids = await cur.fetchall()
         if not ids:
             return json_response({"error": "This quiz has no verified questions."}, 400)
-        cur = await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions) VALUES(%s,%s,%s,%s) RETURNING id,started_at", (quiz_id, user["id"], mode, len(ids)))
+        cur = await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions,question_time_seconds,quiz_settings) VALUES(%s,%s,%s,%s,%s,%s::jsonb) RETURNING id,started_at", (quiz_id, user["id"], mode, len(ids), int(quiz["question_time_seconds"] or 0), json.dumps({"custom": bool(quiz["is_custom"]), "mode_label": requested_mode})))
         attempt = await cur.fetchone()
-    return json_response({"attempt_id": int(attempt["id"]), "started_at": attempt["started_at"].isoformat(), "duration_minutes": int(quiz["duration_minutes"]), "mode": mode})
+        await conn.execute("""INSERT INTO bank_quiz_attempt_question_snapshots(attempt_id,position,question_id,subject,question_en,question_hi,options,correct_option,explanation_en,explanation_hi)
+            SELECT %s,qq.position,qb.id,qb.subject,qb.question_en,qb.question_hi,qb.options,qb.correct_option, qb.explanation_en,qb.explanation_hi
+            FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
+            WHERE qq.quiz_id=%s AND qb.status='ready' ORDER BY qq.position""", (attempt["id"], quiz_id))
+    return json_response({"attempt_id": int(attempt["id"]), "started_at": attempt["started_at"].isoformat(), "duration_minutes": int(quiz["duration_minutes"]), "question_time_seconds": int(quiz["question_time_seconds"] or 0), "shuffle_options": bool(quiz["shuffle_options"]), "mode": mode, "mode_label": requested_mode})
 
 
 async def get_attempt(request):
@@ -224,24 +333,23 @@ async def get_attempt(request):
         result = await _grade_attempt(pool, attempt_id, user["id"])
         return json_response(result)
     async with pool.connection() as conn:
-        cur = await conn.execute("""SELECT qb.id,qb.question_en,qb.question_hi,qb.options,aa.selected_option,aa.is_correct,aa.is_marked_review
-            FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
-            LEFT JOIN bank_quiz_attempt_answers aa ON aa.attempt_id=%s AND aa.question_id=qb.id
-            WHERE qq.quiz_id=%s AND qb.status='ready' ORDER BY qq.position""", (attempt_id, attempt["quiz_id"]))
+        cur = await conn.execute("""SELECT s.question_id AS id,s.question_en,s.question_hi,s.options,aa.selected_option,aa.is_correct,aa.is_marked_review,
+            s.correct_option,s.explanation_en,s.explanation_hi
+            FROM bank_quiz_attempt_question_snapshots s
+            LEFT JOIN bank_quiz_attempt_answers aa ON aa.attempt_id=s.attempt_id AND aa.question_id=s.question_id
+            WHERE s.attempt_id=%s ORDER BY s.position""", (attempt_id,))
         rows = await cur.fetchall()
     questions = []
     for r in rows:
         opts = r["options"] if isinstance(r["options"], dict) else json.loads(r["options"] or "{}")
         item = {"id": int(r["id"]), "question_en": r["question_en"], "question_hi": r["question_hi"], "options": opts, "selected_option": r["selected_option"], "marked_review": bool(r["is_marked_review"])}
-        if attempt["mode"] == "practice" and r["selected_option"]:
-            async with pool.connection() as conn:
-                cur = await conn.execute("SELECT correct_option,explanation_en,explanation_hi FROM question_bank WHERE id=%s", (r["id"],))
-                ans = await cur.fetchone()
-            item["feedback"] = {"is_correct": bool(ans and ans["correct_option"] == r["selected_option"]), "correct_option": ans["correct_option"] if ans else None,
-                                 "explanation_en": ans["explanation_en"] if ans else None, "explanation_hi": ans["explanation_hi"] if ans else None}
+        if attempt["mode"] in ("practice", "revision", "rapidfire") and r["selected_option"]:
+            item["feedback"] = {"is_correct": bool(r["correct_option"] == r["selected_option"]), "correct_option": r["correct_option"],
+                                 "explanation_en": r["explanation_en"], "explanation_hi": r["explanation_hi"]}
         questions.append(item)
-    return json_response({"submitted": False, "attempt_id": attempt_id, "title": attempt["title"], "subject": attempt["subject"], "mode": attempt["mode"],
-                          "duration_minutes": int(attempt["duration_minutes"]), "started_at": attempt["started_at"].isoformat(), "deadline": datetime.fromtimestamp(deadline, timezone.utc).isoformat(),
+    settings = attempt["quiz_settings"] if isinstance(attempt["quiz_settings"], dict) else json.loads(attempt["quiz_settings"] or "{}")
+    return json_response({"submitted": False, "attempt_id": attempt_id, "title": attempt["title"], "subject": attempt["subject"], "mode": attempt["mode"], "mode_label": settings.get("mode_label", attempt["mode"]),
+                          "duration_minutes": int(attempt["duration_minutes"]), "question_time_seconds": int(attempt["question_time_seconds"] or 0), "shuffle_options": bool(attempt["shuffle_options"]), "started_at": attempt["started_at"].isoformat(), "deadline": datetime.fromtimestamp(deadline, timezone.utc).isoformat(),
                           "positive_marks": float(attempt["positive_marks"]), "negative_marks": float(attempt["negative_marks"]), "questions": questions})
 
 
@@ -266,17 +374,16 @@ async def save_answer(request):
         result = await _grade_attempt(pool, attempt_id, user["id"])
         return json_response({"error": "Time is up.", "result": result}, 409)
     async with pool.connection() as conn:
-        cur = await conn.execute("""SELECT qb.correct_option FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
-            WHERE qq.quiz_id=%s AND qb.id=%s AND qb.status='ready'""", (attempt["quiz_id"], question_id))
+        cur = await conn.execute("SELECT correct_option FROM bank_quiz_attempt_question_snapshots WHERE attempt_id=%s AND question_id=%s", (attempt_id, question_id))
         qrow = await cur.fetchone()
         if not qrow:
             return json_response({"error": "Question is not part of this attempt."}, 404)
-        is_correct = (selected == qrow["correct_option"]) if selected and attempt["mode"] == "practice" else None
+        is_correct = (selected == qrow["correct_option"]) if selected and attempt["mode"] in ("practice", "revision", "rapidfire") else None
         await conn.execute("""INSERT INTO bank_quiz_attempt_answers(attempt_id,question_id,selected_option,is_correct)
             VALUES(%s,%s,%s,%s) ON CONFLICT(attempt_id,question_id) DO UPDATE SET selected_option=EXCLUDED.selected_option,is_correct=EXCLUDED.is_correct""",
             (attempt_id, question_id, selected, is_correct))
-        if attempt["mode"] == "practice" and selected:
-            cur = await conn.execute("SELECT correct_option,explanation_en,explanation_hi FROM question_bank WHERE id=%s", (question_id,))
+        if attempt["mode"] in ("practice", "revision", "rapidfire") and selected:
+            cur = await conn.execute("SELECT correct_option,explanation_en,explanation_hi FROM bank_quiz_attempt_question_snapshots WHERE attempt_id=%s AND question_id=%s", (attempt_id, question_id))
             ans = await cur.fetchone()
             feedback = {"is_correct": bool(ans["correct_option"] == selected), "correct_option": ans["correct_option"], "explanation_en": ans["explanation_en"], "explanation_hi": ans["explanation_hi"]}
         else:
@@ -303,7 +410,7 @@ async def save_review(request):
         result = await _grade_attempt(pool, attempt_id, user["id"])
         return json_response({"error": "Time is up.", "result": result}, 409)
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT 1 FROM bank_quiz_questions WHERE quiz_id=%s AND question_id=%s", (attempt["quiz_id"], question_id))
+        cur = await conn.execute("SELECT 1 FROM bank_quiz_attempt_question_snapshots WHERE attempt_id=%s AND question_id=%s", (attempt_id, question_id))
         if not await cur.fetchone():
             return json_response({"error": "Question is not part of this attempt."}, 404)
         await conn.execute("""INSERT INTO bank_quiz_attempt_answers(attempt_id,question_id,is_marked_review)
@@ -346,6 +453,9 @@ def make_app():
     app.router.add_get("/static/{filename}", static_asset)
     app.router.add_get("/healthz", health)
     app.router.add_get("/api/quizzes", list_quizzes)
+    app.router.add_get("/api/quiz-builder/meta", quiz_builder_meta)
+    app.router.add_get("/api/quiz-builder/count", quiz_builder_count)
+    app.router.add_post("/api/quiz-builder/create", create_custom_quiz)
     app.router.add_post("/api/attempts", start_attempt)
     app.router.add_get("/api/attempts/{attempt_id}", get_attempt)
     app.router.add_post("/api/attempts/{attempt_id}/answer", save_answer)

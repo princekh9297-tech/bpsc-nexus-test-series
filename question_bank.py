@@ -109,7 +109,34 @@ DDL = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_bank_quizzes_published ON bank_quizzes(is_published, id DESC)",
     "ALTER TABLE bank_quiz_attempt_answers ADD COLUMN IF NOT EXISTS is_marked_review BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE bank_quizzes ADD COLUMN IF NOT EXISTS is_custom BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE bank_quizzes ADD COLUMN IF NOT EXISTS custom_owner_telegram_id BIGINT",
+    "ALTER TABLE bank_quizzes ADD COLUMN IF NOT EXISTS question_time_seconds INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE bank_quizzes ADD COLUMN IF NOT EXISTS shuffle_options BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE bank_quiz_attempts ADD COLUMN IF NOT EXISTS question_time_seconds INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE bank_quiz_attempts ADD COLUMN IF NOT EXISTS quiz_settings JSONB NOT NULL DEFAULT '{}'::jsonb",
     "CREATE INDEX IF NOT EXISTS idx_bank_attempts_user ON bank_quiz_attempts(telegram_id, started_at DESC)",
+    """CREATE TABLE IF NOT EXISTS bank_quiz_attempt_question_snapshots (
+        attempt_id BIGINT NOT NULL REFERENCES bank_quiz_attempts(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL,
+        question_id BIGINT NOT NULL,
+        subject TEXT NOT NULL DEFAULT 'Other / Unclassified',
+        question_en TEXT NOT NULL,
+        question_hi TEXT,
+        options JSONB NOT NULL,
+        correct_option TEXT NOT NULL,
+        explanation_en TEXT,
+        explanation_hi TEXT,
+        PRIMARY KEY(attempt_id, question_id),
+        UNIQUE(attempt_id, position)
+    )""",
+    "ALTER TABLE bank_quiz_attempt_question_snapshots ADD COLUMN IF NOT EXISTS subject TEXT NOT NULL DEFAULT 'Other / Unclassified'",
+    """INSERT INTO bank_quiz_attempt_question_snapshots(attempt_id,position,question_id,subject,question_en,question_hi,options,correct_option,explanation_en,explanation_hi)
+        SELECT a.id,qq.position,qb.id,qb.subject,qb.question_en,qb.question_hi,qb.options,qb.correct_option,qb.explanation_en,qb.explanation_hi
+        FROM bank_quiz_attempts a JOIN bank_quiz_questions qq ON qq.quiz_id=a.quiz_id
+        JOIN question_bank qb ON qb.id=qq.question_id
+        LEFT JOIN bank_quiz_attempt_question_snapshots s ON s.attempt_id=a.id AND s.question_id=qb.id
+        WHERE s.question_id IS NULL AND qb.correct_option IS NOT NULL ON CONFLICT DO NOTHING""",
 ]
 
 
@@ -638,7 +665,7 @@ async def publish_quiz(q,context,pool,quiz_id):
 
 async def show_student_quizzes(q,pool):
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title,subject,(SELECT COUNT(*) FROM bank_quiz_questions bqq WHERE bqq.quiz_id=bq.id) AS n FROM bank_quizzes bq WHERE is_published=TRUE ORDER BY id DESC LIMIT 20"); rows=await cur.fetchall()
+        cur=await conn.execute("SELECT id,title,subject,(SELECT COUNT(*) FROM bank_quiz_questions bqq WHERE bqq.quiz_id=bq.id) AS n FROM bank_quizzes bq WHERE is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s) ORDER BY id DESC LIMIT 20", (q.from_user.id,)); rows=await cur.fetchall()
     if not rows:
         await q.edit_message_text("No quizzes are published yet."); return
     lines=["📚 Available quizzes",""]; buttons=[]
@@ -650,7 +677,7 @@ async def show_student_quizzes(q,pool):
 
 async def choose_mode(q,context,pool,quiz_id):
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE",(quiz_id,)); quiz=await cur.fetchone()
+        cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,q.from_user.id)); quiz=await cur.fetchone()
     if not quiz: await q.edit_message_text("Quiz not found or not published."); return
     await q.edit_message_text(f"{quiz['title']}\n\nChoose a mode:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Practice (instant explanation)",callback_data=f"play:mode:practice:{quiz_id}")],[InlineKeyboardButton("⏱ Exam (results after submission)",callback_data=f"play:mode:exam:{quiz_id}")],[InlineKeyboardButton("Back to quizzes",callback_data="play:list")]]))
 
@@ -658,7 +685,7 @@ async def choose_mode(q,context,pool,quiz_id):
 async def start_attempt(q,context,pool,quiz_id,mode):
     if mode not in ("practice","exam"): return
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks FROM bank_quizzes WHERE id=%s AND is_published=TRUE",(quiz_id,)); quiz=await cur.fetchone()
+        cur=await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,q.from_user.id)); quiz=await cur.fetchone()
         if not quiz: await q.edit_message_text("Quiz unavailable."); return
         cur=await conn.execute("SELECT qb.id,qb.question_en,qb.question_hi,qb.options,qb.correct_option,qb.explanation_en,qb.explanation_hi FROM bank_quiz_questions bqq JOIN question_bank qb ON qb.id=bqq.question_id WHERE bqq.quiz_id=%s ORDER BY bqq.position",(quiz_id,)); questions=await cur.fetchall()
         cur=await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions) VALUES(%s,%s,%s,%s) RETURNING id",(quiz_id,q.from_user.id,mode,len(questions))); attempt_id=(await cur.fetchone())["id"]

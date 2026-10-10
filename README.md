@@ -13,7 +13,7 @@ The existing HTML/JSON/CSV import flow, question verification, import history, q
 - `question_bank.py` — permanent question bank, import preview, deduplication, verification, quiz builder and existing personal Telegram quiz flow.
 - `group_quiz.py` — persistent sequential group-poll scheduler and leaderboard calculations.
 - `miniapp.py` — authenticated API and static frontend server for personal CBT.
-- `static/index.html` — responsive CBT UI with timer, question palette, answer navigation, mark-for-review, clear response, submit confirmation and result review.
+- `static/index.html` — responsive CBT UI with a custom quiz builder, subject/topic filters, question count, random/sequential/unseen/incorrect selection, Practice/Exam/Revision/Rapid-fire presets, scoring settings, total and per-question timers, shuffled options, saved-on-device setup, question palette, mark-for-review, answer clearing and result review.
 - `requirements.txt` — runtime dependencies for both services.
 - `render.yaml` — existing bot service definition with the new optional `MINI_APP_URL` setting.
 - `render-miniapp.yaml` — optional Blueprint definition for the separate Mini App service.
@@ -28,7 +28,7 @@ The existing HTML/JSON/CSV import flow, question verification, import history, q
 4. Deploy the bot service. Its startup migration creates the group-quiz tables and ensures the question-bank schema. It does not drop existing tables.
 5. Confirm `/admin`, bulk imports, question review, quiz creation, quiz publishing and Premium Pass management still work before launching group quizzes.
 
-The bot can run group quizzes without the Mini App URL configured. The Mini App button appears once `MINI_APP_URL` is set to the new service's public HTTPS URL. Startup also configures Telegram's built-in slash-command menu for private chats and groups. Group menu commands are `/groupquiz`, `/help`, and `/start`.
+The bot can run group quizzes without the Mini App URL configured. The Mini App button appears once `MINI_APP_URL` is set to the new service's public HTTPS URL.
 
 ## 2. Deploy the personal Mini App as a separate Render Web Service
 
@@ -57,18 +57,19 @@ Redeploy the bot service after setting `MINI_APP_URL`. Do not use an example URL
 4. Navigate using Previous/Next or the question palette. Mark questions for review or clear a response.
 5. Submit the test to see correct/incorrect/unattempted counts, score, accuracy and explanations.
 
-The API validates Telegram Mini App `initData` on the server using the bot token and rejects invalid or stale launch data. The frontend does not receive correct answers before submission in Exam mode. A timed exam's deadline is checked server-side, not only by the browser timer.
+The API validates Telegram Mini App `initData` on the server using the bot token and rejects invalid or stale launch data. The frontend does not receive correct answers before submission in Exam mode. The overall exam deadline is checked server-side; the optional per-question countdown is a client-side pacing aid and should not be treated as a tamper-proof proctoring control.
 
 ## 4. How group admins run a group quiz
 
 1. Add the bot to the Telegram group and ensure it is allowed to send polls. Promote it with poll/post permissions if the group restricts those actions.
 2. Publish a quiz from the private admin panel's **Question Bank & Quiz Studio**.
-3. In the destination group, a group administrator runs `/groupquiz`.
-4. Choose a published quiz, then choose a voting window: 15 seconds, 30 seconds, 1 minute, 2 minutes or 5 minutes.
-5. The bot posts one native quiz poll, closes it at the configured window and then posts the next question.
-6. At the end, the bot posts aggregate statistics and a leaderboard (1 point correct, −1/3 incorrect; unanswered questions score 0).
+3. In the destination group, a group administrator runs `/groupquiz` (also available from Telegram's command menu).
+4. Choose **Build a quiz from question bank** or select an existing published quiz. The builder supports mixed-subject or subject-specific question pools and 5–100 questions.
+5. Choose Learning mode or Exam simulation, then a voting window of 15 seconds, 30 seconds, 1 minute, 2 minutes or 5 minutes per question.
+6. The bot posts one poll at a time. Learning mode uses Telegram quiz polls, which reveal the correct answer after voting. Exam simulation uses regular polls and posts the answer/explanation only after the voting window closes.
+7. At the end, the bot posts aggregate statistics and a leaderboard (1 point correct, −1/3 incorrect; unanswered questions score 0).
 
-Group polls are non-anonymous because individual scores require identifying each voter's answer. Telegram displays its native quiz feedback after a user answers; the bot cannot force Telegram to display a custom explanation panel in every situation. The explanation is attached to each poll. The scheduler stores session progress in PostgreSQL so it can recover after ordinary restarts. If a crash occurs during the exact send-poll/database-write boundary, the session pauses rather than blindly sending a potentially duplicate question; start a new session after checking the group.
+Group polls are non-anonymous because individual scores require identifying each voter's answer. The scheduler stores session progress and copied question content in PostgreSQL. If a crash occurs during the exact send-poll/database-write boundary, the session pauses rather than blindly sending a potentially duplicate question; check the group before starting another session.
 
 ## 5. Bulk question import
 
