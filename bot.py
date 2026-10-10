@@ -1,10 +1,18 @@
+import asyncio
+import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatType, ChatMemberStatus
+from google import genai
+from google.genai import types
+from pypdf import PdfReader
+import io
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -25,6 +33,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ADMIN_TELEGRAM_IDS = {
     item.strip()
     for item in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",")
@@ -59,44 +70,42 @@ def is_private(update: Update) -> bool:
 
 
 async def ensure_schema() -> None:
-    """Apply the small, idempotent Premium Pass migration automatically on startup.
-
-    This avoids requiring the owner to paste SQL into Neon. Existing tables and data
-    are preserved; only missing columns/indexes are added. Keep these statements
-    aligned with premium_pass_migration.sql.
-    """
+    """Idempotent compatibility migration for existing databases and Quiz Creator."""
     if pool is None:
         raise RuntimeError("Database pool is not available")
-
     statements = [
+        "CREATE TABLE IF NOT EXISTS premium_passes (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES app_users(id) ON DELETE RESTRICT, granted_by_telegram_id BIGINT NOT NULL, granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), expires_at TIMESTAMPTZ, revoked_at TIMESTAMPTZ, revoked_by_telegram_id BIGINT, note TEXT, CHECK (expires_at IS NULL OR expires_at > granted_at), CHECK ((revoked_at IS NULL AND revoked_by_telegram_id IS NULL) OR (revoked_at IS NOT NULL AND revoked_by_telegram_id IS NOT NULL)))",
+        "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS first_name TEXT",
+        "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS username TEXT",
         "ALTER TABLE tests ADD COLUMN IF NOT EXISTS is_premium BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE tests ADD COLUMN IF NOT EXISTS vault_key TEXT NOT NULL DEFAULT 'general'",
-        """CREATE TABLE IF NOT EXISTS premium_passes (
-            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            user_id BIGINT NOT NULL REFERENCES app_users(id) ON DELETE RESTRICT,
-            granted_by_telegram_id BIGINT NOT NULL,
-            granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            expires_at TIMESTAMPTZ,
-            revoked_at TIMESTAMPTZ,
-            revoked_by_telegram_id BIGINT,
-            note TEXT,
-            CHECK (expires_at IS NULL OR expires_at > granted_at),
-            CHECK (
-                (revoked_at IS NULL AND revoked_by_telegram_id IS NULL)
-                OR (revoked_at IS NOT NULL AND revoked_by_telegram_id IS NOT NULL)
-            )
-        )""",
+        "ALTER TABLE tests ADD COLUMN IF NOT EXISTS created_by_telegram_id BIGINT",
+        "ALTER TABLE tests ADD COLUMN IF NOT EXISTS creator_chat_id BIGINT",
+        "ALTER TABLE tests ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'catalogue'",
+        "ALTER TABLE premium_passes ADD COLUMN IF NOT EXISTS user_id BIGINT",
+        "ALTER TABLE premium_passes ADD COLUMN IF NOT EXISTS granted_by_telegram_id BIGINT",
+        "ALTER TABLE premium_passes ADD COLUMN IF NOT EXISTS granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        "ALTER TABLE premium_passes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
+        "ALTER TABLE premium_passes ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ",
+        "ALTER TABLE premium_passes ADD COLUMN IF NOT EXISTS revoked_by_telegram_id BIGINT",
+        "ALTER TABLE premium_passes ADD COLUMN IF NOT EXISTS note TEXT",
         "ALTER TABLE premium_passes ADD COLUMN IF NOT EXISTS pass_code TEXT NOT NULL DEFAULT 'legacy'",
         "ALTER TABLE premium_passes ADD COLUMN IF NOT EXISTS vault_keys TEXT[] NOT NULL DEFAULT ARRAY['general']::TEXT[]",
         "CREATE INDEX IF NOT EXISTS idx_premium_passes_user ON premium_passes(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_premium_passes_expiry ON premium_passes(expires_at) WHERE revoked_at IS NULL",
         "CREATE INDEX IF NOT EXISTS idx_tests_vault_key ON tests(vault_key)",
+        "CREATE TABLE IF NOT EXISTS quiz_creator_drafts (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, owner_telegram_id BIGINT NOT NULL, source_chat_id BIGINT NOT NULL, title TEXT NOT NULL DEFAULT 'My Quiz', source_name TEXT, questions JSONB NOT NULL, status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','published','discarded')), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+        "CREATE INDEX IF NOT EXISTS idx_quiz_creator_drafts_owner ON quiz_creator_drafts(owner_telegram_id, created_at DESC)",
+        "CREATE TABLE IF NOT EXISTS quiz_creator_usage (owner_telegram_id BIGINT NOT NULL, usage_day DATE NOT NULL DEFAULT CURRENT_DATE, quiz_count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (owner_telegram_id, usage_day))",
     ]
     async with pool.connection() as conn:
         for statement in statements:
             await conn.execute(statement)
-        await conn.execute("SELECT pass_code, vault_keys FROM premium_passes LIMIT 0")
-        await conn.execute("SELECT is_premium, vault_key FROM tests LIMIT 0")
+        # Fail fast with a useful startup log if a legacy schema is incompatible.
+        await conn.execute("SELECT id, telegram_id, first_name, username FROM app_users LIMIT 0")
+        await conn.execute("SELECT id, user_id, granted_by_telegram_id, granted_at, expires_at, revoked_at, revoked_by_telegram_id, pass_code, vault_keys FROM premium_passes LIMIT 0")
+        await conn.execute("SELECT id, title, is_published, is_premium, vault_key, created_by_telegram_id, creator_chat_id, visibility FROM tests LIMIT 0")
+    logger.info("Database compatibility migration and Quiz Creator tables verified.")
 
 
 async def post_init(application: Application) -> None:
@@ -267,6 +276,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Use the buttons below or commands /tests and /mypremium.",
     ]
     keyboard = [[InlineKeyboardButton("📚 Browse Tests", callback_data="user:tests")],
+                [InlineKeyboardButton("🧠 Create Quiz from Photo/PDF", callback_data="qc:menu")],
                 [InlineKeyboardButton("💎 My Membership", callback_data="user:premium")]]
     if is_admin(update):
         keyboard.append([InlineKeyboardButton("🛡️ Open Admin Panel", callback_data="adm:home")])
@@ -365,6 +375,181 @@ async def tests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines.append("")
     lines.append("Question attempts and answer submission are a separate development stage.")
     await message.reply_text("\n".join(lines))
+
+
+# ---------- Quiz Creator Studio (photo/PDF -> AI extraction -> review -> publish as Telegram quiz polls) ----------
+def creator_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📷 Create from Photo", callback_data="qc:photo"), InlineKeyboardButton("📄 Create from PDF", callback_data="qc:pdf")],
+        [InlineKeyboardButton("🗃 My Drafts", callback_data="qc:drafts")],
+    ])
+
+async def creator_is_premium(telegram_id: int) -> bool:
+    if pool is None: return False
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT EXISTS(SELECT 1 FROM premium_passes pp JOIN app_users u ON u.id=pp.user_id WHERE u.telegram_id=%s AND pp.revoked_at IS NULL AND (pp.expires_at IS NULL OR pp.expires_at>NOW())) AS ok", (telegram_id,))
+        row = await cur.fetchone()
+    return bool(row and row["ok"])
+
+async def creator_daily_quota_ok(telegram_id: int) -> bool:
+    if pool is None: return False
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT quiz_count FROM quiz_creator_usage WHERE owner_telegram_id=%s AND usage_day=CURRENT_DATE", (telegram_id,))
+        row = await cur.fetchone()
+    return not row or int(row["quiz_count"]) < 2
+
+async def creator_increment_quota(telegram_id: int) -> None:
+    async with pool.connection() as conn:
+        await conn.execute("INSERT INTO quiz_creator_usage(owner_telegram_id,usage_day,quiz_count) VALUES(%s,CURRENT_DATE,1) ON CONFLICT(owner_telegram_id,usage_day) DO UPDATE SET quiz_count=quiz_creator_usage.quiz_count+1", (telegram_id,))
+
+async def create_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None or update.effective_message is None: return
+    await save_user(update)
+    if not GEMINI_API_KEY:
+        await update.effective_message.reply_text("Quiz Creator is not configured yet. The bot owner must add GEMINI_API_KEY in Render Environment and redeploy.")
+        return
+    await update.effective_message.reply_text("🧠 Quiz Creator Studio\n\nSend a clear photo/screenshot or a PDF of MCQs. I will extract the questions, options, answers and explanations, then show a draft for confirmation.\n\nFree trial: up to 5 questions, maximum 5-page PDF, 2 creations/day. Active Premium Pass: up to 50 questions and 30-page PDF. Unsupported answers are marked uncertain rather than invented.", reply_markup=creator_menu_keyboard())
+
+async def extract_quiz_from_media(data: bytes, mime_type: str, max_questions: int) -> dict:
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    prompt = f'''Extract MCQs from the supplied material. Return ONLY valid JSON with shape:
+{{"title":"Short title","questions":[{{"question_en":"...","question_hi":"...","options":{{"A":"...","B":"...","C":"...","D":"...","E":"Not Attempted / प्रयास नहीं किया"}},"correct_option":"A|B|C|D|E|null","explanation_en":"...","explanation_hi":"...","answer_confidence":"high|medium|low"}}]}}
+Extract at most {max_questions} complete questions. Preserve source meaning. Translate to Hindi only when appropriate; do not fabricate missing text. Use an explicit answer key if present. If no source-supported answer exists, set correct_option to null and answer_confidence to low; do not guess. Keep options A-E and use E as Not Attempted / प्रयास नहीं किया if absent. Skip non-question material. Escape JSON correctly.'''
+    part = types.Part.from_bytes(data=data, mime_type=mime_type)
+    def call_model():
+        return client.models.generate_content(model=GEMINI_MODEL, contents=[prompt, part], config=types.GenerateContentConfig(temperature=0.1, response_mime_type="application/json"))
+    response = await asyncio.to_thread(call_model)
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", (response.text or "").strip(), flags=re.I)
+    parsed = json.loads(raw); clean=[]
+    for q in parsed.get("questions", [])[:max_questions]:
+        opts=q.get("options") or {}
+        if not q.get("question_en") and not q.get("question_hi"): continue
+        normalized={k:str(opts.get(k, "")) for k in "ABCD"}; normalized["E"] = str(opts.get("E") or "Not Attempted / प्रयास नहीं किया")
+        correct=q.get("correct_option")
+        if correct not in list("ABCDE"): correct=None
+        clean.append({"question_en":str(q.get("question_en") or "").strip(), "question_hi":str(q.get("question_hi") or "").strip(), "options":normalized, "correct_option":correct, "explanation_en":str(q.get("explanation_en") or "").strip(), "explanation_hi":str(q.get("explanation_hi") or "").strip(), "answer_confidence":str(q.get("answer_confidence") or "low")})
+    if not clean: raise ValueError("No complete MCQs could be extracted from this file.")
+    return {"title":str(parsed.get("title") or "My Quiz")[:180], "questions":clean}
+
+async def receive_quiz_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg=update.effective_message; user=update.effective_user; chat=update.effective_chat
+    if not msg or not user or not chat: return
+    if not context.user_data.get("quiz_creator_waiting"):
+        return
+    if not GEMINI_API_KEY:
+        await msg.reply_text("Quiz Creator is not configured yet. The bot owner must add GEMINI_API_KEY in Render Environment."); return
+    if chat.type != ChatType.PRIVATE:
+        try:
+            member=await context.bot.get_chat_member(chat.id, user.id)
+            if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+                await msg.reply_text("Only this group's admins can create a group quiz. Open me privately for a personal draft."); return
+        except Exception:
+            await msg.reply_text("I couldn't verify your group-admin status. Please try in a private chat or check the bot's group permissions."); return
+    premium=await creator_is_premium(user.id); max_q=50 if premium else 5; max_pdf_pages=30 if premium else 5
+    if not await creator_daily_quota_ok(user.id):
+        await msg.reply_text("Today's creation limit is used. An active Premium Pass unlocks larger creator limits."); return
+    file_id=None; mime=None; is_pdf=False
+    if msg.photo: file_id=msg.photo[-1].file_id; mime="image/jpeg"
+    elif msg.document:
+        doc=msg.document
+        if (doc.mime_type or "") == "application/pdf" or (doc.file_name or "").lower().endswith(".pdf"):
+            file_id=doc.file_id; mime="application/pdf"; is_pdf=True
+        else:
+            await msg.reply_text("Please send a photo/screenshot or a PDF file."); return
+    if not file_id: return
+    try:
+        tgfile=await context.bot.get_file(file_id); data=bytes(await tgfile.download_as_bytearray())
+        if len(data)>10*1024*1024:
+            await msg.reply_text("This file exceeds the 10 MB limit. Compress it or split the PDF."); return
+        if is_pdf:
+            try: pages=len(PdfReader(io.BytesIO(data)).pages)
+            except Exception: pages=0
+            if pages and pages>max_pdf_pages:
+                await msg.reply_text(f"This PDF has {pages} pages; your limit is {max_pdf_pages}. Premium unlocks up to 30 pages."); return
+        await msg.reply_text("⏳ Reading the file and extracting MCQs…")
+        extracted=await extract_quiz_from_media(data,mime,max_q)
+        async with pool.connection() as conn:
+            cur=await conn.execute("INSERT INTO quiz_creator_drafts(owner_telegram_id,source_chat_id,title,source_name,questions) VALUES(%s,%s,%s,%s,%s::jsonb) RETURNING id",(user.id,chat.id,extracted["title"],"photo" if not is_pdf else "PDF",json.dumps(extracted["questions"],ensure_ascii=False)))
+            draft_id=int((await cur.fetchone())["id"])
+        await creator_increment_quota(user.id)
+        context.user_data["quiz_creator_waiting"] = False
+        await show_creator_draft(msg,draft_id,user.id)
+    except Exception as exc:
+        context.user_data["quiz_creator_waiting"] = False
+        logger.exception("Quiz Creator extraction failed: %s", type(exc).__name__)
+        await msg.reply_text("I couldn't reliably extract this file. Try a clearer image or smaller PDF. No quiz was published.")
+
+async def show_creator_draft(message, draft_id: int, owner_id: int) -> None:
+    if pool is None: return
+    async with pool.connection() as conn:
+        cur=await conn.execute("SELECT title,questions,status FROM quiz_creator_drafts WHERE id=%s AND owner_telegram_id=%s",(draft_id,owner_id)); row=await cur.fetchone()
+    if not row: return
+    qs=row["questions"] if isinstance(row["questions"],list) else json.loads(row["questions"])
+    preview=[]
+    for i,q in enumerate(qs[:3],1):
+        preview.append(f"{i}. {q['question_en'] or q['question_hi']}\nA) {q['options']['A']}  B) {q['options']['B']}\nC) {q['options']['C']}  D) {q['options']['D']}\nAnswer: {q['correct_option'] or 'UNCERTAIN — needs verification'}")
+    uncertain=sum(1 for q in qs if not q.get("correct_option") or q.get("answer_confidence")=="low")
+    await message.reply_text(f"📝 Draft #{draft_id}: {row['title']}\nQuestions: {len(qs)}\nAnswers needing verification: {uncertain}\n\n"+"\n\n".join(preview)+("\n\n…more questions in draft." if len(qs)>3 else "")+"\n\nCheck this preview. Uncertain answers cannot be published until verified.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛠 Correct answer key",callback_data=f"qc:fix:{draft_id}")],[InlineKeyboardButton("✅ Publish quiz to this chat",callback_data=f"qc:publish:{draft_id}")],[InlineKeyboardButton("🗑 Discard draft",callback_data=f"qc:discard:{draft_id}")],[InlineKeyboardButton("🗃 My Drafts",callback_data="qc:drafts")]]))
+
+async def creator_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
+    q=update.callback_query; user=update.effective_user; chat=update.effective_chat
+    if not q or not user or not chat: return
+    if data=="qc:menu":
+        await q.answer()
+        await q.edit_message_text("🧠 Quiz Creator Studio\n\nCreate a quiz from a photo or PDF, review the extracted questions, and publish as Telegram quiz polls.",reply_markup=creator_menu_keyboard()); return
+    if data == "qc:menu":
+        await q.edit_message_text("🧠 Quiz Creator Studio\n\nCreate a quiz from a photo or PDF, review the extracted questions, and publish as Telegram quiz polls.",reply_markup=creator_menu_keyboard()); return
+    if data in ("qc:photo","qc:pdf"):
+        context.user_data["quiz_creator_waiting"] = True
+        await q.answer()
+        await q.edit_message_text("Send the photo/screenshot or PDF as your next message. I will save an extracted draft for review."); return
+    if data=="qc:drafts":
+        await q.answer()
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT id,title FROM quiz_creator_drafts WHERE owner_telegram_id=%s AND status='draft' ORDER BY created_at DESC LIMIT 10",(user.id,)); rows=list(await cur.fetchall())
+        if not rows: await q.edit_message_text("You have no saved drafts.",reply_markup=creator_menu_keyboard()); return
+        keyboard=[[InlineKeyboardButton(f"#{r['id']} · {r['title'][:35]}",callback_data=f"qc:open:{r['id']}")] for r in rows]; keyboard.append([InlineKeyboardButton("⬅ Creator menu",callback_data="qc:menu")])
+        await q.edit_message_text("🗃 Your saved quiz drafts:",reply_markup=InlineKeyboardMarkup(keyboard)); return
+    if data.startswith("qc:open:"):
+        await q.answer()
+        await show_creator_draft(q.message,int(data.rsplit(":",1)[1]),user.id); return
+    if data.startswith("qc:fix:"):
+        draft_id=int(data.rsplit(":",1)[1])
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT id FROM quiz_creator_drafts WHERE id=%s AND owner_telegram_id=%s AND status='draft'",(draft_id,user.id)); found=await cur.fetchone()
+        if not found:
+            await q.answer("Draft not found.",show_alert=True); return
+        context.user_data["quiz_creator_fix_draft_id"]=draft_id
+        await q.answer()
+        await q.message.reply_text("Send answer-key corrections like: 1=A, 2=C, 5=D. This marks only those answers as manually verified; it does not change question wording or options.")
+        return
+    if data.startswith("qc:discard:"):
+        await q.answer()
+        draft_id=int(data.rsplit(":",1)[1])
+        async with pool.connection() as conn: await conn.execute("UPDATE quiz_creator_drafts SET status='discarded',updated_at=NOW() WHERE id=%s AND owner_telegram_id=%s AND status='draft'",(draft_id,user.id))
+        await q.edit_message_text("Draft discarded.",reply_markup=creator_menu_keyboard()); return
+    if data.startswith("qc:publish:"):
+        draft_id=int(data.rsplit(":",1)[1])
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT title,questions FROM quiz_creator_drafts WHERE id=%s AND owner_telegram_id=%s AND status='draft'",(draft_id,user.id)); row=await cur.fetchone()
+        if not row: await q.edit_message_text("Draft not found or already published."); return
+        qs=row["questions"] if isinstance(row["questions"],list) else json.loads(row["questions"])
+        uncertain=[i+1 for i,x in enumerate(qs) if x.get("correct_option") not in list("ABCDE") or x.get("answer_confidence")=="low"]
+        if uncertain: await q.answer("Verify uncertain answers first: question(s) "+", ".join(map(str,uncertain[:10])),show_alert=True); return
+        premium=await creator_is_premium(user.id)
+        if len(qs)>5 and not premium: await q.answer("Free trial is limited to 5 questions.",show_alert=True); return
+        if chat.type!=ChatType.PRIVATE and not premium: await q.answer("Group publishing is a Premium feature. Activate a pass first.",show_alert=True); return
+        await q.edit_message_text(f"Publishing {len(qs)} quiz questions…"); sent=0
+        try:
+            for idx,item in enumerate(qs,1):
+                options=[item["options"].get(k,"")[:100] or "—" for k in "ABCDE"]
+                await context.bot.send_poll(chat_id=chat.id,question=((item.get("question_en") or "") + ("\n" + item.get("question_hi", "") if item.get("question_hi") else "") or f"Question {idx}")[:300],options=options,type="quiz",correct_option_id="ABCDE".index(item["correct_option"]),explanation=(item.get("explanation_en") or item.get("explanation_hi") or "")[:200],is_anonymous=False)
+                sent+=1
+            async with pool.connection() as conn: await conn.execute("UPDATE quiz_creator_drafts SET status='published',updated_at=NOW() WHERE id=%s AND owner_telegram_id=%s",(draft_id,user.id))
+            await context.bot.send_message(chat_id=chat.id,text=f"✅ Published quiz: {row['title']}\n{sent} questions sent as Telegram quiz polls.")
+        except Exception:
+            logger.exception("Quiz Creator publish failed after %s polls",sent)
+            await context.bot.send_message(chat_id=chat.id,text=f"Publishing stopped after {sent} question(s). The draft remains available; check which polls were sent before retrying.")
 
 
 # ---------- Admin panel UI ----------
@@ -502,20 +687,22 @@ async def save_grant(actor_id: int, flow: dict) -> None:
     if pool is None:
         raise RuntimeError("Database is unavailable")
     target_id = int(flow["target_id"])
-    pass_code = flow["pass_code"]
-    vault_keys = flow["vault_keys"]
+    pass_code = str(flow["pass_code"])
+    vault_keys = list(flow["vault_keys"])
     duration = flow["duration"]
     expires_at = None if duration == "permanent" else datetime.now(timezone.utc) + timedelta(days=int(duration))
-    target = await user_summary(target_id)
-    if target is None:
-        raise RuntimeError("Student record no longer exists")
     async with pool.connection() as conn:
+        # Resolve and insert in one transaction to avoid stale user summaries/FK races.
+        cur = await conn.execute(
+            "SELECT id FROM app_users WHERE telegram_id = %s FOR UPDATE", (target_id,)
+        )
+        target = await cur.fetchone()
+        if target is None:
+            raise RuntimeError(f"No app_users row exists for Telegram ID {target_id}")
         await conn.execute(
-            """
-            INSERT INTO premium_passes
-                (user_id, granted_by_telegram_id, expires_at, note, pass_code, vault_keys)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """,
+            """INSERT INTO premium_passes
+               (user_id, granted_by_telegram_id, expires_at, note, pass_code, vault_keys)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
             (target["id"], actor_id, expires_at, "Granted via admin panel", pass_code, vault_keys),
         )
 
@@ -580,6 +767,9 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if query is None:
         return
     data = query.data or ""
+    if data.startswith("qc:"):
+        await creator_callback(update, context, data)
+        return
     # Admin callback data is always re-authorized; hiding the buttons is not the security boundary.
     if data.startswith("adm:"):
         if not admin_only(update):
@@ -688,9 +878,14 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 return
             try:
                 await save_grant(update.effective_user.id, flow)
-            except Exception:
-                logger.exception("Unable to grant pass")
-                await query.edit_message_text("❌ Could not save the pass. Please check the database migration and try again.", reply_markup=admin_home_keyboard())
+            except Exception as exc:
+                logger.exception("Unable to grant pass; database error type=%s detail=%s", type(exc).__name__, str(exc)[:700])
+                await query.edit_message_text(
+                    "❌ The pass could not be saved. I logged the exact database error on the server. "
+                    "No success has been reported and existing passes were not intentionally changed. "
+                    "Please check the latest Render log if this repeats.",
+                    reply_markup=admin_home_keyboard(),
+                )
                 context.user_data.pop("admin_flow", None)
                 return
             target_id = int(flow["target_id"])
@@ -834,11 +1029,46 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or not message.text or user is None:
+        return
+    # Quiz Creator answer-key correction is available only to the draft owner.
+    fix_draft_id = context.user_data.get("quiz_creator_fix_draft_id")
+    if fix_draft_id:
+        pairs = re.findall(r"(\d+)\s*=\s*([A-E])", message.text.upper())
+        if not pairs:
+            await message.reply_text("Use this format: 1=A, 2=C, 5=D. No changes were made.")
+            return
+        if pool is None:
+            await message.reply_text("Database unavailable; no changes were made.")
+            return
+        async with pool.connection() as conn:
+            cur = await conn.execute("SELECT questions FROM quiz_creator_drafts WHERE id=%s AND owner_telegram_id=%s AND status='draft'", (int(fix_draft_id), user.id))
+            draft = await cur.fetchone()
+            if not draft:
+                context.user_data.pop("quiz_creator_fix_draft_id", None)
+                await message.reply_text("Draft not found or no longer editable.")
+                return
+            questions = draft["questions"] if isinstance(draft["questions"], list) else json.loads(draft["questions"])
+            changed=[]
+            for number, letter in pairs:
+                idx=int(number)-1
+                if 0 <= idx < len(questions):
+                    questions[idx]["correct_option"] = letter
+                    questions[idx]["answer_confidence"] = "medium"
+                    changed.append(int(number))
+            if changed:
+                await conn.execute("UPDATE quiz_creator_drafts SET questions=%s::jsonb,updated_at=NOW() WHERE id=%s AND owner_telegram_id=%s", (json.dumps(questions,ensure_ascii=False), int(fix_draft_id), user.id))
+        context.user_data.pop("quiz_creator_fix_draft_id", None)
+        if not changed:
+            await message.reply_text("No valid question numbers were found. No changes were made.")
+        else:
+            await message.reply_text("Saved answer-key corrections for question(s): " + ", ".join(map(str, sorted(set(changed)))) + ". Review the draft again below.")
+            await show_creator_draft(message, int(fix_draft_id), user.id)
+        return
     # Ignore ordinary user text completely; admin text prompts work only in private chat.
     if not admin_only(update):
-        return
-    message = update.effective_message
-    if message is None or not message.text:
         return
     flow = context.user_data.get("admin_flow", {})
     step = flow.get("step")
@@ -955,8 +1185,10 @@ def main() -> None:
     application.add_handler(CommandHandler("tests", tests_command))
     application.add_handler(CommandHandler("mypremium", mypremium_command))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("createquiz", create_quiz_command))
     application.add_handler(CallbackQueryHandler(admin_callback))
-    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, admin_text_input))
+    application.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL), receive_quiz_media))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_input))
     application.add_error_handler(error_handler)
 
     logger.info("Starting BPSC Nexus Telegram bot in webhook mode.")

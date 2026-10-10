@@ -1,38 +1,37 @@
-# BPSC Nexus Premium Pass Admin Panel
+# BPSC Nexus Telegram Bot — Premium Pass + Quiz Creator
 
-This package upgrades the existing webhook-based Telegram bot with a button-based, admin-only Premium Pass panel.
+This package is a GitHub-ready update for the existing Python Telegram webhook bot. It retains the private, allowlisted Premium Pass admin panel and adds a photo/PDF Quiz Creator Studio.
 
-## Admin features
+## What is included
 
-- `/admin` opens the panel only for numeric Telegram IDs listed in `ADMIN_TELEGRAM_IDS`.
-- Grant pass by numeric Telegram ID or a username already known to the bot.
-- Choose BPSC PYQ, Ghatnachakra PYQ, UPSC PYQ, Dual Vault (choose any two), or All-Access.
-- Choose 7, 30, 90, 180 days, permanent access, or a custom number of days (1–3650).
-- Search/manage students, inspect active passes, extend a pass, revoke one pass without affecting other passes, and view membership statistics.
-- Admin callbacks are checked server-side; admin buttons are not sent to ordinary users. Admin panel is private-chat only.
-- Existing separate passes are preserved when granting another pass.
+- **Safer automatic database migration:** creates `premium_passes` if missing, adds missing compatibility columns, verifies the schema at startup, and logs the exact exception when a grant fails. No manual SQL paste should be required for these additions.
+- **Premium Pass admin panel:** `/admin`, admin ID allowlist, grant/manage/revoke passes, and multiple independent passes.
+- **Quiz Creator Studio:** photo/screenshot and PDF input; Gemini extraction to JSON; saved drafts; question preview; uncertain answers are not guessed and cannot be published; Telegram quiz-poll publishing; draft listing and discard.
+- **Trial limits:** non-premium users can extract up to 5 questions per quiz, PDFs up to 5 pages, and 2 creations per day. An active Premium Pass unlocks up to 50 questions and 30-page PDFs. Group publishing is gated to users with an active pass and verified group-admin status.
+- **File safety:** maximum 10 MB upload; source must be a photo or PDF. Only users who select Create from Photo/PDF have the next upload processed.
 
-## Before deployment
+## Deploy to existing Render service
 
-1. Back up the existing GitHub repository files locally.
-2. Run `premium_pass_migration.sql` in the SQL Editor of the dedicated BPSC Nexus Neon project. Do not run it against another application's database.
-3. Replace `bot.py`, `requirements.txt`, `render.yaml`, and `README.md` with this package's versions. Keep your existing webhook deployment structure and Render service.
-4. In Render Environment, keep `BOT_TOKEN`, `DATABASE_URL`, and `WEBHOOK_SECRET`; ensure `ADMIN_TELEGRAM_IDS` contains your numeric Telegram user ID(s), comma-separated if multiple.
-5. Deploy and test `/start`, `/admin`, `/tests`, and `/mypremium`.
+1. Back up your current GitHub files.
+2. Replace `bot.py`, `requirements.txt`, `.env.example`, and `README.md` with these files. Keep your existing `render.yaml` unless you intentionally want to change the service.
+3. In Render Environment, keep the existing `BOT_TOKEN`, `DATABASE_URL`, `WEBHOOK_SECRET`, and `ADMIN_TELEGRAM_IDS` values unchanged. Add `GEMINI_API_KEY` from Google AI Studio. Optionally set `GEMINI_MODEL` (default `gemini-2.5-flash`). Never paste secrets into GitHub.
+4. Commit/push the files and let Render redeploy. The startup migration adds the quiz-draft/usage tables and compatibility columns automatically.
+5. In Telegram, open the bot privately and send `/start`, then tap **Create Quiz from Photo/PDF**. Choose Photo or PDF, then send the file.
+6. Test the pass grant flow using a test account before granting paid access to real customers. Check Render logs if it fails; the new log records the underlying DB exception type and detail.
 
-## Important data mapping
+## Important behavior and limitations
 
-`tests.vault_key` defaults to `general` so existing tests are not automatically assigned to a product without confirmation. Assign each test to its correct vault using the SQL Editor, e.g. `UPDATE tests SET vault_key = 'bpsc_pyq' WHERE ...;`. Use the exact vault key names `bpsc_pyq`, `ghatnachakra_pyq`, and `upsc_pyq` for those products. All-Access unlocks any mapped vault. A test's legacy `is_premium = TRUE` flag still means a matching pass is required, but the `vault_key` must be set to the correct product to match product passes.
+- Gemini API usage may incur charges under your Google AI account and is subject to that account's quotas. Configure spending/usage limits in Google AI Studio/Cloud as available.
+- Extracted questions are saved as drafts. The preview shows the first three questions and flags uncertain answers. The bot blocks publication if an answer is missing or marked low-confidence; verify the answer key before publishing.
+- Publishing sends one Telegram quiz poll per question. This is not yet a full timed CBT engine, a payment gateway, or a complete group-subscription billing system.
+- In this version, any active student Premium Pass unlocks the larger Quiz Creator limits. Group publishing also requires an active pass and verified group-admin status. Group-specific paid subscriptions and reusable, categorized question libraries can be built as the next stage.
+- Render's free service can sleep. For dependable scheduled quizzes and production usage, use an always-on hosting plan.
 
-## Current scope
-
-This package manages memberships and filters the published test catalogue by vault entitlements. The interactive question attempt, answer submission, timer, and scoring engine are not included in this package.
-
-## Environment variables
+## Required environment variables
 
 - `BOT_TOKEN`
 - `DATABASE_URL`
-- `WEBHOOK_SECRET` (random secret, at least 16 characters)
-- `ADMIN_TELEGRAM_IDS` (numeric Telegram user IDs, comma-separated)
-
-Render provides `RENDER_EXTERNAL_URL` and `PORT` for the webhook service.
+- `WEBHOOK_SECRET` (random string, at least 16 characters)
+- `ADMIN_TELEGRAM_IDS` (comma-separated numeric Telegram IDs)
+- `GEMINI_API_KEY` (required for photo/PDF extraction)
+- `GEMINI_MODEL` (optional; defaults to `gemini-2.5-flash`)
