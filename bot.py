@@ -58,6 +58,47 @@ def is_private(update: Update) -> bool:
     return chat is not None and chat.type == "private"
 
 
+async def ensure_schema() -> None:
+    """Apply the small, idempotent Premium Pass migration automatically on startup.
+
+    This avoids requiring the owner to paste SQL into Neon. Existing tables and data
+    are preserved; only missing columns/indexes are added. Keep these statements
+    aligned with premium_pass_migration.sql.
+    """
+    if pool is None:
+        raise RuntimeError("Database pool is not available")
+
+    statements = [
+        "ALTER TABLE tests ADD COLUMN IF NOT EXISTS is_premium BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE tests ADD COLUMN IF NOT EXISTS vault_key TEXT NOT NULL DEFAULT 'general'",
+        """CREATE TABLE IF NOT EXISTS premium_passes (
+            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES app_users(id) ON DELETE RESTRICT,
+            granted_by_telegram_id BIGINT NOT NULL,
+            granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ,
+            revoked_at TIMESTAMPTZ,
+            revoked_by_telegram_id BIGINT,
+            note TEXT,
+            CHECK (expires_at IS NULL OR expires_at > granted_at),
+            CHECK (
+                (revoked_at IS NULL AND revoked_by_telegram_id IS NULL)
+                OR (revoked_at IS NOT NULL AND revoked_by_telegram_id IS NOT NULL)
+            )
+        )""",
+        "ALTER TABLE premium_passes ADD COLUMN IF NOT EXISTS pass_code TEXT NOT NULL DEFAULT 'legacy'",
+        "ALTER TABLE premium_passes ADD COLUMN IF NOT EXISTS vault_keys TEXT[] NOT NULL DEFAULT ARRAY['general']::TEXT[]",
+        "CREATE INDEX IF NOT EXISTS idx_premium_passes_user ON premium_passes(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_premium_passes_expiry ON premium_passes(expires_at) WHERE revoked_at IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_tests_vault_key ON tests(vault_key)",
+    ]
+    async with pool.connection() as conn:
+        for statement in statements:
+            await conn.execute(statement)
+        await conn.execute("SELECT pass_code, vault_keys FROM premium_passes LIMIT 0")
+        await conn.execute("SELECT is_premium, vault_key FROM tests LIMIT 0")
+
+
 async def post_init(application: Application) -> None:
     global pool
     if not BOT_TOKEN:
@@ -82,10 +123,8 @@ async def post_init(application: Application) -> None:
     await pool.wait()
     async with pool.connection() as conn:
         await conn.execute("SELECT 1")
-        # Fail early if the pass-system migration was not run.
-        await conn.execute("SELECT pass_code, vault_keys FROM premium_passes LIMIT 0")
-        await conn.execute("SELECT vault_key FROM tests LIMIT 0")
-    logger.info("Database connection and Premium Pass schema verified.")
+    await ensure_schema()
+    logger.info("Database connection verified; Premium Pass schema migration applied automatically.")
 
 
 async def post_shutdown(application: Application) -> None:
