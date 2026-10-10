@@ -4,7 +4,7 @@ This package is a GitHub-ready update for the existing Python Telegram webhook b
 
 ## What is included
 
-- **Safer automatic database migration:** creates `premium_passes` if missing, adds missing compatibility columns, verifies the schema at startup, and logs the exact exception when a grant fails. No manual SQL paste should be required for these additions.
+- **Safer automatic database migration:** creates `premium_passes` if missing, creates/verifies the pass catalogue, backfills missing pass IDs for legacy rows, and makes every new grant resolve the selected pass to a real pass_catalogue.id before inserting. It preserves existing passes and logs the exact exception when a grant fails. No manual SQL paste should be required for these additions.
 - **Premium Pass admin panel:** `/admin`, admin ID allowlist, grant/manage/revoke passes, and multiple independent passes.
 - **Quiz Creator Studio:** photo/screenshot and PDF input; Gemini extraction to JSON; saved drafts; question preview; uncertain answers are not guessed and cannot be published; Telegram quiz-poll publishing; draft listing and discard.
 - **Trial limits:** non-premium users can extract up to 5 questions per quiz, PDFs up to 5 pages, and 2 creations per day. An active Premium Pass unlocks up to 50 questions and 30-page PDFs. Group publishing is gated to users with an active pass and verified group-admin status.
@@ -13,9 +13,9 @@ This package is a GitHub-ready update for the existing Python Telegram webhook b
 ## Deploy to existing Render service
 
 1. Back up your current GitHub files.
-2. Replace `bot.py`, `requirements.txt`, `.env.example`, and `README.md` with these files. Keep your existing `render.yaml` unless you intentionally want to change the service.
+2. Replace `bot.py`, `requirements.txt`, `premium_pass_migration.sql`, and `README.md` with these files. Keep your existing `render.yaml`. Keep your existing `render.yaml` unless you intentionally want to change the service.
 3. In Render Environment, keep the existing `BOT_TOKEN`, `DATABASE_URL`, `WEBHOOK_SECRET`, and `ADMIN_TELEGRAM_IDS` values unchanged. Add `GEMINI_API_KEY` from Google AI Studio. Optionally set `GEMINI_MODEL` (default `gemini-2.5-flash`). Never paste secrets into GitHub.
-4. Commit/push the files and let Render redeploy. The startup migration adds the quiz-draft/usage tables and compatibility columns automatically.
+4. Commit/push the files and let Render redeploy. The startup migration creates/seeds `pass_catalogue`, fills missing `premium_passes.pass_id` values, enforces the catalogue relationship, and adds the Quiz Creator tables automatically.
 5. In Telegram, open the bot privately and send `/start`, then tap **Create Quiz from Photo/PDF**. Choose Photo or PDF, then send the file.
 6. Test the pass grant flow using a test account before granting paid access to real customers. Check Render logs if it fails; the new log records the underlying DB exception type and detail.
 
