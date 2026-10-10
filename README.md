@@ -1,37 +1,69 @@
-# BPSC Nexus Telegram Bot — Premium Pass + Quiz Creator
+# BPSC Nexus Telegram Bot — Question Bank + Quiz Delivery
 
-This package is a GitHub-ready update for the existing Python Telegram webhook bot. It retains the private, allowlisted Premium Pass admin panel and adds a photo/PDF Quiz Creator Studio.
+This update keeps the existing Premium Pass/admin membership features and adds a permanent categorized question bank with bulk import and in-bot quizzes. Photo/PDF extraction is intentionally deferred and is not exposed in the menu or command handlers in this phase.
 
-## What is included
+## Phase 1 features
 
-- **Safer automatic database migration:** creates `premium_passes` if missing, creates/verifies the pass catalogue, backfills missing pass IDs for legacy rows, and makes every new grant resolve the selected pass to a real pass_catalogue.id before inserting. It preserves existing passes and logs the exact exception when a grant fails. No manual SQL paste should be required for these additions.
-- **Premium Pass admin panel:** `/admin`, admin ID allowlist, grant/manage/revoke passes, and multiple independent passes.
-- **Quiz Creator Studio:** photo/screenshot and PDF input; Gemini extraction to JSON; saved drafts; question preview; uncertain answers are not guessed and cannot be published; Telegram quiz-poll publishing; draft listing and discard.
-- **Trial limits:** non-premium users can extract up to 5 questions per quiz, PDFs up to 5 pages, and 2 creations per day. An active Premium Pass unlocks up to 50 questions and 30-page PDFs. Group publishing is gated to users with an active pass and verified group-admin status.
-- **File safety:** maximum 10 MB upload; source must be a photo or PDF. Only users who select Create from Photo/PDF have the next upload processed.
+- **HTML / HTM / JSON / CSV bulk import** directly through the authorized admin's private chat with the bot. Imports are local parsers; no AI API calls are needed.
+- **Import preview and confirmation** showing recognized rows, ready questions, pending verification, likely duplicates and invalid rows before any permanent insert.
+- **Permanent question bank** with subject, topic, source, attribution, bilingual question/explanation fields, options, answer key, status and import-batch reference.
+- **Safe duplicate detection** based on normalized question and options. Suspected duplicates are skipped at database insertion; identical questions are not silently duplicated.
+- **Answer verification queue** for imported questions without a valid answer key. Pending questions cannot be used in scored quizzes until verified.
+- **Forward or paste a formatted MCQ** into the bot as an admin to preview and save it. The expected format is a question line, options such as `A. ...`, `B. ...`, and optional `Answer: B` / `Explanation: ...` lines.
+- **Question management** with search, details, edit, archive and delete-if-unused. Questions referenced by quizzes are protected from deletion.
+- **Import history and rollback**. Rollback removes questions from that batch only when no quiz references them; questions already used by a quiz are retained.
+- **Quiz builder** to choose a title, subject and 1–100 verified questions. Quizzes are built from existing bank records; the same question can be reused in multiple quizzes.
+- **Student quiz delivery in private chat** using `/quiz` or **Take a Quiz**. Practice mode provides immediate answer feedback/explanations. Exam mode hides correctness until submission, applies a timer and shows result analysis, answer review and explanations after submission.
+- **Scoring**: +1 for correct, −1/3 for incorrect and 0 for not attempted. Exam duration defaults to 60 minutes in this first release.
+- **Automatic database migration** for the new tables. No manual SQL execution is required; the app applies idempotent `CREATE TABLE/INDEX IF NOT EXISTS` statements at startup.
+- **Admin-only import and management** are checked server-side using `ADMIN_TELEGRAM_IDS` and private-chat access.
 
-## Deploy to existing Render service
+## Import file formats
 
-1. Back up your current GitHub files.
-2. Replace `bot.py`, `requirements.txt`, `premium_pass_migration.sql`, and `README.md` with these files. Keep your existing `render.yaml`. Keep your existing `render.yaml` unless you intentionally want to change the service.
-3. In Render Environment, keep the existing `BOT_TOKEN`, `DATABASE_URL`, `WEBHOOK_SECRET`, and `ADMIN_TELEGRAM_IDS` values unchanged. Add `GEMINI_API_KEY` from Google AI Studio. Optionally set `GEMINI_MODEL` (default `gemini-2.5-flash`). Never paste secrets into GitHub.
-4. Commit/push the files and let Render redeploy. The startup migration creates/seeds `pass_catalogue`, fills missing `premium_passes.pass_id` values, enforces the catalogue relationship, and adds the Quiz Creator tables automatically.
-5. In Telegram, open the bot privately and send `/start`, then tap **Create Quiz from Photo/PDF**. Choose Photo or PDF, then send the file.
-6. Test the pass grant flow using a test account before granting paid access to real customers. Check Render logs if it fails; the new log records the underlying DB exception type and detail.
+### JSON
 
-## Important behavior and limitations
+Accepted as a root array or an object containing a `questions`, `items`, `data`, `results`, `mcqs`, or `records` array. Common question, option, answer and explanation field names are supported. Example:
 
-- Gemini API usage may incur charges under your Google AI account and is subject to that account's quotas. Configure spending/usage limits in Google AI Studio/Cloud as available.
-- Extracted questions are saved as drafts. The preview shows the first three questions and flags uncertain answers. The bot blocks publication if an answer is missing or marked low-confidence; verify the answer key before publishing.
-- Publishing sends one Telegram quiz poll per question. This is not yet a full timed CBT engine, a payment gateway, or a complete group-subscription billing system.
-- In this version, any active student Premium Pass unlocks the larger Quiz Creator limits. Group publishing also requires an active pass and verified group-admin status. Group-specific paid subscriptions and reusable, categorized question libraries can be built as the next stage.
-- Render's free service can sleep. For dependable scheduled quizzes and production usage, use an always-on hosting plan.
+```json
+{
+  "questions": [
+    {
+      "question_en": "What is the capital of Bihar?",
+      "question_hi": "बिहार की राजधानी क्या है?",
+      "options": {"A": "Patna", "B": "Gaya", "C": "Delhi", "D": "Pune"},
+      "correct_option": "A",
+      "explanation_en": "Patna is the capital of Bihar.",
+      "subject": "Bihar Special",
+      "topic": "Geography",
+      "source": "Example source"
+    }
+  ]
+}
+```
 
-## Required environment variables
+### CSV
 
-- `BOT_TOKEN`
-- `DATABASE_URL`
-- `WEBHOOK_SECRET` (random string, at least 16 characters)
-- `ADMIN_TELEGRAM_IDS` (comma-separated numeric Telegram IDs)
-- `GEMINI_API_KEY` (required for photo/PDF extraction)
-- `GEMINI_MODEL` (optional; defaults to `gemini-2.5-flash`)
+Use a header row. Recommended columns: `question_en`, `question_hi`, `option_a`, `option_b`, `option_c`, `option_d`, optional `option_e`, `correct_answer`, `explanation_en`, `explanation_hi`, `subject`, `topic`, `source`, `source_url`, `attribution`. `question`, `optionA`-style aliases and several common answer-key aliases are also supported.
+
+### HTML / HTM
+
+The importer supports quiz data embedded in common JSON script blocks or JavaScript `questions`/`quizData` arrays, plus common question-card markup with recognizable question and option classes. HTML layouts vary; if a page's structure cannot be recognized reliably, export its questions to the supplied JSON/CSV shape instead of assuming every website's HTML is identical.
+
+## Deploy to the existing Render service
+
+1. Back up the current GitHub repository.
+2. Add/replace **`bot.py`**, **`question_bank.py`**, **`requirements.txt`**, and **`README.md`** from this package. Keep your existing `render.yaml` and database connection/environment values.
+3. In Render, keep `BOT_TOKEN`, `DATABASE_URL`, `WEBHOOK_SECRET`, and `ADMIN_TELEGRAM_IDS` unchanged. `GEMINI_API_KEY` is not required for this phase; photo/PDF extraction is disabled.
+4. Commit and push the files. Render should install the reduced requirements and redeploy.
+5. Open the bot privately, use `/admin`, then **Question Bank & Quiz Studio → Import HTML / JSON / CSV**. Choose a default subject, send the file, review the preview and confirm.
+6. Review pending answer keys, then build and publish a quiz. Students can use `/quiz` in their private chat.
+
+## Data safety and limitations
+
+- Existing app users, Premium Pass rows, pass catalogue and existing published tests are not dropped or rewritten. The new question bank uses separate tables.
+- The question bank is permanent and separate from quizzes. Quiz references prevent accidental deletion of questions already in use.
+- Importing does not rewrite wording or invent missing answers. Questions without a valid answer remain pending verification.
+- HTML parsing cannot guarantee support for every custom website layout; JSON or CSV is the most predictable exchange format.
+- This phase delivers an interactive Telegram quiz in private chat, not a browser-based visual CBT dashboard. Exam timers are enforced by the running bot process; an in-progress attempt can be interrupted by a hosting restart.
+- Photo/PDF extraction, AI-generated tagging, multi-select bulk editing and advanced charts are intentionally deferred.
+- Keep secrets out of GitHub. Render's free service may sleep, and a deployment restart interrupts live exam sessions.

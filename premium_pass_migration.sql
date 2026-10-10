@@ -114,3 +114,86 @@ CREATE TABLE IF NOT EXISTS quiz_creator_usage (
   quiz_count INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(owner_telegram_id, usage_day)
 );
+
+
+-- Question Bank + Quiz Delivery migration (also applied automatically by bot.py).
+CREATE TABLE IF NOT EXISTS question_import_batches (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        owner_telegram_id BIGINT NOT NULL,
+        file_name TEXT NOT NULL,
+        file_type TEXT NOT NULL,
+        selected_subject TEXT,
+        total_detected INTEGER NOT NULL DEFAULT 0,
+        imported_count INTEGER NOT NULL DEFAULT 0,
+        duplicate_count INTEGER NOT NULL DEFAULT 0,
+        invalid_count INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'completed',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+CREATE TABLE IF NOT EXISTS question_bank (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        question_en TEXT NOT NULL,
+        question_hi TEXT,
+        options JSONB NOT NULL DEFAULT '{}'::jsonb,
+        correct_option TEXT,
+        explanation_en TEXT,
+        explanation_hi TEXT,
+        subject TEXT NOT NULL DEFAULT 'Other / Unclassified',
+        topic TEXT,
+        source TEXT,
+        source_url TEXT,
+        attribution TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        question_hash TEXT NOT NULL,
+        import_batch_id BIGINT REFERENCES question_import_batches(id) ON DELETE SET NULL,
+        created_by_telegram_id BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT question_bank_status_check CHECK (status IN ('ready','pending','archived')),
+        CONSTRAINT question_bank_correct_check CHECK (correct_option IS NULL OR correct_option IN ('A','B','C','D','E'))
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_question_bank_hash ON question_bank(question_hash);
+CREATE INDEX IF NOT EXISTS idx_question_bank_subject_status ON question_bank(subject, status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_question_bank_batch ON question_bank(import_batch_id);
+CREATE TABLE IF NOT EXISTS bank_quizzes (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT,
+        subject TEXT NOT NULL,
+        created_by_telegram_id BIGINT NOT NULL,
+        is_published BOOLEAN NOT NULL DEFAULT FALSE,
+        duration_minutes INTEGER NOT NULL DEFAULT 60,
+        positive_marks NUMERIC(8,6) NOT NULL DEFAULT 1,
+        negative_marks NUMERIC(8,6) NOT NULL DEFAULT 0.333333,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        published_at TIMESTAMPTZ
+    );
+CREATE TABLE IF NOT EXISTS bank_quiz_questions (
+        quiz_id BIGINT NOT NULL REFERENCES bank_quizzes(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL,
+        question_id BIGINT NOT NULL REFERENCES question_bank(id) ON DELETE RESTRICT,
+        PRIMARY KEY (quiz_id, position),
+        UNIQUE (quiz_id, question_id)
+    );
+CREATE TABLE IF NOT EXISTS bank_quiz_attempts (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        quiz_id BIGINT NOT NULL REFERENCES bank_quizzes(id) ON DELETE RESTRICT,
+        telegram_id BIGINT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('practice','exam')),
+        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        submitted_at TIMESTAMPTZ,
+        total_questions INTEGER NOT NULL,
+        correct_count INTEGER NOT NULL DEFAULT 0,
+        incorrect_count INTEGER NOT NULL DEFAULT 0,
+        skipped_count INTEGER NOT NULL DEFAULT 0,
+        score NUMERIC(10,2) NOT NULL DEFAULT 0
+    );
+CREATE TABLE IF NOT EXISTS bank_quiz_attempt_answers (
+        attempt_id BIGINT NOT NULL REFERENCES bank_quiz_attempts(id) ON DELETE CASCADE,
+        question_id BIGINT NOT NULL REFERENCES question_bank(id) ON DELETE RESTRICT,
+        selected_option TEXT,
+        is_correct BOOLEAN,
+        PRIMARY KEY (attempt_id, question_id)
+    );
+CREATE INDEX IF NOT EXISTS idx_bank_quizzes_published ON bank_quizzes(is_published, id DESC);
+CREATE INDEX IF NOT EXISTS idx_bank_attempts_user ON bank_quiz_attempts(telegram_id, started_at DESC);

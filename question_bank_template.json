@@ -1,0 +1,22 @@
+{
+  "questions": [
+    {
+      "question_en": "What is the capital of Bihar?",
+      "question_hi": "बिहार की राजधानी क्या है?",
+      "options": {
+        "A": "Patna",
+        "B": "Gaya",
+        "C": "Delhi",
+        "D": "Pune"
+      },
+      "correct_option": "A",
+      "explanation_en": "Patna is the capital of Bihar.",
+      "explanation_hi": "पटना बिहार की राजधानी है।",
+      "subject": "Bihar Special",
+      "topic": "Geography",
+      "source": "Example Source",
+      "source_url": "",
+      "attribution": ""
+    }
+  ]
+}
