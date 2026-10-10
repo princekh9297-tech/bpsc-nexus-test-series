@@ -1,42 +1,56 @@
-# BPSC Nexus | Prelims Test Series Bot (Free Web Service starter)
+# BPSC Nexus Test Series — Premium Pass update
 
-Python Telegram bot using Telegram webhooks, Neon PostgreSQL, and Render Web Service.
+This update adds admin-only Premium Pass commands to the webhook-based Telegram bot.
 
-## Current features
+## Important prerequisite
 
-- `/start`: registers or updates a student's Telegram profile.
-- `/tests`: lists up to 30 published tests.
-- `/help`: lists available commands.
-- Neon connection check at startup.
-- Webhook mode for deployment as a Render Web Service.
+Run `premium_pass_migration.sql` in the dedicated BPSC Nexus Neon project's SQL Editor. It adds `tests.is_premium` and creates `premium_passes`. It does not delete existing records.
 
-Interactive exam attempts, timers, answer submission, marking, and analytics are not implemented yet.
+## Update GitHub files
 
-## Database
+Replace `bot.py`, `requirements.txt`, `render.yaml`, and `.env.example` with the versions in this package. Keep the repository private. Do not upload secrets.
 
-Use your dedicated Neon project. If you already created the six tables in `schema.sql`, do not rerun the schema unnecessarily.
+## Render environment variables
 
-## GitHub and Render
+Keep existing `BOT_TOKEN`, `DATABASE_URL`, and `WEBHOOK_SECRET`. Add:
 
-1. Upload these updated files to your existing private GitHub repository, replacing the old versions.
-2. In Render, create a **Web Service** from that repository and select the **Free** instance if offered.
-3. Build command: `pip install -r requirements.txt`
-4. Start command: `python bot.py`
-5. Add these environment variables in Render:
-   - `BOT_TOKEN`: token from @BotFather
-   - `DATABASE_URL`: Neon PostgreSQL connection string; keep SSL enabled
-   - `WEBHOOK_SECRET`: a random secret of at least 16 characters. Render's Blueprint may generate this automatically.
-6. Render automatically supplies `RENDER_EXTERNAL_URL` and `PORT` to deployed web services.
-7. Deploy, inspect logs, then test `/start` and `/tests` in Telegram.
+- `ADMIN_TELEGRAM_IDS`: your numeric Telegram user ID. Multiple administrators can be comma-separated, for example `123456789,987654321`.
 
-If using the Render Blueprint, review the generated environment variables before deploying. Do not place secrets in source files or GitHub.
+Never put a bot token or database password in source code. The previously exposed bot token should be revoked in BotFather and replaced in Render before deployment.
 
-## Free-tier caveats
+## Commands
 
-Render free web services can sleep after 15 minutes without incoming HTTP traffic and can restart. Telegram webhook delivery may be delayed during cold starts, so this is for a prototype rather than guaranteed always-on service. Check current Render limits and billing settings.
+- `/start` — register/update the user
+- `/tests` — list published tests available to the user
+- `/mypremium` — check own pass
+- `/grantpremium <Telegram ID or known @username> permanent`
+- `/grantpremium <Telegram ID or known @username> 30`
+- `/revokepremium <Telegram ID or known @username>`
+- `/premiumstatus <Telegram ID or known @username>`
 
-## Security
+A username can only be resolved if the person has interacted with the bot before, because Telegram does not provide a general API to look up arbitrary usernames. Prefer numeric Telegram IDs.
 
-- Keep bot and database credentials out of source control.
-- If a token is exposed, revoke it with BotFather.
-- Back up questions and important records.
+## Marking tests as premium
+
+In Neon SQL Editor, for example:
+
+```sql
+UPDATE tests SET is_premium = TRUE WHERE id = 123;
+```
+
+Only do this after creating the test and verifying its ID. To make a test public again:
+
+```sql
+UPDATE tests SET is_premium = FALSE WHERE id = 123;
+```
+
+The `/tests` catalogue filters premium tests by membership. This starter does not yet implement question-level delivery or the complete exam engine; those are separate development stages.
+
+## Deployment
+
+1. Run the migration.
+2. Replace the code files in GitHub and commit.
+3. Add `ADMIN_TELEGRAM_IDS` to Render Environment.
+4. Deploy latest commit.
+5. Test `/start`, `/mypremium`, and admin commands.
+6. Confirm a non-admin account cannot execute grant/revoke commands.
