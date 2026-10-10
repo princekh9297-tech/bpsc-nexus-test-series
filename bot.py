@@ -1,12 +1,18 @@
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -22,14 +28,38 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 ADMIN_TELEGRAM_IDS = {
     item.strip()
     for item in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",")
-    if item.strip()
+    if item.strip().isdigit()
 }
 pool: AsyncConnectionPool | None = None
+
+VAULTS = {
+    "bpsc_pyq": "BPSC PYQ",
+    "ghatnachakra_pyq": "Ghatnachakra PYQ",
+    "upsc_pyq": "UPSC PYQ",
+}
+PASS_NAMES = {
+    "bpsc_pyq": "BPSC PYQ Pass",
+    "ghatnachakra_pyq": "Ghatnachakra PYQ Pass",
+    "upsc_pyq": "UPSC PYQ Pass",
+    "dual_vault": "Dual Vault Pass",
+    "all_access": "All-Access Pass",
+    "legacy": "Legacy Premium Pass",
+}
+DURATIONS = {"7": 7, "30": 30, "90": 90, "180": 180}
+
+
+def is_admin(update: Update) -> bool:
+    user = update.effective_user
+    return user is not None and str(user.id) in ADMIN_TELEGRAM_IDS
+
+
+def is_private(update: Update) -> bool:
+    chat = update.effective_chat
+    return chat is not None and chat.type == "private"
 
 
 async def post_init(application: Application) -> None:
     global pool
-
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is missing.")
     if not DATABASE_URL:
@@ -39,7 +69,7 @@ async def post_init(application: Application) -> None:
     if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 16:
         raise RuntimeError("Set WEBHOOK_SECRET to a random string of at least 16 characters.")
     if not ADMIN_TELEGRAM_IDS:
-        logger.warning("ADMIN_TELEGRAM_IDS is empty; all admin commands will be denied.")
+        logger.warning("ADMIN_TELEGRAM_IDS is empty; all admin panel access will be denied.")
 
     pool = AsyncConnectionPool(
         conninfo=DATABASE_URL,
@@ -52,7 +82,10 @@ async def post_init(application: Application) -> None:
     await pool.wait()
     async with pool.connection() as conn:
         await conn.execute("SELECT 1")
-    logger.info("Database connection verified.")
+        # Fail early if the pass-system migration was not run.
+        await conn.execute("SELECT pass_code, vault_keys FROM premium_passes LIMIT 0")
+        await conn.execute("SELECT vault_key FROM tests LIMIT 0")
+    logger.info("Database connection and Premium Pass schema verified.")
 
 
 async def post_shutdown(application: Application) -> None:
@@ -60,20 +93,6 @@ async def post_shutdown(application: Application) -> None:
     if pool is not None:
         await pool.close()
         pool = None
-
-
-def is_admin(update: Update) -> bool:
-    user = update.effective_user
-    return user is not None and str(user.id) in ADMIN_TELEGRAM_IDS
-
-
-async def require_admin(update: Update) -> bool:
-    if is_admin(update):
-        return True
-    message = update.effective_message
-    if message:
-        await message.reply_text("⛔ This command is restricted to authorized administrators.")
-    return False
 
 
 async def save_user(update: Update) -> None:
@@ -94,7 +113,7 @@ async def save_user(update: Update) -> None:
 
 
 async def resolve_user_id(identifier: str) -> int | None:
-    """Resolve a numeric Telegram ID, or a username previously seen by this bot."""
+    """Resolve a numeric Telegram ID or a username already known to this bot."""
     if pool is None:
         return None
     clean = identifier.strip()
@@ -112,40 +131,68 @@ async def resolve_user_id(identifier: str) -> int | None:
                 (telegram_id,),
             )
         return telegram_id
-
     if not clean:
         return None
     async with pool.connection() as conn:
-        cursor = await conn.execute(
-            """
-            SELECT telegram_id
-            FROM app_users
-            WHERE LOWER(username) = LOWER(%s)
-            LIMIT 1
-            """,
+        cur = await conn.execute(
+            "SELECT telegram_id FROM app_users WHERE LOWER(username) = LOWER(%s) LIMIT 1",
             (clean,),
         )
-        row = await cursor.fetchone()
+        row = await cur.fetchone()
     return int(row["telegram_id"]) if row else None
 
 
-async def get_user_pk(telegram_id: int) -> int | None:
+async def user_summary(telegram_id: int) -> dict | None:
     if pool is None:
         return None
     async with pool.connection() as conn:
-        cursor = await conn.execute(
-            "SELECT id FROM app_users WHERE telegram_id = %s",
+        cur = await conn.execute(
+            "SELECT id, telegram_id, first_name, username FROM app_users WHERE telegram_id = %s",
             (telegram_id,),
         )
-        row = await cursor.fetchone()
-    return int(row["id"]) if row else None
+        return await cur.fetchone()
 
 
-async def has_active_premium(telegram_id: int) -> bool:
+async def active_passes_for_user(telegram_id: int) -> list[dict]:
+    if pool is None:
+        return []
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT pp.id, pp.pass_code, pp.vault_keys, pp.granted_at, pp.expires_at,
+                   pp.revoked_at, pp.granted_by_telegram_id, u.telegram_id
+            FROM premium_passes pp
+            JOIN app_users u ON u.id = pp.user_id
+            WHERE u.telegram_id = %s
+              AND pp.revoked_at IS NULL
+              AND (pp.expires_at IS NULL OR pp.expires_at > NOW())
+            ORDER BY pp.granted_at DESC
+            """,
+            (telegram_id,),
+        )
+        return list(await cur.fetchall())
+
+
+def pass_label(pass_code: str, vault_keys: list[str] | None = None) -> str:
+    if pass_code == "dual_vault" and vault_keys:
+        names = [VAULTS.get(key, key) for key in vault_keys if key != "*"]
+        return "Dual Vault Pass" + (f" ({' + '.join(names)})" if names else "")
+    if pass_code == "all_access":
+        return "All-Access Pass"
+    return PASS_NAMES.get(pass_code, pass_code.replace("_", " ").title())
+
+
+def duration_label(expires_at) -> str:
+    if expires_at is None:
+        return "Permanent"
+    return "Until " + expires_at.astimezone(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+
+
+async def has_vault_access(telegram_id: int, vault_key: str) -> bool:
     if pool is None:
         return False
     async with pool.connection() as conn:
-        cursor = await conn.execute(
+        cur = await conn.execute(
             """
             SELECT EXISTS (
                 SELECT 1
@@ -154,289 +201,695 @@ async def has_active_premium(telegram_id: int) -> bool:
                 WHERE u.telegram_id = %s
                   AND pp.revoked_at IS NULL
                   AND (pp.expires_at IS NULL OR pp.expires_at > NOW())
-            ) AS active
+                  AND (%s = ANY(pp.vault_keys) OR '*' = ANY(pp.vault_keys))
+            ) AS allowed
             """,
-            (telegram_id,),
+            (telegram_id, vault_key),
         )
-        row = await cursor.fetchone()
-    return bool(row and row["active"])
+        row = await cur.fetchone()
+    return bool(row and row["allowed"])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_private(update):
+        if update.effective_message:
+            await update.effective_message.reply_text("Please open me in a private chat to use the bot.")
+        return
     user = update.effective_user
     message = update.effective_message
     if user is None or message is None:
         return
-
     await save_user(update)
-    premium = await has_active_premium(user.id)
-    status = "✅ Premium Pass active" if premium else "Standard access"
-    await message.reply_text(
-        "Welcome to BPSC Nexus | Prelims Test Series!\n\n"
-        f"Membership: {status}\n\n"
-        "Use /tests to browse available tests.\n"
-        "Use /mypremium to check your Premium Pass.\n"
-        "Use /help to see available commands."
-    )
+    passes = await active_passes_for_user(user.id)
+    lines = [
+        "Welcome to BPSC Nexus | Prelims Test Series!",
+        "",
+        f"Active pass entitlements: {len(passes)}",
+        "Use the buttons below or commands /tests and /mypremium.",
+    ]
+    keyboard = [[InlineKeyboardButton("📚 Browse Tests", callback_data="user:tests")],
+                [InlineKeyboardButton("💎 My Membership", callback_data="user:premium")]]
+    if is_admin(update):
+        keyboard.append([InlineKeyboardButton("🛡️ Open Admin Panel", callback_data="adm:home")])
+    await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_private(update):
+        return
     message = update.effective_message
     if message is None:
         return
-    await message.reply_text(
-        "BPSC Nexus Test Series — commands\n\n"
-        "/start — Register and open the bot\n"
+    text = (
+        "BPSC Nexus Test Series\n\n"
+        "/start — Open the bot\n"
         "/tests — Browse published tests\n"
-        "/mypremium — Check your Premium Pass\n"
-        "/help — Show this help\n\n"
-        "Admin commands:\n"
-        "/grantpremium <Telegram ID or known @username> <permanent|days>\n"
-        "/revokepremium <Telegram ID or known @username>\n"
-        "/premiumstatus <Telegram ID or known @username>\n\n"
-        "A username can only be resolved if the account has previously interacted with this bot."
+        "/mypremium — Check your membership\n"
+        "/help — Show this help"
     )
+    if is_admin(update):
+        text += "\n/admin — Open the private admin panel"
+    await message.reply_text(text)
 
 
 async def mypremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_private(update):
+        return
     user = update.effective_user
     message = update.effective_message
     if user is None or message is None:
         return
-    if await has_active_premium(user.id):
-        if pool is None:
-            await message.reply_text("Unable to check membership right now.")
-            return
-        async with pool.connection() as conn:
-            cursor = await conn.execute(
-                """
-                SELECT pp.expires_at
-                FROM premium_passes pp
-                JOIN app_users u ON u.id = pp.user_id
-                WHERE u.telegram_id = %s
-                  AND pp.revoked_at IS NULL
-                  AND (pp.expires_at IS NULL OR pp.expires_at > NOW())
-                ORDER BY pp.granted_at DESC
-                LIMIT 1
-                """,
-                (user.id,),
-            )
-            row = await cursor.fetchone()
-        if row and row["expires_at"] is None:
-            await message.reply_text("💎 Your Premium Pass is active (permanent until revoked).")
-        elif row:
-            expiry = row["expires_at"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            await message.reply_text(f"💎 Your Premium Pass is active until {expiry}.")
-        else:
-            await message.reply_text("No active Premium Pass found.")
-    else:
+    await save_user(update)
+    passes = await active_passes_for_user(user.id)
+    if not passes:
         await message.reply_text("You currently have standard access. No active Premium Pass was found.")
+        return
+    lines = ["💎 Your active Premium Passes", ""]
+    for item in passes:
+        lines.append(f"• {pass_label(item['pass_code'], item['vault_keys'])}")
+        lines.append(f"  {duration_label(item['expires_at'])}")
+    await message.reply_text("\n".join(lines))
 
 
 async def tests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_private(update):
+        if update.effective_message:
+            await update.effective_message.reply_text("Please open me in a private chat to browse tests.")
+        return
     message = update.effective_message
     user = update.effective_user
     if message is None or user is None:
         return
+    await save_user(update)
     if pool is None:
         await message.reply_text("The test catalogue is temporarily unavailable. Please try again shortly.")
         return
-
-    premium = await has_active_premium(user.id)
     async with pool.connection() as conn:
-        cursor = await conn.execute(
+        cur = await conn.execute(
             """
-            SELECT id, title, description, test_type, duration_minutes, total_marks, is_premium
-            FROM tests
-            WHERE is_published = TRUE
-              AND (is_premium = FALSE OR %s = TRUE)
-            ORDER BY id DESC
-            LIMIT 30
+            SELECT t.id, t.title, t.description, t.test_type, t.duration_minutes,
+                   t.total_marks, t.is_premium, t.vault_key,
+                   EXISTS (
+                     SELECT 1 FROM premium_passes pp
+                     JOIN app_users u ON u.id = pp.user_id
+                     WHERE u.telegram_id = %s
+                       AND pp.revoked_at IS NULL
+                       AND (pp.expires_at IS NULL OR pp.expires_at > NOW())
+                       AND (t.vault_key = ANY(pp.vault_keys) OR '*' = ANY(pp.vault_keys))
+                   ) AS has_vault_access
+            FROM tests t
+            WHERE t.is_published = TRUE
+            ORDER BY t.id DESC
+            LIMIT 50
             """,
-            (premium,),
+            (user.id,),
         )
-        tests = await cursor.fetchall()
-        cursor = await conn.execute(
-            """
-            SELECT COUNT(*) AS locked_count
-            FROM tests
-            WHERE is_published = TRUE AND is_premium = TRUE
-            """
-        )
-        locked_row = await cursor.fetchone()
+        tests = list(await cur.fetchall())
 
     if not tests:
-        text = "No tests are published for your access level yet."
-    else:
-        lines = ["Available published tests", ""]
-        for test in tests:
-            kind = str(test["test_type"]).replace("_", " ").title()
-            marker = "💎 " if test["is_premium"] else ""
-            lines.append(
-                f'{marker}#{test["id"]} — {test["title"]}\n'
-                f'Type: {kind} | Duration: {test["duration_minutes"]} min '
-                f'| Marks: {test["total_marks"]}'
-            )
-            if test["description"]:
-                lines.append(str(test["description"])[:250])
-            lines.append("")
-        text = "\n".join(lines)
-
-    locked_count = int(locked_row["locked_count"]) if locked_row else 0
-    if not premium and locked_count:
-        text += (
-            f"\n💎 {locked_count} premium test(s) require a Premium Pass. "
-            "Contact the administrator for access."
-        )
-    text += "\nInteractive test attempts are a separate development stage."
-    await message.reply_text(text)
-
-
-async def grantpremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update):
+        await message.reply_text("No tests are published yet. Please check again later.")
         return
-    message = update.effective_message
-    actor = update.effective_user
-    if message is None or actor is None or pool is None:
-        return
-    if len(context.args) != 2:
-        await message.reply_text(
-            "Usage: /grantpremium <Telegram ID or known @username> <permanent|days>\n"
-            "Examples:\n/grantpremium 123456789 permanent\n/grantpremium 123456789 30"
-        )
-        return
+    lines = ["📚 Published tests", ""]
+    keyboard = []
+    for test in tests:
+        entitled = bool(test["has_vault_access"])
+        # Legacy is_premium flag is respected for tests that have not yet been assigned to a vault.
+        unlocked = (not test["is_premium"]) or entitled
+        vault_name = VAULTS.get(test["vault_key"], str(test["vault_key"]).replace("_", " ").title())
+        marker = "✅" if unlocked else "🔒"
+        lines.append(f"{marker} #{test['id']} — {test['title']}")
+        lines.append(f"Vault: {vault_name} | {test['duration_minutes']} min | {test['total_marks']} marks")
+        if test["description"]:
+            lines.append(str(test["description"])[:180])
+        if not unlocked:
+            lines.append("Access required: matching Premium Pass")
+        lines.append("")
+    lines.append("Question attempts and answer submission are a separate development stage.")
+    await message.reply_text("\n".join(lines))
 
-    identifier, duration = context.args
-    if duration.lower() == "permanent":
-        expires_at = None
-        duration_label = "permanent until revoked"
-    else:
-        try:
-            days = int(duration)
-        except ValueError:
-            days = 0
-        if days < 1 or days > 3650:
-            await message.reply_text("Duration must be 'permanent' or a number of days from 1 to 3650.")
-            return
-        expires_at = None
-        duration_label = f"{days} days"
 
+# ---------- Admin panel UI ----------
+def admin_home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Grant Pass", callback_data="adm:grant"),
+         InlineKeyboardButton("👥 Manage Members", callback_data="adm:manage")],
+        [InlineKeyboardButton("🗂 Pass Catalogue", callback_data="adm:catalogue"),
+         InlineKeyboardButton("📊 Statistics", callback_data="adm:stats")],
+    ])
+
+
+def admin_only(update: Update) -> bool:
+    return is_private(update) and is_admin(update)
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_private(update):
+        if update.effective_message:
+            await update.effective_message.reply_text("For security, the admin panel is available only in a private chat with the bot.")
+        return
+    if not is_admin(update):
+        if update.effective_message:
+            await update.effective_message.reply_text("⛔ This panel is available only to authorized administrators.")
+        return
+    context.user_data.pop("admin_flow", None)
+    await update.effective_message.reply_text("🛡️ BPSC Nexus Admin Panel\nChoose an action:", reply_markup=admin_home_keyboard())
+
+
+async def show_admin_home(query) -> None:
+    await query.edit_message_text("🛡️ BPSC Nexus Admin Panel\nChoose an action:", reply_markup=admin_home_keyboard())
+
+
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data="adm:cancel")]])
+
+
+def duration_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("7 days", callback_data=f"adm:{prefix}:dur:7"),
+         InlineKeyboardButton("30 days", callback_data=f"adm:{prefix}:dur:30")],
+        [InlineKeyboardButton("90 days", callback_data=f"adm:{prefix}:dur:90"),
+         InlineKeyboardButton("180 days", callback_data=f"adm:{prefix}:dur:180")],
+        [InlineKeyboardButton("♾ Permanent", callback_data=f"adm:{prefix}:dur:permanent"),
+         InlineKeyboardButton("✍️ Custom days", callback_data=f"adm:{prefix}:dur:custom")],
+        [InlineKeyboardButton("⬅ Back to Admin Panel", callback_data="adm:home")],
+    ])
+
+
+def pass_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("BPSC PYQ", callback_data="adm:pass:bpsc_pyq")],
+        [InlineKeyboardButton("Ghatnachakra PYQ", callback_data="adm:pass:ghatnachakra_pyq")],
+        [InlineKeyboardButton("UPSC PYQ", callback_data="adm:pass:upsc_pyq")],
+        [InlineKeyboardButton("🔀 Dual Vault (choose 2)", callback_data="adm:pass:dual_vault")],
+        [InlineKeyboardButton("👑 All-Access", callback_data="adm:pass:all_access")],
+        [InlineKeyboardButton("⬅ Back to Admin Panel", callback_data="adm:home")],
+    ])
+
+
+def dual_keyboard(selected: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for key, label in VAULTS.items():
+        mark = "✅ " if key in selected else "▫️ "
+        rows.append([InlineKeyboardButton(mark + label, callback_data=f"adm:dual:toggle:{key}")])
+    rows.append([InlineKeyboardButton("Continue with selected vaults", callback_data="adm:dual:done")])
+    rows.append([InlineKeyboardButton("⬅ Back", callback_data="adm:grant:passmenu")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def ask_target(query, context: ContextTypes.DEFAULT_TYPE, flow: str) -> None:
+    context.user_data["admin_flow"] = {"step": flow}
+    await query.edit_message_text(
+        "Send the student's Telegram username (e.g. @student) or numeric Telegram ID.\n\n"
+        "Username lookup works only if the student has previously started this bot. If not found, use their numeric ID.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+async def begin_duration(query, context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
+    flow = context.user_data.get("admin_flow", {})
+    flow["step"] = f"{mode}_duration"
+    context.user_data["admin_flow"] = flow
+    await query.edit_message_text("Choose the pass duration:", reply_markup=duration_keyboard(mode))
+
+
+async def lookup_target_for_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, identifier: str) -> bool:
     target = await resolve_user_id(identifier)
     if target is None:
-        await message.reply_text(
-            "I couldn't resolve that username. Use a numeric Telegram user ID, or ask the user to start this bot first."
+        await update.effective_message.reply_text(
+            "I couldn't find that username. Ask the student to press /start first, or enter their numeric Telegram ID."
         )
-        return
-    target_pk = await get_user_pk(target)
-    if target_pk is None:
-        await message.reply_text("Could not create or find the user's database record.")
-        return
+        return False
+    person = await user_summary(target)
+    if person is None:
+        await update.effective_message.reply_text("Couldn't load this student from the database. Please try the numeric ID again.")
+        return False
+    context.user_data.setdefault("admin_flow", {})["target_id"] = target
+    context.user_data["admin_flow"]["target_name"] = person.get("first_name") or "Student"
+    context.user_data["admin_flow"]["target_username"] = person.get("username")
+    return True
 
-    async with pool.connection() as conn:
-        async with conn.transaction():
-            await conn.execute(
-                """
-                UPDATE premium_passes
-                SET revoked_at = NOW(), revoked_by_telegram_id = %s
-                WHERE user_id = %s AND revoked_at IS NULL
-                  AND (expires_at IS NULL OR expires_at > NOW())
-                """,
-                (actor.id, target_pk),
-            )
-            if duration.lower() == "permanent":
-                await conn.execute(
-                    """
-                    INSERT INTO premium_passes (user_id, granted_by_telegram_id, expires_at)
-                    VALUES (%s, %s, NULL)
-                    """,
-                    (target_pk, actor.id),
-                )
-            else:
-                await conn.execute(
-                    """
-                    INSERT INTO premium_passes (user_id, granted_by_telegram_id, expires_at)
-                    VALUES (%s, %s, NOW() + (%s * INTERVAL '1 day'))
-                    """,
-                    (target_pk, actor.id, days),
-                )
-    await message.reply_text(
-        f"✅ Premium Pass granted.\nTelegram ID: {target}\nDuration: {duration_label}"
+
+async def grant_confirmation(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    flow = context.user_data.get("admin_flow", {})
+    target_id = flow.get("target_id")
+    pass_code = flow.get("pass_code")
+    vault_keys = flow.get("vault_keys", [])
+    duration = flow.get("duration")
+    if not target_id or not pass_code or not vault_keys or duration is None:
+        await query.edit_message_text("This grant session is incomplete. Please start again from the Admin Panel.", reply_markup=admin_home_keyboard())
+        context.user_data.pop("admin_flow", None)
+        return
+    person = await user_summary(int(target_id))
+    username = f" (@{person['username']})" if person and person.get("username") else ""
+    expiry = "Permanent" if duration == "permanent" else f"{duration} days"
+    label = pass_label(pass_code, vault_keys)
+    flow["step"] = "grant_confirm"
+    context.user_data["admin_flow"] = flow
+    await query.edit_message_text(
+        "Please confirm this membership grant:\n\n"
+        f"Student: {flow.get('target_name', 'Student')}{username}\n"
+        f"Telegram ID: {target_id}\n"
+        f"Pass: {label}\n"
+        f"Duration: {expiry}\n\n"
+        "Existing separate passes will be preserved.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm Grant", callback_data="adm:grant:confirm")],
+            [InlineKeyboardButton("✖ Cancel", callback_data="adm:cancel")],
+        ]),
     )
 
 
-async def revokepremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update):
-        return
-    message = update.effective_message
-    actor = update.effective_user
-    if message is None or actor is None or pool is None:
-        return
-    if len(context.args) != 1:
-        await message.reply_text("Usage: /revokepremium <Telegram ID or known @username>")
-        return
-    target = await resolve_user_id(context.args[0])
+async def save_grant(actor_id: int, flow: dict) -> None:
+    if pool is None:
+        raise RuntimeError("Database is unavailable")
+    target_id = int(flow["target_id"])
+    pass_code = flow["pass_code"]
+    vault_keys = flow["vault_keys"]
+    duration = flow["duration"]
+    expires_at = None if duration == "permanent" else datetime.now(timezone.utc) + timedelta(days=int(duration))
+    target = await user_summary(target_id)
     if target is None:
-        await message.reply_text("User not found. Use a numeric Telegram user ID or a known username.")
-        return
-    target_pk = await get_user_pk(target)
-    if target_pk is None:
-        await message.reply_text("User not found in the database.")
-        return
+        raise RuntimeError("Student record no longer exists")
     async with pool.connection() as conn:
-        cursor = await conn.execute(
+        await conn.execute(
             """
-            UPDATE premium_passes
-            SET revoked_at = NOW(), revoked_by_telegram_id = %s
-            WHERE user_id = %s AND revoked_at IS NULL
-              AND (expires_at IS NULL OR expires_at > NOW())
+            INSERT INTO premium_passes
+                (user_id, granted_by_telegram_id, expires_at, note, pass_code, vault_keys)
+            VALUES (%s, %s, %s, %s, %s, %s)
             """,
-            (actor.id, target_pk),
+            (target["id"], actor_id, expires_at, "Granted via admin panel", pass_code, vault_keys),
         )
-        count = cursor.rowcount
-    await message.reply_text(
-        f"Revoked {count} active Premium Pass record(s) for Telegram ID {target}."
-        if count else f"No active Premium Pass found for Telegram ID {target}."
-    )
 
 
-async def premiumstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update):
+async def show_member(query, telegram_id: int) -> None:
+    person = await user_summary(telegram_id)
+    if person is None:
+        await query.edit_message_text("Student not found in the database.", reply_markup=admin_home_keyboard())
         return
-    message = update.effective_message
-    if message is None or pool is None:
-        return
-    if len(context.args) != 1:
-        await message.reply_text("Usage: /premiumstatus <Telegram ID or known @username>")
-        return
-    target = await resolve_user_id(context.args[0])
-    if target is None:
-        await message.reply_text("User not found. Use a numeric Telegram user ID or a known username.")
-        return
-    async with pool.connection() as conn:
-        cursor = await conn.execute(
-            """
-            SELECT pp.granted_at, pp.expires_at, pp.revoked_at, pp.granted_by_telegram_id
-            FROM premium_passes pp
-            JOIN app_users u ON u.id = pp.user_id
-            WHERE u.telegram_id = %s
-            ORDER BY pp.granted_at DESC
-            LIMIT 1
-            """,
-            (target,),
-        )
-        row = await cursor.fetchone()
-    if row is None:
-        await message.reply_text(f"No Premium Pass history for Telegram ID {target}.")
-    elif row["revoked_at"] is not None:
-        await message.reply_text(f"Latest pass for {target} was revoked at {row['revoked_at']}.")
-    elif row["expires_at"] is not None and row["expires_at"] <= datetime.now(timezone.utc):
-        await message.reply_text(f"Latest pass for {target} expired at {row['expires_at']}.")
+    display = person.get("first_name") or "Student"
+    if person.get("username"):
+        display += f" (@{person['username']})"
+    passes = await active_passes_for_user(telegram_id)
+    lines = [f"👤 {display}", f"Telegram ID: {telegram_id}", ""]
+    keyboard = []
+    if passes:
+        lines.append("Active passes:")
+        for item in passes:
+            lines.append(f"• #{item['id']} {pass_label(item['pass_code'], item['vault_keys'])} — {duration_label(item['expires_at'])}")
+            row = []
+            if item["expires_at"] is not None:
+                row.append(InlineKeyboardButton(f"Extend #{item['id']}", callback_data=f"adm:extend:{item['id']}"))
+            row.append(InlineKeyboardButton(f"Revoke #{item['id']}", callback_data=f"adm:revoke:{item['id']}"))
+            keyboard.append(row)
     else:
-        expiry = "Permanent until revoked" if row["expires_at"] is None else str(row["expires_at"])
-        await message.reply_text(
-            f"Latest Premium Pass for {target}\nStatus: ACTIVE\nExpiry: {expiry}\n"
-            f"Granted by: {row['granted_by_telegram_id']}"
+        lines.append("No active passes found.")
+    keyboard.append([InlineKeyboardButton("➕ Grant another pass", callback_data=f"adm:grantto:{telegram_id}")])
+    keyboard.append([InlineKeyboardButton("🔎 Find another student", callback_data="adm:manage")])
+    keyboard.append([InlineKeyboardButton("⬅ Admin Panel", callback_data="adm:home")])
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def admin_stats(query) -> None:
+    if pool is None:
+        await query.edit_message_text("Database unavailable.", reply_markup=admin_home_keyboard())
+        return
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT COUNT(*) FILTER (WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())) AS active_passes,
+                   COUNT(DISTINCT user_id) FILTER (WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())) AS active_students,
+                   COUNT(*) FILTER (WHERE revoked_at IS NULL AND expires_at IS NOT NULL AND expires_at <= NOW()) AS expired_passes,
+                   COUNT(*) FILTER (WHERE revoked_at IS NOT NULL) AS revoked_passes,
+                   COUNT(*) FILTER (WHERE revoked_at IS NULL AND expires_at IS NULL) AS permanent_passes
+            FROM premium_passes
+            """
         )
+        row = await cur.fetchone()
+    await query.edit_message_text(
+        "📊 Membership Statistics\n\n"
+        f"Active students: {row['active_students']}\n"
+        f"Active passes: {row['active_passes']}\n"
+        f"Permanent active passes: {row['permanent_passes']}\n"
+        f"Expired passes: {row['expired_passes']}\n"
+        f"Revoked passes: {row['revoked_passes']}",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Admin Panel", callback_data="adm:home")]]),
+    )
+
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    data = query.data or ""
+    # Admin callback data is always re-authorized; hiding the buttons is not the security boundary.
+    if data.startswith("adm:"):
+        if not admin_only(update):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        await query.answer()
+        if data == "adm:home":
+            context.user_data.pop("admin_flow", None)
+            await show_admin_home(query)
+        elif data == "adm:cancel":
+            context.user_data.pop("admin_flow", None)
+            await query.edit_message_text("Cancelled.", reply_markup=admin_home_keyboard())
+        elif data == "adm:grant":
+            await ask_target(query, context, "grant_target")
+        elif data == "adm:manage":
+            await ask_target(query, context, "manage_target")
+        elif data == "adm:catalogue":
+            await query.edit_message_text(
+                "🗂 Pass Catalogue\n\n"
+                "• BPSC PYQ Pass — BPSC PYQ vault\n"
+                "• Ghatnachakra PYQ Pass — Ghatnachakra vault\n"
+                "• UPSC PYQ Pass — UPSC PYQ vault\n"
+                "• Dual Vault Pass — choose any two vaults when granting\n"
+                "• All-Access Pass — every mapped vault, including future vaults\n\n"
+                "Available durations: 7, 30, 90, 180 days, permanent, or custom days.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Admin Panel", callback_data="adm:home")]]),
+            )
+        elif data == "adm:stats":
+            await admin_stats(query)
+        elif data == "adm:grant:passmenu":
+            await query.edit_message_text("Choose a pass:", reply_markup=pass_keyboard())
+        elif data.startswith("adm:pass:"):
+            code = data.split(":", 2)[2]
+            flow = context.user_data.get("admin_flow", {})
+            if flow.get("step") not in {"grant_pass", "grant_target", "dual_vaults"} or not flow.get("target_id"):
+                await query.edit_message_text("Grant session expired. Start again.", reply_markup=admin_home_keyboard())
+                context.user_data.pop("admin_flow", None)
+                return
+            if code == "dual_vault":
+                flow["step"] = "dual_vaults"
+                flow["selected_vaults"] = []
+                context.user_data["admin_flow"] = flow
+                await query.edit_message_text("Select exactly two vaults for this Dual Vault Pass:", reply_markup=dual_keyboard([]))
+            elif code in VAULTS:
+                flow["pass_code"] = code
+                flow["vault_keys"] = [code]
+                flow["step"] = "grant_duration"
+                context.user_data["admin_flow"] = flow
+                await query.edit_message_text(f"Selected: {PASS_NAMES[code]}\nChoose duration:", reply_markup=duration_keyboard("grant"))
+            elif code == "all_access":
+                flow["pass_code"] = code
+                flow["vault_keys"] = ["*"]
+                flow["step"] = "grant_duration"
+                context.user_data["admin_flow"] = flow
+                await query.edit_message_text("Selected: All-Access Pass\nChoose duration:", reply_markup=duration_keyboard("grant"))
+        elif data.startswith("adm:dual:toggle:"):
+            key = data.split(":", 3)[3]
+            flow = context.user_data.get("admin_flow", {})
+            if flow.get("step") != "dual_vaults" or key not in VAULTS:
+                await query.edit_message_text("Dual Vault selection expired. Start again.", reply_markup=admin_home_keyboard())
+                return
+            selected = list(flow.get("selected_vaults", []))
+            if key in selected:
+                selected.remove(key)
+            elif len(selected) < 2:
+                selected.append(key)
+            flow["selected_vaults"] = selected
+            context.user_data["admin_flow"] = flow
+            await query.edit_message_text(f"Select exactly two vaults ({len(selected)}/2 selected):", reply_markup=dual_keyboard(selected))
+        elif data == "adm:dual:done":
+            flow = context.user_data.get("admin_flow", {})
+            selected = list(flow.get("selected_vaults", []))
+            if flow.get("step") != "dual_vaults" or len(selected) != 2:
+                await query.edit_message_text(
+                    f"Please select exactly two vaults ({len(selected)}/2 selected):",
+                    reply_markup=dual_keyboard(selected),
+                )
+                return
+            flow["pass_code"] = "dual_vault"
+            flow["vault_keys"] = selected
+            flow["step"] = "grant_duration"
+            context.user_data["admin_flow"] = flow
+            await query.edit_message_text(
+                f"Selected: Dual Vault Pass ({' + '.join(VAULTS[k] for k in selected)})\nChoose duration:",
+                reply_markup=duration_keyboard("grant"),
+            )
+        elif data.startswith("adm:grant:dur:"):
+            value = data.rsplit(":", 1)[1]
+            flow = context.user_data.get("admin_flow", {})
+            if flow.get("step") != "grant_duration":
+                await query.edit_message_text("Grant session expired. Start again.", reply_markup=admin_home_keyboard())
+                return
+            if value == "custom":
+                flow["step"] = "grant_custom_days"
+                context.user_data["admin_flow"] = flow
+                await query.edit_message_text("Send the number of days (1–3650).", reply_markup=cancel_keyboard())
+            else:
+                flow["duration"] = "permanent" if value == "permanent" else DURATIONS.get(value)
+                context.user_data["admin_flow"] = flow
+                await grant_confirmation(query, context)
+        elif data == "adm:grant:confirm":
+            flow = context.user_data.get("admin_flow", {})
+            if flow.get("step") != "grant_confirm":
+                await query.edit_message_text("Grant session expired. Start again.", reply_markup=admin_home_keyboard())
+                context.user_data.pop("admin_flow", None)
+                return
+            try:
+                await save_grant(update.effective_user.id, flow)
+            except Exception:
+                logger.exception("Unable to grant pass")
+                await query.edit_message_text("❌ Could not save the pass. Please check the database migration and try again.", reply_markup=admin_home_keyboard())
+                context.user_data.pop("admin_flow", None)
+                return
+            target_id = int(flow["target_id"])
+            label = pass_label(flow["pass_code"], flow["vault_keys"])
+            duration = "Permanent" if flow["duration"] == "permanent" else f"{flow['duration']} days"
+            context.user_data.pop("admin_flow", None)
+            await query.edit_message_text(
+                f"✅ Pass granted successfully.\n\nStudent ID: {target_id}\nPass: {label}\nDuration: {duration}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👤 Manage this student", callback_data=f"adm:member:{target_id}")],
+                    [InlineKeyboardButton("⬅ Admin Panel", callback_data="adm:home")],
+                ]),
+            )
+        elif data.startswith("adm:grantto:"):
+            target_id = int(data.rsplit(":", 1)[1])
+            person = await user_summary(target_id)
+            if person is None:
+                await query.edit_message_text("Student not found.", reply_markup=admin_home_keyboard())
+                return
+            context.user_data["admin_flow"] = {
+                "step": "grant_pass", "target_id": target_id,
+                "target_name": person.get("first_name") or "Student",
+                "target_username": person.get("username"),
+            }
+            await query.edit_message_text("Choose a pass for this student:", reply_markup=pass_keyboard())
+        elif data.startswith("adm:member:"):
+            target_id = int(data.rsplit(":", 1)[1])
+            await show_member(query, target_id)
+        elif data.startswith("adm:extend:") and data != "adm:extend:confirm" and ":dur:" not in data:
+            pass_id = int(data.rsplit(":", 1)[1])
+            context.user_data["admin_flow"] = {"step": "extend_duration", "pass_id": pass_id}
+            await query.edit_message_text("Choose how much time to add to this pass:", reply_markup=duration_keyboard("extend"))
+        elif data.startswith("adm:extend:dur:"):
+            value = data.rsplit(":", 1)[1]
+            flow = context.user_data.get("admin_flow", {})
+            if flow.get("step") != "extend_duration":
+                await query.edit_message_text("Extension session expired.", reply_markup=admin_home_keyboard())
+                return
+            if value == "custom":
+                flow["step"] = "extend_custom_days"
+                context.user_data["admin_flow"] = flow
+                await query.edit_message_text("Send the number of days to add (1–3650).", reply_markup=cancel_keyboard())
+            else:
+                flow["extension"] = "permanent" if value == "permanent" else DURATIONS.get(value)
+                context.user_data["admin_flow"] = flow
+                await query.edit_message_text(
+                    f"Confirm extension of pass #{flow['pass_id']} by {('permanent access' if flow['extension'] == 'permanent' else str(flow['extension']) + ' days')}?",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Confirm Extension", callback_data="adm:extend:confirm")],
+                        [InlineKeyboardButton("✖ Cancel", callback_data="adm:cancel")],
+                    ]),
+                )
+        elif data == "adm:extend:confirm":
+            flow = context.user_data.get("admin_flow", {})
+            if flow.get("step") != "extend_duration" or "extension" not in flow:
+                await query.edit_message_text("Extension session expired.", reply_markup=admin_home_keyboard())
+                return
+            pass_id = int(flow["pass_id"])
+            extension = flow["extension"]
+            if pool is None:
+                await query.edit_message_text("Database unavailable.", reply_markup=admin_home_keyboard())
+                return
+            async with pool.connection() as conn:
+                if extension == "permanent":
+                    cur = await conn.execute(
+                        "UPDATE premium_passes SET expires_at = NULL WHERE id = %s AND revoked_at IS NULL RETURNING user_id",
+                        (pass_id,),
+                    )
+                else:
+                    cur = await conn.execute(
+                        """UPDATE premium_passes SET expires_at = GREATEST(COALESCE(expires_at, NOW()), NOW()) + (%s * INTERVAL '1 day')
+                           WHERE id = %s AND revoked_at IS NULL AND expires_at IS NOT NULL RETURNING user_id""",
+                        (int(extension), pass_id),
+                    )
+                row = await cur.fetchone()
+                if row is None and extension != "permanent":
+                    await query.edit_message_text("This pass may be revoked or permanent already. No change was made.", reply_markup=admin_home_keyboard())
+                    context.user_data.pop("admin_flow", None)
+                    return
+                if row is None:
+                    await query.edit_message_text("Pass not found or already revoked.", reply_markup=admin_home_keyboard())
+                    context.user_data.pop("admin_flow", None)
+                    return
+                cur = await conn.execute("SELECT telegram_id FROM app_users WHERE id = %s", (row["user_id"],))
+                owner = await cur.fetchone()
+            context.user_data.pop("admin_flow", None)
+            await query.edit_message_text("✅ Pass updated successfully.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👤 Manage this student", callback_data=f"adm:member:{owner['telegram_id']}")],
+                [InlineKeyboardButton("⬅ Admin Panel", callback_data="adm:home")],
+            ]))
+        elif data.startswith("adm:revoke:") and data != "adm:revoke:confirm":
+            pass_id = int(data.rsplit(":", 1)[1])
+            context.user_data["admin_flow"] = {"step": "revoke_confirm", "pass_id": pass_id}
+            await query.edit_message_text(
+                f"Revoke pass #{pass_id}? The student will lose access from this pass, but other passes remain active.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑 Confirm Revoke", callback_data="adm:revoke:confirm")],
+                    [InlineKeyboardButton("✖ Cancel", callback_data="adm:cancel")],
+                ]),
+            )
+        elif data == "adm:revoke:confirm":
+            flow = context.user_data.get("admin_flow", {})
+            if flow.get("step") != "revoke_confirm":
+                await query.edit_message_text("Revoke session expired.", reply_markup=admin_home_keyboard())
+                return
+            if pool is None:
+                await query.edit_message_text("Database unavailable.", reply_markup=admin_home_keyboard())
+                return
+            async with pool.connection() as conn:
+                cur = await conn.execute(
+                    "UPDATE premium_passes SET revoked_at = NOW(), revoked_by_telegram_id = %s WHERE id = %s AND revoked_at IS NULL RETURNING user_id",
+                    (update.effective_user.id, int(flow["pass_id"])),
+                )
+                row = await cur.fetchone()
+                if row:
+                    cur = await conn.execute("SELECT telegram_id FROM app_users WHERE id = %s", (row["user_id"],))
+                    owner = await cur.fetchone()
+                else:
+                    owner = None
+            context.user_data.pop("admin_flow", None)
+            if owner:
+                await query.edit_message_text("✅ Pass revoked. Other passes for this student are unchanged.", reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👤 Manage this student", callback_data=f"adm:member:{owner['telegram_id']}")],
+                    [InlineKeyboardButton("⬅ Admin Panel", callback_data="adm:home")],
+                ]))
+            else:
+                await query.edit_message_text("No active pass was changed.", reply_markup=admin_home_keyboard())
+        else:
+            await query.edit_message_text("Unknown action. Return to the Admin Panel.", reply_markup=admin_home_keyboard())
+        return
+
+    # User callbacks never expose admin actions.
+    if data == "user:tests":
+        await query.answer()
+        await tests_command(update, context)
+    elif data == "user:premium":
+        await query.answer()
+        await mypremium_command(update, context)
+    else:
+        await query.answer("This action is no longer available.", show_alert=True)
+
+
+async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Ignore ordinary user text completely; admin text prompts work only in private chat.
+    if not admin_only(update):
+        return
+    message = update.effective_message
+    if message is None or not message.text:
+        return
+    flow = context.user_data.get("admin_flow", {})
+    step = flow.get("step")
+    if step in {"grant_target", "manage_target"}:
+        if not await lookup_target_for_flow(update, context, message.text.strip()):
+            return
+        target_id = int(context.user_data["admin_flow"]["target_id"])
+        if step == "grant_target":
+            context.user_data["admin_flow"]["step"] = "grant_pass"
+            await message.reply_text("Choose a pass:", reply_markup=pass_keyboard())
+        else:
+            context.user_data.pop("admin_flow", None)
+            await message.reply_text("Student membership details:")
+            # Send a fresh management view because this step started from a typed identifier.
+            await send_member_message(message, target_id)
+    elif step == "grant_custom_days":
+        try:
+            days = int(message.text.strip())
+        except ValueError:
+            await message.reply_text("Enter a whole number from 1 to 3650.")
+            return
+        if not 1 <= days <= 3650:
+            await message.reply_text("Enter a whole number from 1 to 3650.")
+            return
+        flow["duration"] = days
+        context.user_data["admin_flow"] = flow
+        await send_grant_confirmation_message(message, context)
+    elif step == "extend_custom_days":
+        try:
+            days = int(message.text.strip())
+        except ValueError:
+            await message.reply_text("Enter a whole number from 1 to 3650.")
+            return
+        if not 1 <= days <= 3650:
+            await message.reply_text("Enter a whole number from 1 to 3650.")
+            return
+        flow["extension"] = days
+        flow["step"] = "extend_duration"
+        context.user_data["admin_flow"] = flow
+        await message.reply_text(
+            f"Confirm adding {days} days to pass #{flow['pass_id']}?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm Extension", callback_data="adm:extend:confirm")],
+                [InlineKeyboardButton("✖ Cancel", callback_data="adm:cancel")],
+            ]),
+        )
+
+
+async def send_grant_confirmation_message(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    flow = context.user_data.get("admin_flow", {})
+    person = await user_summary(int(flow["target_id"]))
+    username = f" (@{person['username']})" if person and person.get("username") else ""
+    expiry = "Permanent" if flow["duration"] == "permanent" else f"{flow['duration']} days"
+    await message.reply_text(
+        "Please confirm this membership grant:\n\n"
+        f"Student: {flow.get('target_name', 'Student')}{username}\n"
+        f"Telegram ID: {flow['target_id']}\n"
+        f"Pass: {pass_label(flow['pass_code'], flow['vault_keys'])}\n"
+        f"Duration: {expiry}\n\nExisting separate passes will be preserved.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm Grant", callback_data="adm:grant:confirm")],
+            [InlineKeyboardButton("✖ Cancel", callback_data="adm:cancel")],
+        ]),
+    )
+    context.user_data["admin_flow"]["step"] = "grant_confirm"
+
+
+async def send_member_message(message, telegram_id: int) -> None:
+    person = await user_summary(telegram_id)
+    if person is None:
+        await message.reply_text("Student not found.")
+        return
+    display = person.get("first_name") or "Student"
+    if person.get("username"):
+        display += f" (@{person['username']})"
+    passes = await active_passes_for_user(telegram_id)
+    lines = [f"👤 {display}", f"Telegram ID: {telegram_id}", ""]
+    keyboard = []
+    for item in passes:
+        lines.append(f"• #{item['id']} {pass_label(item['pass_code'], item['vault_keys'])} — {duration_label(item['expires_at'])}")
+        row = []
+        if item["expires_at"] is not None:
+            row.append(InlineKeyboardButton(f"Extend #{item['id']}", callback_data=f"adm:extend:{item['id']}"))
+        row.append(InlineKeyboardButton(f"Revoke #{item['id']}", callback_data=f"adm:revoke:{item['id']}"))
+        keyboard.append(row)
+    if not passes:
+        lines.append("No active passes found.")
+    keyboard.append([InlineKeyboardButton("➕ Grant another pass", callback_data=f"adm:grantto:{telegram_id}")])
+    keyboard.append([InlineKeyboardButton("⬅ Admin Panel", callback_data="adm:home")])
+    await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -449,7 +902,7 @@ def main() -> None:
     if not DATABASE_URL:
         raise SystemExit("Set DATABASE_URL in the hosting environment.")
     if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 16:
-        raise SystemExit("Set WEBHOOK_SECRET to a random secret of at least 16 characters.")
+        raise SystemExit("Set WEBHOOK_SECRET to a random string of at least 16 characters.")
 
     application = (
         Application.builder()
@@ -462,9 +915,9 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("tests", tests_command))
     application.add_handler(CommandHandler("mypremium", mypremium_command))
-    application.add_handler(CommandHandler("grantpremium", grantpremium_command))
-    application.add_handler(CommandHandler("revokepremium", revokepremium_command))
-    application.add_handler(CommandHandler("premiumstatus", premiumstatus_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CallbackQueryHandler(admin_callback))
+    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, admin_text_input))
     application.add_error_handler(error_handler)
 
     logger.info("Starting BPSC Nexus Telegram bot in webhook mode.")

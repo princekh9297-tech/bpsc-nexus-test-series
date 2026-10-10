@@ -1,56 +1,38 @@
-# BPSC Nexus Test Series — Premium Pass update
+# BPSC Nexus Premium Pass Admin Panel
 
-This update adds admin-only Premium Pass commands to the webhook-based Telegram bot.
+This package upgrades the existing webhook-based Telegram bot with a button-based, admin-only Premium Pass panel.
 
-## Important prerequisite
+## Admin features
 
-Run `premium_pass_migration.sql` in the dedicated BPSC Nexus Neon project's SQL Editor. It adds `tests.is_premium` and creates `premium_passes`. It does not delete existing records.
+- `/admin` opens the panel only for numeric Telegram IDs listed in `ADMIN_TELEGRAM_IDS`.
+- Grant pass by numeric Telegram ID or a username already known to the bot.
+- Choose BPSC PYQ, Ghatnachakra PYQ, UPSC PYQ, Dual Vault (choose any two), or All-Access.
+- Choose 7, 30, 90, 180 days, permanent access, or a custom number of days (1–3650).
+- Search/manage students, inspect active passes, extend a pass, revoke one pass without affecting other passes, and view membership statistics.
+- Admin callbacks are checked server-side; admin buttons are not sent to ordinary users. Admin panel is private-chat only.
+- Existing separate passes are preserved when granting another pass.
 
-## Update GitHub files
+## Before deployment
 
-Replace `bot.py`, `requirements.txt`, `render.yaml`, and `.env.example` with the versions in this package. Keep the repository private. Do not upload secrets.
+1. Back up the existing GitHub repository files locally.
+2. Run `premium_pass_migration.sql` in the SQL Editor of the dedicated BPSC Nexus Neon project. Do not run it against another application's database.
+3. Replace `bot.py`, `requirements.txt`, `render.yaml`, and `README.md` with this package's versions. Keep your existing webhook deployment structure and Render service.
+4. In Render Environment, keep `BOT_TOKEN`, `DATABASE_URL`, and `WEBHOOK_SECRET`; ensure `ADMIN_TELEGRAM_IDS` contains your numeric Telegram user ID(s), comma-separated if multiple.
+5. Deploy and test `/start`, `/admin`, `/tests`, and `/mypremium`.
 
-## Render environment variables
+## Important data mapping
 
-Keep existing `BOT_TOKEN`, `DATABASE_URL`, and `WEBHOOK_SECRET`. Add:
+`tests.vault_key` defaults to `general` so existing tests are not automatically assigned to a product without confirmation. Assign each test to its correct vault using the SQL Editor, e.g. `UPDATE tests SET vault_key = 'bpsc_pyq' WHERE ...;`. Use the exact vault key names `bpsc_pyq`, `ghatnachakra_pyq`, and `upsc_pyq` for those products. All-Access unlocks any mapped vault. A test's legacy `is_premium = TRUE` flag still means a matching pass is required, but the `vault_key` must be set to the correct product to match product passes.
 
-- `ADMIN_TELEGRAM_IDS`: your numeric Telegram user ID. Multiple administrators can be comma-separated, for example `123456789,987654321`.
+## Current scope
 
-Never put a bot token or database password in source code. The previously exposed bot token should be revoked in BotFather and replaced in Render before deployment.
+This package manages memberships and filters the published test catalogue by vault entitlements. The interactive question attempt, answer submission, timer, and scoring engine are not included in this package.
 
-## Commands
+## Environment variables
 
-- `/start` — register/update the user
-- `/tests` — list published tests available to the user
-- `/mypremium` — check own pass
-- `/grantpremium <Telegram ID or known @username> permanent`
-- `/grantpremium <Telegram ID or known @username> 30`
-- `/revokepremium <Telegram ID or known @username>`
-- `/premiumstatus <Telegram ID or known @username>`
+- `BOT_TOKEN`
+- `DATABASE_URL`
+- `WEBHOOK_SECRET` (random secret, at least 16 characters)
+- `ADMIN_TELEGRAM_IDS` (numeric Telegram user IDs, comma-separated)
 
-A username can only be resolved if the person has interacted with the bot before, because Telegram does not provide a general API to look up arbitrary usernames. Prefer numeric Telegram IDs.
-
-## Marking tests as premium
-
-In Neon SQL Editor, for example:
-
-```sql
-UPDATE tests SET is_premium = TRUE WHERE id = 123;
-```
-
-Only do this after creating the test and verifying its ID. To make a test public again:
-
-```sql
-UPDATE tests SET is_premium = FALSE WHERE id = 123;
-```
-
-The `/tests` catalogue filters premium tests by membership. This starter does not yet implement question-level delivery or the complete exam engine; those are separate development stages.
-
-## Deployment
-
-1. Run the migration.
-2. Replace the code files in GitHub and commit.
-3. Add `ADMIN_TELEGRAM_IDS` to Render Environment.
-4. Deploy latest commit.
-5. Test `/start`, `/mypremium`, and admin commands.
-6. Confirm a non-admin account cannot execute grant/revoke commands.
+Render provides `RENDER_EXTERNAL_URL` and `PORT` for the webhook service.
