@@ -28,7 +28,7 @@ The existing HTML/JSON/CSV import flow, question verification, import history, q
 4. Deploy the bot service. Its startup migration creates the group-quiz tables and ensures the question-bank schema. It does not drop existing tables.
 5. Confirm `/admin`, bulk imports, question review, quiz creation, quiz publishing and Premium Pass management still work before launching group quizzes.
 
-The bot can run group quizzes without the Mini App URL configured. The Mini App button appears once `MINI_APP_URL` is set to the new service's public HTTPS URL.
+The bot can run group quizzes without the Mini App URL configured. The Mini App button appears once `MINI_APP_URL` is set to the new service's public HTTPS URL. Startup also configures Telegram's built-in slash-command menu for private chats and groups. Group menu commands are `/groupquiz`, `/help`, and `/start`.
 
 ## 2. Deploy the personal Mini App as a separate Render Web Service
 

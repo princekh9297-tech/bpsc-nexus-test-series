@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo, BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats)
 from telegram.ext import PollAnswerHandler
 import question_bank as qb
 import group_quiz as gq
@@ -203,6 +203,30 @@ async def post_init(application: Application) -> None:
     await ensure_schema()
     await qb.ensure_schema(pool)
     await gq.ensure_schema(pool)
+    # Populate Telegram's built-in slash-command menu for private chats and groups.
+    # Group scope intentionally exposes only commands that make sense in a group.
+    private_commands = [
+        BotCommand("start", "Open BPSC Nexus"),
+        BotCommand("tests", "Browse published tests"),
+        BotCommand("quiz", "Take a question-bank quiz"),
+        BotCommand("mypremium", "Check your Premium Pass"),
+        BotCommand("groupquiz", "Start a group quiz (group admins)"),
+        BotCommand("admin", "Open the admin panel (authorized admins)"),
+        BotCommand("help", "Show available commands"),
+    ]
+    group_commands = [
+        BotCommand("groupquiz", "Start a group quiz (group admins)"),
+        BotCommand("help", "Show group commands"),
+        BotCommand("start", "Show how to use BPSC Nexus"),
+    ]
+    try:
+        await application.bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
+        await application.bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
+        await application.bot.set_my_commands(private_commands, scope=BotCommandScopeDefault())
+        logger.info("Telegram command menus configured for private chats and groups.")
+    except Exception:
+        # A command-menu API issue should not prevent the bot from starting.
+        logger.exception("Could not configure Telegram command menus; handlers remain registered.")
     application.bot_data["db_pool"] = pool
     application.bot_data["group_quiz_scheduler_task"] = application.create_task(gq.scheduler(application, pool), name="bpsc-nexus-group-quiz-scheduler")
     logger.info("Database connection verified; Premium Pass, Question Bank, and Group Quiz migrations applied automatically.")
@@ -340,7 +364,10 @@ async def has_vault_access(telegram_id: int, vault_key: str) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_private(update):
         if update.effective_message:
-            await update.effective_message.reply_text("Please open me in a private chat to use the bot.")
+            await update.effective_message.reply_text(
+                "👋 BPSC Nexus is ready. Group admins can use /groupquiz to start a quiz. "
+                "For personal tests, Premium Pass and admin tools, open me in a private chat."
+            )
         return
     user = update.effective_user
     message = update.effective_message
@@ -399,10 +426,16 @@ async def question_bank_file_handler(update: Update, context: ContextTypes.DEFAU
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_private(update):
-        return
     message = update.effective_message
     if message is None:
+        return
+    if not is_private(update):
+        await message.reply_text(
+            "BPSC Nexus group commands:\n"
+            "/groupquiz — Start a quiz in this group (group admins only)\n"
+            "/help — Show these commands\n\n"
+            "Use the bot in a private chat for /tests, /quiz and /mypremium."
+        )
         return
     text = (
         "BPSC Nexus Test Series\n\n"
@@ -410,6 +443,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/tests — Browse existing published tests\n"
         "/quiz — Take a published question-bank quiz\n"
         "/mypremium — Check your membership\n"
+        "/groupquiz — Start a group quiz\n"
         "/help — Show this help"
     )
     if is_admin(update):
@@ -419,6 +453,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def mypremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_private(update):
+        if update.effective_message:
+            await update.effective_message.reply_text("Please open BPSC Nexus in a private chat to check your Premium Pass.")
         return
     user = update.effective_user
     message = update.effective_message

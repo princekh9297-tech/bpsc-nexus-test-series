@@ -133,13 +133,19 @@ async def _result_payload(conn, attempt_id: int, telegram_id: int):
 async def index(request):
     # Resolve frontend relative to this file, not the process working directory.
     page = ROOT / "static" / "index.html"
+    # Prefer the deployment's static/ directory, but support repositories that keep
+    # index.html at the project root (the earlier deployment layout) as a safe fallback.
     if not page.is_file():
-        log.error("Mini App frontend missing at %s", page)
-        return web.Response(
-            text="BPSC Nexus Mini App frontend is missing. Ensure static/index.html is committed to the deployment repository.",
-            status=500,
-            content_type="text/plain",
-        )
+        root_page = ROOT / "index.html"
+        if root_page.is_file():
+            page = root_page
+        else:
+            log.error("Mini App frontend missing at %s and %s", page, root_page)
+            return web.Response(
+                text="BPSC Nexus Mini App frontend is missing. Commit static/index.html (or index.html at the project root).",
+                status=500,
+                content_type="text/plain",
+            )
     response = web.FileResponse(page)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
