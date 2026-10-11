@@ -190,6 +190,29 @@ async def list_quizzes(request):
         "total_questions": int(r["total_questions"])} for r in rows]})
 
 
+async def attempt_history(request):
+    """Return only the authenticated user's completed attempts for the progress panel."""
+    user_id=request["telegram_user"]["id"]
+    try: limit=max(1,min(30,int(request.query.get("limit","15"))))
+    except ValueError: limit=15
+    async with request.app["pool"].connection() as conn:
+        cur=await conn.execute("""SELECT a.id,a.quiz_id,a.mode,a.started_at,a.submitted_at,a.total_questions,a.correct_count,a.incorrect_count,a.skipped_count,a.score,
+            q.title,q.subject,q.positive_marks
+            FROM bank_quiz_attempts a JOIN bank_quizzes q ON q.id=a.quiz_id
+            WHERE a.telegram_id=%s AND a.submitted_at IS NOT NULL
+            ORDER BY a.submitted_at DESC LIMIT %s""",(user_id,limit))
+        rows=await cur.fetchall()
+    items=[]
+    for r in rows:
+        attempted=int(r["correct_count"] or 0)+int(r["incorrect_count"] or 0)
+        items.append({"attempt_id":int(r["id"]),"quiz_id":int(r["quiz_id"]),"title":r["title"],"subject":r["subject"],"mode":r["mode"],
+            "submitted_at":r["submitted_at"].isoformat() if r["submitted_at"] else None,"total_questions":int(r["total_questions"]),
+            "correct":int(r["correct_count"] or 0),"incorrect":int(r["incorrect_count"] or 0),"skipped":int(r["skipped_count"] or 0),
+            "score":float(r["score"] or 0),"max_score":float(r["total_questions"])*float(r["positive_marks"]),
+            "accuracy":round(int(r["correct_count"] or 0)/attempted*100,1) if attempted else 0})
+    return json_response({"attempts":items})
+
+
 async def quiz_builder_meta(request):
     pool = request.app["pool"]
     async with pool.connection() as conn:
@@ -453,6 +476,7 @@ def make_app():
     app.router.add_get("/static/{filename}", static_asset)
     app.router.add_get("/healthz", health)
     app.router.add_get("/api/quizzes", list_quizzes)
+    app.router.add_get("/api/history", attempt_history)
     app.router.add_get("/api/quiz-builder/meta", quiz_builder_meta)
     app.router.add_get("/api/quiz-builder/count", quiz_builder_count)
     app.router.add_post("/api/quiz-builder/create", create_custom_quiz)

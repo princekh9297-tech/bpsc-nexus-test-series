@@ -215,6 +215,8 @@ async def post_init(application: Application) -> None:
         ], scope=BotCommandScopeAllPrivateChats())
         await application.bot.set_my_commands([
             BotCommand("groupquiz", "Admin: configure a group quiz"),
+            BotCommand("groupquiz_schedule", "Admin: schedule a future quiz (UTC)"),
+            BotCommand("grouprank", "Show this group's cumulative quiz leaderboard"),
             BotCommand("help", "Help and commands"),
         ], scope=BotCommandScopeAllGroupChats())
     except Exception:
@@ -361,6 +363,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if user is None or message is None:
         return
     await save_user(update)
+    # Shareable quiz deep links use /start quiz_<id> and are always re-validated against publication status.
+    if context.args and context.args[0].startswith("quiz_"):
+        try:
+            shared_quiz_id=int(context.args[0].split("_",1)[1])
+        except (ValueError, IndexError):
+            shared_quiz_id=0
+        if shared_quiz_id and pool is not None:
+            async with pool.connection() as conn:
+                cur=await conn.execute("SELECT q.id,q.title,q.subject,COUNT(qq.question_id) AS n FROM bank_quizzes q JOIN bank_quiz_questions qq ON qq.quiz_id=q.id JOIN question_bank qb ON qb.id=qq.question_id AND qb.status='ready' WHERE q.id=%s AND q.is_published=TRUE AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s) GROUP BY q.id",(shared_quiz_id,user.id))
+                shared=await cur.fetchone()
+            if shared:
+                await message.reply_text(f"🧩 Shared BPSC Nexus quiz\n\n{shared['title']}\n{shared['subject']} · {shared['n']} questions\n\nChoose how you want to attempt it.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Practice",callback_data=f"play:mode:practice:{shared_quiz_id}"),InlineKeyboardButton("⏱ Exam",callback_data=f"play:mode:exam:{shared_quiz_id}")],[InlineKeyboardButton("Browse all quizzes",callback_data="play:list")]]))
+                return
+            await message.reply_text("This shared quiz is unavailable or is no longer published. Use /quiz to browse available tests.")
+            return
     passes = await active_passes_for_user(user.id)
     lines = [
         "Welcome to BPSC Nexus | Prelims Test Series!",
@@ -412,11 +429,18 @@ async def question_bank_file_handler(update: Update, context: ContextTypes.DEFAU
             await update.effective_message.reply_text("Open Admin Panel → Question Bank → Import, choose a default subject, then send the file.")
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_private(update):
+async def question_bank_poll_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_private(update) or not is_admin(update):
         return
+    await qb.receive_poll(update, context, True)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
+        return
+    if not is_private(update):
+        await message.reply_text("BPSC Nexus group commands\n\n/groupquiz — Start a group quiz (group admins)\n/groupquiz_schedule — Schedule a quiz in UTC (group admins)\n/grouprank — View this group's cumulative leaderboard\n/help — Show commands")
         return
     text = (
         "BPSC Nexus Test Series\n\n"
@@ -439,6 +463,21 @@ async def mypremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if user is None or message is None:
         return
     await save_user(update)
+    # Shareable quiz deep links use /start quiz_<id> and are always re-validated against publication status.
+    if context.args and context.args[0].startswith("quiz_"):
+        try:
+            shared_quiz_id=int(context.args[0].split("_",1)[1])
+        except (ValueError, IndexError):
+            shared_quiz_id=0
+        if shared_quiz_id and pool is not None:
+            async with pool.connection() as conn:
+                cur=await conn.execute("SELECT q.id,q.title,q.subject,COUNT(qq.question_id) AS n FROM bank_quizzes q JOIN bank_quiz_questions qq ON qq.quiz_id=q.id JOIN question_bank qb ON qb.id=qq.question_id AND qb.status='ready' WHERE q.id=%s AND q.is_published=TRUE AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s) GROUP BY q.id",(shared_quiz_id,user.id))
+                shared=await cur.fetchone()
+            if shared:
+                await message.reply_text(f"🧩 Shared BPSC Nexus quiz\n\n{shared['title']}\n{shared['subject']} · {shared['n']} questions\n\nChoose how you want to attempt it.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Practice",callback_data=f"play:mode:practice:{shared_quiz_id}"),InlineKeyboardButton("⏱ Exam",callback_data=f"play:mode:exam:{shared_quiz_id}")],[InlineKeyboardButton("Browse all quizzes",callback_data="play:list")]]))
+                return
+            await message.reply_text("This shared quiz is unavailable or is no longer published. Use /quiz to browse available tests.")
+            return
     passes = await active_passes_for_user(user.id)
     if not passes:
         await message.reply_text("You currently have standard access. No active Premium Pass was found.")
@@ -1128,11 +1167,14 @@ def main() -> None:
     application.add_handler(CommandHandler("tests", tests_command))
     application.add_handler(CommandHandler("quiz", quiz_command))
     application.add_handler(CommandHandler("groupquiz", gq.group_quiz_command))
+    application.add_handler(CommandHandler("groupquiz_schedule", gq.group_quiz_schedule_command))
+    application.add_handler(CommandHandler("grouprank", gq.group_leaderboard_command))
     application.add_handler(PollAnswerHandler(gq.group_poll_answer))
     application.add_handler(CommandHandler("mypremium", mypremium_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(admin_callback))
     application.add_handler(MessageHandler(filters.Document.ALL, question_bank_file_handler))
+    application.add_handler(MessageHandler(filters.POLL, question_bank_poll_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_input))
     application.add_error_handler(error_handler)
 

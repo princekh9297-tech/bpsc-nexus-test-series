@@ -9,11 +9,11 @@ The existing HTML/JSON/CSV import flow, question verification, import history, q
 
 ## What's included
 
-- `bot.py` — existing Telegram bot plus Mini App launch button, group quiz command and poll-answer handling.
-- `question_bank.py` — permanent question bank, import preview, deduplication, verification, quiz builder and existing personal Telegram quiz flow.
+- `bot.py` — existing Telegram bot plus Mini App launch button, forwarded Telegram poll import, quiz deep links, group quiz/scheduling/leaderboard commands and poll-answer handling.
+- `question_bank.py` — permanent question bank, HTML/JSON/CSV and Telegram poll imports with confirmation preview, deduplication, verification queue, bank quality audit, quiz editor (title/scoring/duration/question membership), and the existing personal Telegram quiz flow.
 - `group_quiz.py` — persistent sequential group-poll scheduler and leaderboard calculations.
-- `miniapp.py` — authenticated API and static frontend server for personal CBT.
-- `static/index.html` — responsive CBT UI with a custom quiz builder, subject/topic filters, question count, random/sequential/unseen/incorrect selection, Practice/Exam/Revision/Rapid-fire presets, scoring settings, total and per-question timers, shuffled options, saved-on-device setup, question palette, mark-for-review, answer clearing and result review.
+- `miniapp.py` — authenticated API and static frontend server for personal CBT, including private completed-attempt history.
+- `static/index.html` — responsive CBT UI with a custom quiz builder, subject/topic filters, question count, random/sequential/unseen/incorrect selection, Practice/Exam/Revision/Rapid-fire presets, scoring settings, total and per-question timers, shuffled options, saved-on-device setup, question palette, mark-for-review, answer clearing, detailed result review and recent result history.
 - `requirements.txt` — runtime dependencies for both services.
 - `render.yaml` — existing bot service definition with the new optional `MINI_APP_URL` setting.
 - `render-miniapp.yaml` — optional Blueprint definition for the separate Mini App service.
@@ -81,6 +81,22 @@ Use `/admin` privately → **Question Bank & Quiz Studio** → **Import HTML / J
 - Questions with missing or invalid answer keys remain pending verification and cannot be used in scored quizzes until reviewed.
 - Importing does not rewrite the source wording or invent answers. Duplicate questions are detected by normalized question and option content.
 - Import batch rollback removes only questions not already referenced by a quiz.
+
+
+### Group bank builder and scheduled quizzes
+
+- `/groupquiz` → **Build from Question Bank** → choose a subject or mixed subjects → choose a question count → choose Learning or Exam simulation → choose the voting window.
+- Group bank-built sets are sampled from verified questions and avoid questions used in completed quizzes in that group where possible; if the unused pool is too small, the selector falls back to the eligible bank rather than blocking the quiz.
+- `/groupquiz_schedule <quiz_id> <YYYY-MM-DDTHH:MMZ> [15|30|60|120|300] [learning|exam]` schedules a published quiz for a future UTC time. Example: `/groupquiz_schedule 12 2026-10-12T18:00Z 30 exam`. Schedule at least two minutes ahead.
+- `/grouprank` displays cumulative standings across completed quizzes in the current group.
+
+### Importing a Telegram poll
+
+Send or forward a Telegram quiz poll to the bot in a private chat as an authorized admin. The bot previews it and waits for confirmation before saving. Quiz polls with an answer key can be imported as verified records; regular polls without a visible answer key remain pending review. PDF-to-quiz generation is intentionally excluded.
+
+### Quiz Manager
+
+In **Admin → Question Bank & Quiz Studio**, open **Manage Quizzes** to edit quiz title, duration, scoring, publication status, and question membership. Existing attempts keep their own question snapshots; changes apply to future attempts. **Bank Quality Audit** reports pending, unclassified and explanation-deficient records.
 
 ## 6. Data safety and operational notes
 
