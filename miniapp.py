@@ -145,16 +145,18 @@ async def _result_payload(conn, attempt_id: int, telegram_id: int):
 
 
 
-VALID_THEMES = {"graphite", "emerald", "amethyst", "ivory"}
+VALID_THEMES = {"obsidian", "emerald", "cobalt", "amethyst", "ivory", "graphite"}
 
 async def get_theme_preference(request):
     user_id = request["telegram_user"]["id"]
     async with request.app["pool"].connection() as conn:
         cur = await conn.execute("SELECT preference_value FROM bpsc_nexus_user_preferences WHERE telegram_id=%s AND preference_key='theme'", (user_id,))
         row = await cur.fetchone()
-    theme = row["preference_value"] if row else "graphite"
+    theme = row["preference_value"] if row else "obsidian"
+    # Keep legacy saved preferences readable while supporting the five current palettes.
+    theme = {"graphite": "obsidian"}.get(theme, theme)
     if theme not in VALID_THEMES:
-        theme = "graphite"
+        theme = "obsidian"
     return json_response({"theme": theme})
 
 async def save_theme_preference(request):
