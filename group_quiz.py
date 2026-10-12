@@ -6,8 +6,6 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
-import leaderboard as lb
-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus, ChatType
 from telegram.ext import ContextTypes
@@ -65,6 +63,15 @@ DDL = [
     "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS message_id BIGINT",
     "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
     "CREATE INDEX IF NOT EXISTS idx_group_quiz_answers_session ON group_quiz_answers(session_id,telegram_id)",
+    """CREATE TABLE IF NOT EXISTS group_quiz_memberships (
+        chat_id BIGINT PRIMARY KEY,
+        chat_title TEXT,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        granted_by BIGINT NOT NULL,
+        granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        revoked_at TIMESTAMPTZ
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_group_quiz_memberships_active ON group_quiz_memberships(is_active,chat_id)",
 ]
 
 
@@ -72,7 +79,26 @@ async def ensure_schema(pool):
     async with pool.connection() as conn:
         for stmt in DDL:
             await conn.execute(stmt)
-    await lb.ensure_schema(pool)
+
+
+async def _group_is_authorized(pool, chat_id: int) -> bool:
+    """Only explicitly granted groups may use BPSC Nexus group quiz features."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT 1 FROM group_quiz_memberships WHERE chat_id=%s AND is_active=TRUE",
+            (int(chat_id),),
+        )
+        return await cur.fetchone() is not None
+
+
+async def _require_group_membership(message, pool, chat) -> bool:
+    if await _group_is_authorized(pool, chat.id):
+        return True
+    await message.reply_text(
+        "🔒 This group does not have BPSC Nexus Quiz membership.\n"
+        "Ask the BPSC Nexus owner to activate this group."
+    )
+    return False
 
 
 async def _is_chat_admin(context, chat_id: int, user_id: int) -> bool:
@@ -93,6 +119,8 @@ async def group_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if chat.type == ChatType.PRIVATE:
         await message.reply_text("Use /groupquiz inside the Telegram group where you want to run the quiz.")
+        return
+    if not await _require_group_membership(message, pool, chat):
         return
     if not await _is_chat_admin(context, chat.id, user.id):
         await message.reply_text("Only this group's administrators can start a group quiz.")
@@ -115,6 +143,7 @@ async def group_leaderboard_command(update: Update, context: ContextTypes.DEFAUL
     if not chat or not message or pool is None: return
     if chat.type==ChatType.PRIVATE:
         await message.reply_text("Run /grouprank inside a Telegram group to see that group's cumulative leaderboard."); return
+    if not await _require_group_membership(message, pool, chat): return
     async with pool.connection() as conn:
         cur=await conn.execute("""SELECT a.telegram_id,MAX(a.first_name) AS first_name,MAX(a.username) AS username,
             COUNT(DISTINCT a.session_id) AS quizzes,
@@ -136,6 +165,67 @@ async def group_leaderboard_command(update: Update, context: ContextTypes.DEFAUL
     await message.reply_text("\n".join(lines)[:4000])
 
 
+async def group_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show this group's active/scheduled quiz; available to all group members."""
+    chat = update.effective_chat; message = update.effective_message
+    pool = context.application.bot_data.get("db_pool")
+    if not chat or not message or pool is None:
+        return
+    if chat.type == ChatType.PRIVATE:
+        await message.reply_text("Run /groupstatus inside the group to see its current quiz.")
+        return
+    if not await _require_group_membership(message, pool, chat):
+        return
+    async with pool.connection() as conn:
+        cur = await conn.execute("""SELECT id,quiz_title,questions_count,current_index,mode,interval_seconds,next_at,started_by
+            FROM group_quiz_sessions WHERE chat_id=%s AND status='active' ORDER BY id DESC LIMIT 1""", (chat.id,))
+        row = await cur.fetchone()
+    if not row:
+        await message.reply_text("ℹ️ There is no active or scheduled group quiz right now. A group admin can start one with /groupquiz.")
+        return
+    starts = row["next_at"].strftime("%Y-%m-%d %H:%M UTC") if row["next_at"] else "soon"
+    await message.reply_text(
+        f"🧩 Group Quiz Status · #{row['id']}\n\n{row['quiz_title']}\n"
+        f"Mode: {row['mode'].title()}\nQuestions: {row['questions_count']}\n"
+        f"Progress: {min(int(row['current_index']) + 1, int(row['questions_count']))}/{row['questions_count']}\n"
+        f"Voting window: {row['interval_seconds']} seconds\nNext activity: {starts}"
+    )
+
+
+async def group_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel this group's active/scheduled quiz; only Telegram admins/owner may do so."""
+    chat = update.effective_chat; user = update.effective_user; message = update.effective_message
+    pool = context.application.bot_data.get("db_pool")
+    if not chat or not user or not message or pool is None:
+        return
+    if chat.type == ChatType.PRIVATE:
+        await message.reply_text("Run /groupstop inside the group whose quiz you want to stop.")
+        return
+    if not await _require_group_membership(message, pool, chat):
+        return
+    if not await _is_chat_admin(context, chat.id, user.id):
+        await message.reply_text("Only this group's administrators or owner can stop its quiz.")
+        return
+    async with pool.connection() as conn:
+        cur = await conn.execute("""SELECT s.id,q.poll_id,q.message_id FROM group_quiz_sessions s
+            LEFT JOIN group_quiz_session_questions q ON q.session_id=s.id AND q.position=s.current_index
+            WHERE s.chat_id=%s AND s.status='active' ORDER BY s.id DESC LIMIT 1""", (chat.id,))
+        row = await cur.fetchone()
+        if row:
+            await conn.execute("UPDATE group_quiz_sessions SET status='cancelled',completed_at=NOW() WHERE id=%s AND status='active'", (row["id"],))
+            if row["poll_id"]:
+                await conn.execute("UPDATE group_quiz_session_questions SET status='closed',updated_at=NOW() WHERE session_id=%s AND position=(SELECT current_index FROM group_quiz_sessions WHERE id=%s)", (row["id"], row["id"]))
+    if not row:
+        await message.reply_text("There is no active or scheduled quiz to stop.")
+        return
+    if row["message_id"]:
+        try:
+            await context.bot.stop_poll(chat_id=chat.id, message_id=int(row["message_id"]))
+        except Exception:
+            log.info("Poll for cancelled session %s was already closed or unavailable", row["id"])
+    await message.reply_text(f"🛑 Group quiz #{row['id']} has been cancelled by an administrator.")
+
+
 async def group_quiz_schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Schedule a group quiz in UTC: /groupquiz_schedule <quiz_id> <YYYY-MM-DDTHH:MMZ> [15|30|60|120|300] [learning|exam]."""
     chat=update.effective_chat; user=update.effective_user; message=update.effective_message
@@ -143,6 +233,8 @@ async def group_quiz_schedule_command(update: Update, context: ContextTypes.DEFA
     if not chat or not user or not message or pool is None: return
     if chat.type==ChatType.PRIVATE:
         await message.reply_text("Run this command in the destination group. Syntax: /groupquiz_schedule 12 2026-10-12T18:00Z 30 exam (time is UTC).")
+        return
+    if not await _require_group_membership(message, pool, chat):
         return
     if not await _is_chat_admin(context,chat.id,user.id):
         await message.reply_text("Only this group's administrators can schedule a quiz."); return
@@ -193,6 +285,9 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
     user = update.effective_user
     if not chat or not user or chat.type == ChatType.PRIVATE:
         await q.answer("Use group quiz controls inside the destination group.", show_alert=True)
+        return True
+    if not await _group_is_authorized(pool, chat.id):
+        await q.answer("This group does not have BPSC Nexus Quiz membership.", show_alert=True)
         return True
     if not await _is_chat_admin(context, chat.id, user.id):
         await q.answer("Only this group's administrators can control its quiz.", show_alert=True)
@@ -418,7 +513,6 @@ async def _finish_session(application, pool, session):
             FROM group_quiz_answers a JOIN group_quiz_session_questions q USING(session_id,position)
             WHERE a.session_id=%s""", (sid,))
         agg = await cur.fetchone()
-        await lb.record_group_session(conn, sid)
     lines = [f"🏁 Group Quiz Complete · #{sid}", str(finished["quiz_title"]), "", f"Questions: {finished['questions_count']}", f"Participants: {agg['participants']}", f"Votes recorded: {agg['votes']}", f"Correct votes: {agg['correct']}", f"Incorrect votes: {agg['incorrect']}", "", "🏆 Leaderboard (1 mark correct, −⅓ incorrect)"]
     if not scores:
         lines.append("No participant answers were recorded.")
@@ -444,6 +538,14 @@ async def scheduler(application, pool):
                 sessions = await cur.fetchall()
             for session in sessions:
                 sid = int(session["id"]); position = int(session["current_index"])
+                if not await _group_is_authorized(pool, int(session["chat_id"])):
+                    async with pool.connection() as conn:
+                        await conn.execute("UPDATE group_quiz_sessions SET status='cancelled',completed_at=NOW() WHERE id=%s AND status='active'", (sid,))
+                    try:
+                        await application.bot.send_message(chat_id=int(session["chat_id"]), text="🔒 BPSC Nexus Quiz membership is inactive for this group. This quiz has been stopped.")
+                    except Exception:
+                        log.info("Could not notify group %s about inactive membership", session["chat_id"])
+                    continue
                 if position >= int(session["questions_count"]):
                     await _finish_session(application, pool, session)
                     continue

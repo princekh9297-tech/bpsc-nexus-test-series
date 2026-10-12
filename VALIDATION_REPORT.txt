@@ -1,0 +1,30 @@
+BPSC NEXUS GROUP MEMBERSHIP UPDATE — RECHECK REPORT
+
+Included files:
+- bot.py
+- group_quiz.py
+- question_bank.py
+- static/index.html
+- README_GROUP_MEMBERSHIP_UPDATE.txt
+
+Checks performed on this package:
+- Python AST/syntax parsing passed for bot.py, group_quiz.py, question_bank.py.
+- Inline JavaScript syntax check passed for static/index.html using Node.js.
+- Confirmed CommandHandler registration exists for:
+  /groupgrant, /grouprevoke, /grouplist, /groupquiz,
+  /groupquiz_schedule, /grouprank, /groupstatus, /groupstop.
+- Confirmed matching group quiz handler functions exist.
+- Confirmed membership checks in group quiz commands and group callback flow.
+- Confirmed scheduler cancels active sessions when group membership is inactive.
+- Excluded Python __pycache__ artifacts from this ZIP.
+
+Not performed:
+- Live Telegram API test.
+- Live Render deployment test.
+- Live PostgreSQL integration test.
+
+Deployment notes:
+- Bot service: replace bot.py and group_quiz.py.
+- Mini App/shared repository: replace question_bank.py and static/index.html if these are in the same/shared repo setup.
+- Keep existing environment variables and database; do not reset/drop tables.
+- After deployment, grant each allowed group explicitly with /groupgrant <group_id> [name].

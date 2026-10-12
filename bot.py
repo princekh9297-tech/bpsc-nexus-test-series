@@ -12,7 +12,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppI
 from telegram.ext import PollAnswerHandler
 import question_bank as qb
 import group_quiz as gq
-import leaderboard as lb
 
 from telegram.ext import (
     Application,
@@ -45,29 +44,16 @@ pool: AsyncConnectionPool | None = None
 
 VAULTS = {
     "bpsc_pyq": "BPSC PYQ",
-    "upsc_cse_pyq": "UPSC CSE PYQ",
-    "ssc_pyq": "SSC PYQ",
-    "upsc_cds_capf_other": "UPSC CDS/CAPF/Other Exams",
-    "bihar_exams_gk_gs": "Bihar Exams GK/GS",
-    "lucent": "Lucent",
-    "ghatnachakra_science": "Ghatnachakra Science",
-    "ghatnachakra_geography": "Ghatnachakra Geography",
-    "ghatnachakra_economy": "Ghatnachakra Economy",
-    "ghatnachakra_polity": "Ghatnachakra Polity",
-    "ghatnachakra_history": "Ghatnachakra History",
-    "ghatnachakra_ecology": "Ghatnachakra Ecology",
-    # Legacy vault identifiers remain supported for existing quizzes and passes.
     "ghatnachakra_pyq": "Ghatnachakra PYQ",
     "upsc_pyq": "UPSC PYQ",
 }
 PASS_NAMES = {
-    "bpsc_pyq": "BPSC PYQ Pass", "upsc_cse_pyq": "UPSC CSE PYQ Pass", "ssc_pyq": "SSC PYQ Pass",
-    "upsc_cds_capf_other": "UPSC CDS/CAPF/Other Exams Pass", "bihar_exams_gk_gs": "Bihar Exams GK/GS Pass",
-    "lucent": "Lucent Pass", "ghatnachakra_science": "Ghatnachakra Science Pass",
-    "ghatnachakra_geography": "Ghatnachakra Geography Pass", "ghatnachakra_economy": "Ghatnachakra Economy Pass",
-    "ghatnachakra_polity": "Ghatnachakra Polity Pass", "ghatnachakra_history": "Ghatnachakra History Pass",
-    "ghatnachakra_ecology": "Ghatnachakra Ecology Pass", "ghatnachakra_pyq": "Ghatnachakra PYQ Pass",
-    "upsc_pyq": "UPSC PYQ Pass", "dual_vault": "Dual Vault Pass", "all_access": "All-Access Pass", "legacy": "Legacy Premium Pass",
+    "bpsc_pyq": "BPSC PYQ Pass",
+    "ghatnachakra_pyq": "Ghatnachakra PYQ Pass",
+    "upsc_pyq": "UPSC PYQ Pass",
+    "dual_vault": "Dual Vault Pass",
+    "all_access": "All-Access Pass",
+    "legacy": "Legacy Premium Pass",
 }
 DURATIONS = {"7": 7, "30": 30, "90": 90, "180": 180}
 
@@ -107,17 +93,6 @@ async def ensure_schema() -> None:
             ('upsc_pyq', 'UPSC PYQ Pass', 'Access to the UPSC PYQ vault', TRUE),
             ('dual_vault', 'Dual Vault Pass', 'Access to two selected vaults', TRUE),
             ('all_access', 'All-Access Pass', 'Access to all supported vaults', TRUE),
-            ('upsc_cse_pyq', 'UPSC CSE PYQ Lifetime', 'Lifetime access to UPSC CSE PYQ edition only', TRUE),
-            ('ssc_pyq', 'SSC PYQ Lifetime', 'Lifetime access to SSC PYQ edition only', TRUE),
-            ('upsc_cds_capf_other', 'UPSC CDS/CAPF/Other Exams Lifetime', 'Lifetime access to UPSC CDS/CAPF/Other Exams edition only', TRUE),
-            ('bihar_exams_gk_gs', 'Bihar Exams GK/GS Lifetime', 'Lifetime access to Bihar Exams GK/GS edition only', TRUE),
-            ('lucent', 'Lucent Lifetime', 'Lifetime access to Lucent edition only', TRUE),
-            ('ghatnachakra_science', 'Ghatnachakra Science Lifetime', 'Lifetime access to Ghatnachakra Science edition only', TRUE),
-            ('ghatnachakra_geography', 'Ghatnachakra Geography Lifetime', 'Lifetime access to Ghatnachakra Geography edition only', TRUE),
-            ('ghatnachakra_economy', 'Ghatnachakra Economy Lifetime', 'Lifetime access to Ghatnachakra Economy edition only', TRUE),
-            ('ghatnachakra_polity', 'Ghatnachakra Polity Lifetime', 'Lifetime access to Ghatnachakra Polity edition only', TRUE),
-            ('ghatnachakra_history', 'Ghatnachakra History Lifetime', 'Lifetime access to Ghatnachakra History edition only', TRUE),
-            ('ghatnachakra_ecology', 'Ghatnachakra Ecology Lifetime', 'Lifetime access to Ghatnachakra Ecology edition only', TRUE),
             ('legacy', 'Legacy Premium Pass', 'Migrated legacy entitlement', TRUE)
             ON CONFLICT (pass_code) DO NOTHING""",
         """CREATE TABLE IF NOT EXISTS premium_passes (
@@ -192,27 +167,7 @@ async def ensure_schema() -> None:
             submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ,
             reviewed_by BIGINT, review_note TEXT, activated_pass_id BIGINT,
             UNIQUE (transaction_ref))""",
-        "ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS product_code TEXT NOT NULL DEFAULT 'all_access'",
         "CREATE INDEX IF NOT EXISTS bpsc_payment_requests_status_idx ON bpsc_payment_requests(status, submitted_at DESC)",
-        """CREATE TABLE IF NOT EXISTS bpsc_individual_products (
-            product_code TEXT PRIMARY KEY, product_name TEXT NOT NULL, amount_inr INTEGER NOT NULL CHECK(amount_inr >= 0),
-            entitlement_key TEXT NOT NULL, duration_days INTEGER NOT NULL DEFAULT 0, is_active BOOLEAN NOT NULL DEFAULT TRUE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), retired_at TIMESTAMPTZ NULL)""",
-        """INSERT INTO bpsc_individual_products(product_code,product_name,amount_inr,entitlement_key,duration_days,is_active)
-        VALUES
-        ('bpsc_pyq','BPSC PYQ — Lifetime Edition',49,'bpsc_pyq',0,TRUE),
-        ('upsc_cse_pyq','UPSC CSE PYQ — Lifetime Edition',49,'upsc_cse_pyq',0,TRUE),
-        ('ssc_pyq','SSC PYQ — Lifetime Edition',49,'ssc_pyq',0,TRUE),
-        ('upsc_cds_capf_other','UPSC CDS/CAPF/Other Exams — Lifetime Edition',99,'upsc_cds_capf_other',0,TRUE),
-        ('bihar_exams_gk_gs','Bihar Exams GK/GS — Lifetime Edition',29,'bihar_exams_gk_gs',0,TRUE),
-        ('lucent','Lucent — Lifetime Edition',69,'lucent',0,TRUE),
-        ('ghatnachakra_science','Ghatnachakra Science — Lifetime Edition',39,'ghatnachakra_science',0,TRUE),
-        ('ghatnachakra_geography','Ghatnachakra Geography — Lifetime Edition',39,'ghatnachakra_geography',0,TRUE),
-        ('ghatnachakra_economy','Ghatnachakra Economy — Lifetime Edition',39,'ghatnachakra_economy',0,TRUE),
-        ('ghatnachakra_polity','Ghatnachakra Polity — Lifetime Edition',39,'ghatnachakra_polity',0,TRUE),
-        ('ghatnachakra_history','Ghatnachakra History — Lifetime Edition',39,'ghatnachakra_history',0,TRUE),
-        ('ghatnachakra_ecology','Ghatnachakra Ecology — Lifetime Edition',39,'ghatnachakra_ecology',0,TRUE)
-        ON CONFLICT(product_code) DO UPDATE SET product_name=EXCLUDED.product_name,amount_inr=EXCLUDED.amount_inr,entitlement_key=EXCLUDED.entitlement_key,duration_days=0""",
     ]
     async with pool.connection() as conn:
         for statement in statements:
@@ -258,21 +213,30 @@ async def post_init(application: Application) -> None:
     await ensure_schema()
     await qb.ensure_schema(pool)
     await gq.ensure_schema(pool)
-    await lb.backfill_bank_attempts(pool)
-    await lb.backfill_group_sessions(pool)
     application.bot_data["db_pool"] = pool
+    # Start the persistent group-poll scheduler once the shared database is ready.
+    if application.bot_data.get("group_quiz_scheduler_task") is None:
+        application.bot_data["group_quiz_scheduler_task"] = asyncio.create_task(gq.scheduler(application, pool))
     try:
         await application.bot.set_my_commands([
             BotCommand("start", "Open BPSC Nexus Mini App"),
+            BotCommand("quiz", "Open available personal quizzes"),
+            BotCommand("tests", "Browse published tests"),
             BotCommand("mypremium", "View membership status"),
             BotCommand("tutorial", "How to use BPSC Nexus"),
-            BotCommand("help", "Open the quick tutorial"),
+            BotCommand("help", "Show commands and help"),
+            BotCommand("groupgrant", "Activate group quiz membership (owner)"),
+            BotCommand("grouprevoke", "Revoke group quiz membership (owner)"),
+            BotCommand("grouplist", "List authorized quiz groups (owner)"),
         ], scope=BotCommandScopeAllPrivateChats())
-        # Quiz-taking commands are intentionally not exposed in groups; attempts belong in the Mini App.
         await application.bot.set_my_commands([
-            BotCommand("start", "Open BPSC Nexus"),
-            BotCommand("tutorial", "How to use BPSC Nexus"),
-            BotCommand("help", "Open the quick tutorial"),
+            BotCommand("start", "Show group quiz commands"),
+            BotCommand("groupquiz", "Create/start a group quiz (admins)"),
+            BotCommand("groupquiz_schedule", "Schedule a group quiz (admins)"),
+            BotCommand("grouprank", "Show group leaderboard"),
+            BotCommand("groupstatus", "Show current group quiz"),
+            BotCommand("groupstop", "Stop current group quiz (admins)"),
+            BotCommand("help", "Show group commands"),
         ], scope=BotCommandScopeAllGroupChats())
     except Exception:
         logger.exception("Could not register Telegram command menus")
@@ -416,7 +380,13 @@ async def reply_with_uluk(message, caption: str, reply_markup=None) -> None:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_private(update):
         if update.effective_message:
-            await update.effective_message.reply_text("Please open me in a private chat to use the bot.")
+            await update.effective_message.reply_text(
+                "🧩 BPSC Nexus Group Quiz\n\n"
+                "Group admins/owners can use /groupquiz to create a quiz, "
+                "/groupquiz_schedule to schedule one, /grouprank for the leaderboard, "
+                "/groupstatus to check the current session, and /groupstop to stop it.\n\n"
+                "Use /help to see all group commands. Personal Mini App features open in private chat."
+            )
         return
     user = update.effective_user
     message = update.effective_message
@@ -507,6 +477,20 @@ async def question_bank_poll_handler(update: Update, context: ContextTypes.DEFAU
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_private(update):
+        message = update.effective_message
+        if message:
+            await message.reply_text(
+                "🧩 BPSC Nexus — Group Commands\n\n"
+                "/groupquiz — create a quiz from published tests or verified question bank (group admins/owner)\n"
+                "/groupquiz_schedule <quiz_id> <YYYY-MM-DDTHH:MMZ> [15|30|60|120|300] [learning|exam] — schedule in UTC\n"
+                "/grouprank — cumulative leaderboard for this group\n"
+                "/groupstatus — active/scheduled quiz status\n"
+                "/groupstop — cancel the current group quiz (group admins/owner)\n"
+                "/start — show this group guide\n\n"
+                "Make the bot an administrator with permission to send messages and create polls."
+            )
+        return
     await tutorial_command(update, context)
 
 async def mypremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -841,7 +825,7 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
                 cur=await conn.execute("SELECT * FROM bpsc_payment_requests WHERE id=%s",(rid,)); r=await cur.fetchone()
             if not r:
                 await query.edit_message_text("Payment request not found.", reply_markup=admin_home_keyboard()); return True
-            text=(f"💳 Payment request #{rid}\n\nUser: {r['telegram_id']}\nProduct: {r['product_name']}\nAmount: ₹{r['amount_inr']}\nAccess: {'Lifetime' if int(r['duration_days'] or 0)==0 else str(r['duration_days'])+' days'}\nProduct code: {r['product_code']}\nUPI reference: {r['transaction_ref']}\nStatus: {r['status']}\nSubmitted: {r['submitted_at']}\n\nVerify the credit in your PhonePe/bank app before approving.")
+            text=(f"💳 Payment request #{rid}\n\nUser: {r['telegram_id']}\nProduct: {r['product_name']}\nAmount: ₹{r['amount_inr']}\nDuration: {r['duration_days']} days\nUPI reference: {r['transaction_ref']}\nStatus: {r['status']}\nSubmitted: {r['submitted_at']}\n\nVerify the credit in your PhonePe/bank app before approving.")
             buttons=[]
             if r['status']=='pending': buttons=[[InlineKeyboardButton("✅ Approve & Activate",callback_data=f"pay:approve:{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"pay:reject:{rid}")]]
             buttons.append([InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")])
@@ -867,36 +851,17 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
                     cur=await conn.execute("SELECT id FROM app_users WHERE telegram_id=%s",(r['telegram_id'],)); u=await cur.fetchone()
                     if not u:
                         await query.edit_message_text("User is not registered in app_users. Ask them to press /start, then review again.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")]])); return True
-                    product_code=str(r.get('product_code') or 'all_access')
-                    if product_code == 'all_access':
-                        pass_code='all_access'; vault_keys=['*']; duration=int(r['duration_days'] or 0)
-                        cur=await conn.execute("SELECT MAX(expires_at) AS expiry FROM premium_passes WHERE user_id=%s AND pass_code='all_access' AND revoked_at IS NULL AND expires_at>NOW()",(u['id'],)); expiry=(await cur.fetchone())['expiry']
-                        granted_at=expiry
-                    else:
-                        # Individual products receive only their own vault key and lifetime expiry.
-                        cur=await conn.execute("SELECT entitlement_key,duration_days FROM bpsc_individual_products WHERE product_code=%s",(product_code,)); product=await cur.fetchone()
-                        if not product:
-                            await query.edit_message_text("The purchased product configuration is missing; no access was granted. Keep this request pending and repair the product catalogue.",reply_markup=admin_home_keyboard()); return True
-                        pass_code=product_code; vault_keys=[str(product['entitlement_key'])]; duration=int(product['duration_days'] or 0); expiry=None; granted_at=None
-                    cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code=%s AND is_active=TRUE",(pass_code,)); cat=await cur.fetchone()
+                    cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code='all_access' AND is_active=TRUE"); cat=await cur.fetchone()
                     if not cat:
-                        await conn.execute("INSERT INTO pass_catalogue(pass_code,pass_name,description,is_active) VALUES(%s,%s,%s,TRUE) ON CONFLICT(pass_code) DO NOTHING",(pass_code,str(r['product_name']),f"Entitlement for {r['product_name']}"))
-                        cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code=%s AND is_active=TRUE",(pass_code,)); cat=await cur.fetchone()
-                    if not cat:
-                        await query.edit_message_text(f"Entitlement catalogue entry '{pass_code}' is missing/inactive; no access was granted.",reply_markup=admin_home_keyboard()); return True
-                    if product_code == 'all_access':
-                        cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys)
-                            VALUES(%s,%s,%s,COALESCE(%s,NOW()),COALESCE(%s,NOW()) + (%s * INTERVAL '1 day'),%s,%s,%s) RETURNING id""",
-                            (u['id'],cat['id'],update.effective_user.id,granted_at,expiry,duration,f"Manual UPI payment request #{rid}; ₹{r['amount_inr']}",pass_code,vault_keys))
-                        access_label=f"All Access for {duration} days"
-                    else:
-                        cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys)
-                            VALUES(%s,%s,%s,NOW(),NULL,%s,%s,%s) RETURNING id""",
-                            (u['id'],cat['id'],update.effective_user.id,f"Manual UPI payment request #{rid}; ₹{r['amount_inr']}",pass_code,vault_keys))
-                        access_label=f"lifetime access to {r['product_name']} only"
+                        await query.edit_message_text("All-Access pass is missing/inactive in pass_catalogue; no access was granted.",reply_markup=admin_home_keyboard()); return True
+                    cur=await conn.execute("SELECT MAX(expires_at) AS expiry FROM premium_passes WHERE user_id=%s AND pass_code='all_access' AND revoked_at IS NULL AND expires_at>NOW()",(u['id'],)); expiry=(await cur.fetchone())['expiry']
+                    # Renewal begins after current expiry when one exists, otherwise now.
+                    cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys)
+                        VALUES(%s,%s,%s,COALESCE(%s,NOW()),COALESCE(%s,NOW()) + (%s * INTERVAL '1 day'),%s,'all_access',ARRAY['*']::TEXT[]) RETURNING id""",
+                        (u['id'],cat['id'],update.effective_user.id,expiry,expiry,int(r['duration_days']),f"Manual UPI payment request #{rid}; ₹{r['amount_inr']}") )
                     activated=(await cur.fetchone())['id']
                     await conn.execute("UPDATE bpsc_payment_requests SET status='approved',reviewed_at=NOW(),reviewed_by=%s,activated_pass_id=%s WHERE id=%s",(update.effective_user.id,activated,rid))
-                    user_msg=f"✅ Your BPSC Nexus payment is approved. Activated: {access_label}. Use /mypremium to check your membership."
+                    user_msg=f"✅ Your BPSC Nexus payment is approved. All Access for {r['duration_days']} days has been activated. Use /mypremium to check your membership."
         try: await context.bot.send_message(chat_id=int(r['telegram_id']),text=user_msg)
         except Exception: logger.warning("Could not notify user %s about payment request %s",r['telegram_id'],rid)
         await query.edit_message_text(f"Request #{rid} {parts[1]}d. {'Membership activated.' if parts[1]=='approve' else 'No membership was granted.'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")],[InlineKeyboardButton("Admin Panel",callback_data="adm:home")]]))
@@ -913,6 +878,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Legacy Telegram quiz buttons must never start or continue a quiz attempt.
     if data.startswith("play:"):
         await query.answer("Quiz attempts are available only inside the BPSC Nexus Mini App.", show_alert=True)
+        return
+    if await gq.route_callback(update, context, pool):
         return
     handled = await qb.route_callback(update, context, pool, admin_only(update))
     if handled:
@@ -1285,6 +1252,78 @@ async def send_member_message(message, telegram_id: int) -> None:
     await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+async def groupgrant_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: /groupgrant <telegram_group_id> [optional group name]."""
+    message = update.effective_message; user = update.effective_user
+    if not message or not user: return
+    if not is_admin(update) or not is_private(update):
+        await message.reply_text("Only the bot owner/admin can grant group membership, in private chat."); return
+    if not context.args:
+        await message.reply_text("Usage: /groupgrant <group_id> [group name]\nExample: /groupgrant -1001234567890 BPSC Batch A\nGet the numeric group ID from your user-info bot."); return
+    try: chat_id = int(context.args[0])
+    except ValueError:
+        await message.reply_text("Invalid group ID. Use the numeric Telegram group ID, usually starting with -100."); return
+    label = " ".join(context.args[1:]).strip() or None
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        if not label: label = chat.title or chat.username or str(chat_id)
+    except Exception:
+        label = label or str(chat_id)
+    async with pool.connection() as conn:
+        await conn.execute("""INSERT INTO group_quiz_memberships(chat_id,chat_title,is_active,granted_by,granted_at,revoked_at)
+            VALUES(%s,%s,TRUE,%s,NOW(),NULL)
+            ON CONFLICT(chat_id) DO UPDATE SET chat_title=EXCLUDED.chat_title,is_active=TRUE,
+            granted_by=EXCLUDED.granted_by,granted_at=NOW(),revoked_at=NULL""", (chat_id, label, user.id))
+    await message.reply_text(f"✅ Group Quiz membership activated.\n\nGroup ID: {chat_id}\nName: {label or 'Not set'}\nOnly this group can now use BPSC Nexus group-quiz features.")
+
+
+async def grouprevoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: /grouprevoke <telegram_group_id>."""
+    message = update.effective_message
+    if not message: return
+    if not is_admin(update) or not is_private(update):
+        await message.reply_text("Only the bot owner/admin can revoke group membership, in private chat."); return
+    if not context.args:
+        await message.reply_text("Usage: /grouprevoke <group_id>\nExample: /grouprevoke -1001234567890"); return
+    try: chat_id = int(context.args[0])
+    except ValueError:
+        await message.reply_text("Invalid group ID. Use the numeric Telegram group ID."); return
+    current_poll_message_id = None
+    async with pool.connection() as conn:
+        cur = await conn.execute("UPDATE group_quiz_memberships SET is_active=FALSE,revoked_at=NOW() WHERE chat_id=%s AND is_active=TRUE RETURNING chat_title", (chat_id,))
+        row = await cur.fetchone()
+        cur = await conn.execute("""SELECT q.message_id FROM group_quiz_sessions s
+            LEFT JOIN group_quiz_session_questions q ON q.session_id=s.id AND q.position=s.current_index
+            WHERE s.chat_id=%s AND s.status='active' ORDER BY s.id DESC LIMIT 1""", (chat_id,))
+        active = await cur.fetchone()
+        if active:
+            current_poll_message_id = active["message_id"]
+        await conn.execute("UPDATE group_quiz_sessions SET status='cancelled',completed_at=NOW() WHERE chat_id=%s AND status='active'", (chat_id,))
+    if current_poll_message_id:
+        try:
+            await context.bot.stop_poll(chat_id=chat_id, message_id=int(current_poll_message_id))
+        except Exception:
+            logger.info("Current poll for revoked group %s was already closed or unavailable", chat_id)
+    if row: await message.reply_text(f"⛔ Group membership revoked.\nGroup ID: {chat_id}\nName: {row['chat_title'] or 'Not set'}")
+    else: await message.reply_text(f"No active membership was found for group ID {chat_id}.")
+
+
+async def grouplist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: list authorized Telegram groups."""
+    message = update.effective_message
+    if not message: return
+    if not is_admin(update) or not is_private(update):
+        await message.reply_text("Only the bot owner/admin can view the authorized group list in private chat."); return
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT chat_id,chat_title,granted_at FROM group_quiz_memberships WHERE is_active=TRUE ORDER BY granted_at DESC")
+        rows = await cur.fetchall()
+    if not rows:
+        await message.reply_text("No groups have active Quiz membership yet. Use /groupgrant <group_id>."); return
+    lines = ["📋 Authorized BPSC Nexus Quiz Groups", ""]
+    for row in rows: lines.append(f"• {row['chat_title'] or 'Unnamed group'} — {row['chat_id']}")
+    await message.reply_text("\n".join(lines)[:4000])
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled bot error", exc_info=context.error)
 
@@ -1306,10 +1345,21 @@ def main() -> None:
     )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("quiz", quiz_command))
+    application.add_handler(CommandHandler("tests", tests_command))
     application.add_handler(CommandHandler("mypremium", mypremium_command))
     application.add_handler(CommandHandler("tutorial", tutorial_command))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("groupquiz", gq.group_quiz_command))
+    application.add_handler(CommandHandler("groupquiz_schedule", gq.group_quiz_schedule_command))
+    application.add_handler(CommandHandler("grouprank", gq.group_leaderboard_command))
+    application.add_handler(CommandHandler("groupstatus", gq.group_status_command))
+    application.add_handler(CommandHandler("groupstop", gq.group_stop_command))
+    application.add_handler(CommandHandler("groupgrant", groupgrant_command))
+    application.add_handler(CommandHandler("grouprevoke", grouprevoke_command))
+    application.add_handler(CommandHandler("grouplist", grouplist_command))
     application.add_handler(CallbackQueryHandler(admin_callback))
+    application.add_handler(PollAnswerHandler(gq.group_poll_answer))
     application.add_handler(MessageHandler(filters.Document.ALL, question_bank_file_handler))
     application.add_handler(MessageHandler(filters.POLL, question_bank_poll_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_input))
