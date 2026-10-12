@@ -157,6 +157,58 @@ async def _is_chat_admin(context, chat_id: int, user_id: int) -> bool:
     return False
 
 
+async def _reconcile_chat_quizzes(conn, chat_id: int) -> int | None:
+    """Repair stale sessions for one group and return the one live session, if any.
+
+    The caller must hold the per-chat PostgreSQL advisory transaction lock.
+    Future-dated active rows are scheduled sessions and are preserved.
+    """
+    cur = await conn.execute("""SELECT * FROM group_quiz_sessions
+        WHERE chat_id=%s AND status IN ('active','paused') ORDER BY id DESC""", (int(chat_id),))
+    sessions = await cur.fetchall()
+    live_id = None
+    for session in sessions:
+        sid = int(session['id'])
+        if session.get('status') == 'paused':
+            # Paused sessions are never allowed to remain as hidden blockers for a new quiz.
+            # A fresh launch supersedes them; they must not unexpectedly resume later.
+            await conn.execute("UPDATE group_quiz_sessions SET status='cancelled',completed_at=COALESCE(completed_at,NOW()) WHERE id=%s AND status='paused'", (sid,))
+            continue
+        total = int(session.get('questions_count') or 0)
+        position = int(session.get('current_index') or 0)
+        if total <= 0 or position >= total:
+            await conn.execute("UPDATE group_quiz_sessions SET current_index=GREATEST(current_index,questions_count),next_at=NOW() WHERE id=%s AND status='active'", (sid,))
+            # Mark terminal now; scheduler's completed/report retry path generates results.
+            await conn.execute("UPDATE group_quiz_sessions SET status='completed',completed_at=COALESCE(completed_at,NOW()) WHERE id=%s AND status='active'", (sid,))
+            continue
+        # Walk past already-closed questions left behind by older buggy versions.
+        while position < total:
+            qcur = await conn.execute("SELECT status FROM group_quiz_session_questions WHERE session_id=%s AND position=%s", (sid, position))
+            qrow = await qcur.fetchone()
+            if qrow and qrow['status'] == 'closed':
+                position += 1
+                continue
+            break
+        if position >= total:
+            await conn.execute("UPDATE group_quiz_sessions SET current_index=questions_count,status='completed',completed_at=COALESCE(completed_at,NOW()),next_at=NOW() WHERE id=%s AND status='active'", (sid,))
+            continue
+        if not qrow:
+            # No current question means this active row can never progress; quarantine it.
+            await conn.execute("UPDATE group_quiz_sessions SET status='cancelled',completed_at=COALESCE(completed_at,NOW()) WHERE id=%s AND status='active'", (sid,))
+            continue
+        if qrow['status'] == 'failed':
+            await conn.execute("UPDATE group_quiz_sessions SET status='failed',completed_at=COALESCE(completed_at,NOW()) WHERE id=%s AND status='active'", (sid,))
+            continue
+        if position != int(session['current_index']):
+            await conn.execute("UPDATE group_quiz_sessions SET current_index=%s,next_at=NOW() WHERE id=%s AND status='active'", (position, sid))
+        if live_id is None:
+            live_id = sid
+        else:
+            # Legacy duplicate active rows: preserve the newest live session and retire older ones.
+            await conn.execute("UPDATE group_quiz_sessions SET status='cancelled',completed_at=COALESCE(completed_at,NOW()) WHERE id=%s AND status='active'", (sid,))
+    return live_id
+
+
 async def group_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
@@ -375,9 +427,10 @@ async def group_quiz_schedule_command(update: Update, context: ContextTypes.DEFA
         cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,user.id)); quiz=await cur.fetchone()
         if not quiz:
             await message.reply_text("Published quiz not found."); return
-        cur=await conn.execute("SELECT id FROM group_quiz_sessions WHERE chat_id=%s AND status='active' LIMIT 1",(chat.id,)); active=await cur.fetchone()
-        if active:
-            await message.reply_text(f"This group already has active or scheduled quiz session #{active['id']}. Complete or cancel it first."); return
+        await conn.execute("SELECT pg_advisory_xact_lock(741923, %s)", (int(chat.id),))
+        active_id = await _reconcile_chat_quizzes(conn, chat.id)
+        if active_id is not None:
+            await message.reply_text(f"This group already has live or scheduled quiz session #{active_id}. Finish it before scheduling another."); return
         cur=await conn.execute("""SELECT b.id,b.question_en,b.question_hi,b.options,b.correct_option,b.explanation_en,b.explanation_hi
             FROM bank_quiz_questions qq JOIN question_bank b ON b.id=qq.question_id WHERE qq.quiz_id=%s AND b.status='ready' ORDER BY qq.position""",(quiz_id,))
         source=await cur.fetchall(); prepared=[]
@@ -630,8 +683,10 @@ async def _launch_pending_quiz(q,context,pool,pending,user):
         if len(prepared)!=int(expected_count):
             await q.answer(f"That fixed range contains {int(expected_count)-len(prepared)} question(s) that cannot be displayed as Telegram polls. Choose a different range so no question is silently omitted.",show_alert=True); return True
         random.shuffle(prepared)
-        cur=await conn.execute("SELECT id FROM group_quiz_sessions WHERE chat_id=%s AND status='active' LIMIT 1",(chat_id,)); active=await cur.fetchone()
-        if active: await q.answer(f"This group already has active quiz session #{active['id']}.",show_alert=True); return True
+        await conn.execute("SELECT pg_advisory_xact_lock(741923, %s)", (int(chat_id),))
+        active_id = await _reconcile_chat_quizzes(conn, chat_id)
+        if active_id is not None:
+            await q.answer(f"This group already has live or scheduled quiz session #{active_id}. Finish it first.",show_alert=True); return True
         cur=await conn.execute("INSERT INTO group_quiz_sessions(chat_id,chat_title,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at,positive_marks,negative_marks,started_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,0,'active',NOW()+INTERVAL '5 seconds',%s,%s,NOW()) RETURNING id",(chat_id,pending.get("chat_title","Telegram group"),quiz["id"],quiz["title"],user.id,interval,len(prepared),mode,positive,negative)); sid=int((await cur.fetchone())["id"])
         for position,(row,opts,letters) in enumerate(prepared):
             await conn.execute("INSERT INTO group_quiz_session_questions(session_id,position,question_id,question_en,question_hi,options,option_letters,correct_option,explanation_en,explanation_hi) VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)",(sid,position,row["id"],row["question_en"],row["question_hi"],json.dumps(opts,ensure_ascii=False),json.dumps(letters),row["correct_option"],row["explanation_en"],row["explanation_hi"]))
@@ -881,6 +936,19 @@ async def scheduler(application, pool):
     while True:
         try:
             async with pool.connection() as conn:
+                # Global recovery: retire orphaned active rows and finalize exhausted sessions
+                # before the normal due-session loop. This prevents legacy DB rows from
+                # permanently blocking new quizzes after a deployment/restart.
+                await conn.execute("""UPDATE group_quiz_sessions s SET status='completed',completed_at=COALESCE(completed_at,NOW()),next_at=NOW()
+                    WHERE s.status='active' AND s.questions_count>0 AND s.current_index>=s.questions_count""")
+                await conn.execute("""UPDATE group_quiz_sessions s SET status='cancelled',completed_at=COALESCE(completed_at,NOW())
+                    WHERE s.status='active' AND (s.questions_count<=0 OR NOT EXISTS (
+                        SELECT 1 FROM group_quiz_session_questions q WHERE q.session_id=s.id))""")
+                # Any non-progressing active/paused session older than 24h is stale. A
+                # future-dated scheduled quiz is preserved because next_at must already be due.
+                await conn.execute("""UPDATE group_quiz_sessions s SET status='cancelled',completed_at=COALESCE(completed_at,NOW())
+                    WHERE s.status IN ('active','paused') AND s.next_at<=NOW()
+                      AND s.created_at < NOW()-INTERVAL '24 hours'""")
                 # Recover sessions whose final question finished even if next_at/current_index
                 # were left stale by an older deployment or a restart. The NOT EXISTS clause
                 # only matches sessions where no question remains pending, posting, or open.
