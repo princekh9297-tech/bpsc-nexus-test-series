@@ -222,13 +222,13 @@ def detect_question_layout(question_en: str, question_hi: str = "", record: dict
     flags = {}
     flags["negative_wording"] = bool(re.search(r"\b(not|incorrect|false|except|least likely|isn't|cannot)\b|नहीं|असत्य|गलत|अपवाद|निम्न में से कौन नहीं", text, re.I))
     flags["bilingual"] = bool(hi.strip())
-    if raw_type in LAYOUT_TYPES:
+    if raw_type in LAYOUT_TYPES and raw_type != "standard":
         qtype = raw_type
     elif li and lj:
         qtype = "match_following"
     elif assertion or reason or re.search(r"assertion.{0,160}reason|अभिकथन.{0,120}कारण|कथन.{0,80}कारण", text, re.I | re.S):
         qtype = "assertion_reason"
-    elif statements or re.search(r"following statements|statements? given below|consider the following statements|which of the statements|निम्नलिखित कथनों|कौन से कथन|कथन\s*(?:1|१|दो|तीन|चार)", text, re.I):
+    elif statements or re.search(r"following\s+(?:three\s+|four\s+)?statements?|statements?\s+(?:given|listed|are\s+given)|consider the following statements|which of the (?:(?:above|following) )?statements|which one of the following statements|how many of the statements|निम्नलिखित कथन|कथनों?\s+में से|कौन से कथन|उपर्युक्त कथन|उपर्युक्त में से कौन|कथन\s*(?:1|१|दो|तीन|चार)", text, re.I) or (re.search(r"statement|कथन", text, re.I) and len(re.findall(r"(?:\(\s*(?:1|2|3|4|i|ii|iii|iv|१|२|३|४)\s*\)|(?:^|\s)(?:1|2|3|4|i|ii|iii|iv)[.)])", text, re.I)) >= 2):
         qtype = "statement_based"
     elif pairs or re.search(r"which of the following pairs|correctly matched pair|following pairs|सही सुमेलित युग्म|निम्नलिखित युग्म", text, re.I):
         qtype = "pair_based"
@@ -664,19 +664,23 @@ async def ensure_schema(pool):
         await conn.execute("""UPDATE question_bank SET
             question_type = CASE
               WHEN COALESCE(question_structure,'{}'::jsonb) ? 'list_i' AND COALESCE(question_structure,'{}'::jsonb) ? 'list_ii' THEN 'match_following'
-              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(match[[:space:]]+(the[[:space:]]+)?following|match list|correctly matched|सुमेलित|मिलान[[:space:]]+कीजिए)' THEN 'match_following'
-              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(assertion.{0,80}reason|अभिकथन.{0,80}कारण)' THEN 'assertion_reason'
-              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(following statements|consider the following statements|which of the statements|कथनों? में से|निम्नलिखित कथनों|कौन से कथन)' THEN 'statement_based'
+              WHEN CASE WHEN jsonb_typeof(COALESCE(question_structure,'{}'::jsonb)->'statements')='array' THEN jsonb_array_length(COALESCE(question_structure,'{}'::jsonb)->'statements') ELSE 0 END > 1 THEN 'statement_based'
+              WHEN COALESCE(question_structure,'{}'::jsonb) ? 'assertion' AND COALESCE(question_structure,'{}'::jsonb) ? 'reason' THEN 'assertion_reason'
+              WHEN CASE WHEN jsonb_typeof(COALESCE(question_structure,'{}'::jsonb)->'pairs')='array' THEN jsonb_array_length(COALESCE(question_structure,'{}'::jsonb)->'pairs') ELSE 0 END > 0 THEN 'pair_based'
+              WHEN CASE WHEN jsonb_typeof(COALESCE(question_structure,'{}'::jsonb)->'events')='array' THEN jsonb_array_length(COALESCE(question_structure,'{}'::jsonb)->'events') ELSE 0 END > 0 THEN 'chronology'
+              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(match[[:space:]]*(the[[:space:]]*)?following|match[[:space:]]+(list|column)|list[[:space:]-]*i.{0,500}list[[:space:]-]*ii|सुमेलित|मिलान[[:space:]]*कीजिए|सूची[[:space:]]*[i१२12].{0,500}सूची)' THEN 'match_following'
+              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(assertion.{0,220}reason|अभिकथन.{0,180}कारण|कथन[[:space:]]*\\(?[[:space:]]*a\\)?.{0,160}कारण)' THEN 'assertion_reason'
+              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(following[[:space:]]+(three[[:space:]]+|four[[:space:]]+)?statements?|statements?[[:space:]]+(given|listed|are[[:space:]]+given)|consider[[:space:]]+the[[:space:]]+following[[:space:]]+statements|which[[:space:]]+of[[:space:]]+the[[:space:]]+((above|following)[[:space:]]+)?statements|which[[:space:]]+one[[:space:]]+of[[:space:]]+the[[:space:]]+following[[:space:]]+statements|how[[:space:]]+many[[:space:]]+of[[:space:]]+the[[:space:]]+statements|निम्नलिखित[[:space:]]+कथन|कथनों?[[:space:]]+में[[:space:]]+से|कौन[[:space:]]+से[[:space:]]+कथन|उपर्युक्त[[:space:]]+कथन|उपर्युक्त[[:space:]]+में[[:space:]]+से[[:space:]]+कौन)' THEN 'statement_based'
               WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(chronological order|correct sequence|arrange.{0,30}order|कालानुक्रम|सही क्रम में व्यवस्थित)' THEN 'chronology'
-              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(following pairs|correctly matched pair|सही सुमेलित युग्म|निम्नलिखित युग्म)' THEN 'pair_based'
+              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(following pairs|correctly matched pair|which pairs|सही सुमेलित युग्म|निम्नलिखित युग्म)' THEN 'pair_based'
               WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(read the following passage|passage given below|निम्नलिखित गद्यांश|निम्नलिखित अनुच्छेद)' THEN 'passage_based'
               WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(calculate|solve for|find the value|गणना कीजिए|मान ज्ञात कीजिए)' THEN 'numerical'
               ELSE 'standard' END,
-            question_flags = jsonb_build_object(
+            question_flags = COALESCE(question_flags,'{}'::jsonb) || jsonb_build_object(
               'negative_wording', LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(not|incorrect|false|except|नहीं|असत्य|गलत|अपवाद)',
               'bilingual', COALESCE(BTRIM(question_hi),'') <> ''),
             updated_at = updated_at
-            WHERE question_type IS NULL OR question_type='unknown'""")
+            WHERE question_type IS NULL OR question_type IN ('unknown','standard','auto','')""")
         # Keep existing attempt snapshots aligned with the classifier; never change their text or answer key.
         await conn.execute("""UPDATE bank_quiz_attempt_question_snapshots s SET
             question_type=qb.question_type, question_structure=qb.question_structure, question_flags=qb.question_flags
