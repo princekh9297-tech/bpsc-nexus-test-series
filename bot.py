@@ -210,9 +210,32 @@ async def post_init(application: Application) -> None:
     await pool.wait()
     async with pool.connection() as conn:
         await conn.execute("SELECT 1")
-    await ensure_schema()
-    await qb.ensure_schema(pool)
-    await gq.ensure_schema(pool)
+
+    # Serialize every startup migration across Render processes/instances.
+    # This is a session-level lock: it remains held while the individual
+    # migration functions use their own pooled connections and is released
+    # automatically by PostgreSQL if this process/connection disappears.
+    migration_lock_key = 0x425053434D4947  # Stable BPSC Nexus schema-migration lock.
+    async with pool.connection() as migration_lock_conn:
+        logger.info("Waiting for the shared database migration lock...")
+        await migration_lock_conn.execute(
+            "SELECT pg_advisory_lock(%s)", (migration_lock_key,)
+        )
+        await migration_lock_conn.commit()
+        try:
+            logger.info("Database migration lock acquired; applying startup migrations.")
+            await ensure_schema()
+            await qb.ensure_schema(pool)
+            await gq.ensure_schema(pool)
+            logger.info("All startup migrations completed successfully.")
+        finally:
+            # Commit the unlock query as well; the session-level lock survives
+            # transaction boundaries until pg_advisory_unlock is called.
+            await migration_lock_conn.execute(
+                "SELECT pg_advisory_unlock(%s)", (migration_lock_key,)
+            )
+            await migration_lock_conn.commit()
+            logger.info("Database migration lock released.")
     me = await application.bot.get_me()
     application.bot_data["bot_username"] = me.username
     application.bot_data["db_pool"] = pool
