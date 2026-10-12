@@ -352,10 +352,11 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
 
 def admin_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 Import HTML / JSON / CSV", callback_data="qb:import")],
-        [InlineKeyboardButton("🗃 Question Bank", callback_data="qb:browse"), InlineKeyboardButton("🧩 Build Quiz", callback_data="qb:build")],
-        [InlineKeyboardButton("🛠 Manage Quizzes", callback_data="qb:manage"), InlineKeyboardButton("🧪 Bank Quality Audit", callback_data="qb:audit")],
-        [InlineKeyboardButton("🕵️ Verify Pending", callback_data="qb:pending"), InlineKeyboardButton("📦 Import History", callback_data="qb:history")],
+        [InlineKeyboardButton("➕ Add One Question", callback_data="qb:addone"), InlineKeyboardButton("📥 Bulk Import File", callback_data="qb:import")],
+        [InlineKeyboardButton("🗃 Browse / Edit", callback_data="qb:browse"), InlineKeyboardButton("🗑 Delete Questions", callback_data="qb:deletehub")],
+        [InlineKeyboardButton("🧹 Bulk Delete by IDs", callback_data="qb:bulkdelete"), InlineKeyboardButton("📦 Import History / Undo", callback_data="qb:history")],
+        [InlineKeyboardButton("🧩 Build Quiz", callback_data="qb:build"), InlineKeyboardButton("🛠 Manage Quizzes", callback_data="qb:manage")],
+        [InlineKeyboardButton("🕵️ Verify Pending", callback_data="qb:pending"), InlineKeyboardButton("🧪 Quality Audit", callback_data="qb:audit")],
         [InlineKeyboardButton("↩ Main Admin Panel", callback_data="adm:home")],
     ])
 
@@ -384,6 +385,64 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
     if data.startswith("qb:") and not is_authorized:
         await q.answer("Not authorized.",show_alert=True); return
     await q.answer()
+    if data == "qb:addone":
+        context.user_data["qb_flow"]={"step":"add_question_subject"}
+        await q.edit_message_text("➕ Add a question\n\nChoose its subject first:",reply_markup=subject_keyboard("qb:addsubject")); return
+    if data.startswith("qb:addsubject:"):
+        idx=int(data.rsplit(":",1)[1]); context.user_data["qb_flow"]={"step":"add_question_text","subject":SUBJECTS[idx]}
+        await q.edit_message_text("Send the MCQ in one message using this format:\n\nQuestion text\nA. Option A\nB. Option B\nC. Option C\nD. Option D\nAnswer: B\nExplanation: Explanation text\n\nHindi text may be included too. The question is previewed before saving.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel",callback_data="qb:home")]])); return
+    if data == "qb:deletehub":
+        await q.edit_message_text("🗑 Question deletion\n\nChoose a group to browse. Open a question to edit, archive, or permanently delete it. Permanent deletion can also remove its links from quizzes.",reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("All questions",callback_data="qb:liststatus:all:0")],
+            [InlineKeyboardButton("Verified / Ready",callback_data="qb:liststatus:ready:0"),InlineKeyboardButton("Pending",callback_data="qb:liststatus:pending:0")],
+            [InlineKeyboardButton("Archived",callback_data="qb:liststatus:archived:0")],
+            [InlineKeyboardButton("🧹 Delete archived questions",callback_data="qb:purgearchivedconfirm")],
+            [InlineKeyboardButton("⬅ Question Bank menu",callback_data="qb:home")]])); return
+    if data.startswith("qb:liststatus:"):
+        _,_,status,page=data.split(":",3); page=max(0,int(page)); await show_question_list(q,pool,status,page); return
+    if data == "qb:bulkdelete":
+        context.user_data["qb_flow"]={"step":"bulk_delete_ids"}
+        await q.edit_message_text("🧹 Bulk delete questions\n\nSend the question IDs separated by commas or spaces (example: 12, 18, 25). I will show a confirmation before changing anything.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel",callback_data="qb:home")]])); return
+    if data == "qb:bulkdeleteconfirm":
+        ids=context.user_data.get("qb_bulk_delete_ids",[])
+        if not ids: await q.edit_message_text("No question IDs selected.",reply_markup=admin_keyboard()); return
+        deleted=0; unhandled=[]
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                for qid in ids:
+                    await conn.execute("DELETE FROM bank_quiz_questions WHERE question_id=%s",(qid,))
+                    # Attempt totals remain intact; remove only answer-level rows that FK-restrict deletion.
+                    await conn.execute("DELETE FROM bank_quiz_attempt_answers WHERE question_id=%s",(qid,))
+                    cur=await conn.execute("DELETE FROM question_bank WHERE id=%s RETURNING id",(qid,))
+                    if await cur.fetchone(): deleted+=1
+                    else: unhandled.append(qid)
+        context.user_data.pop("qb_bulk_delete_ids",None); context.user_data.pop("qb_flow",None)
+        await q.edit_message_text(f"✅ Bulk delete complete\n\nDeleted: {deleted}\nNot found: {', '.join(map(str,unhandled)) if unhandled else 'None'}\n\nQuiz links for deleted questions were removed. Existing database tables and unrelated questions were left intact.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Delete more",callback_data="qb:bulkdelete")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
+    if data == "qb:purgearchivedconfirm":
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status='archived'"); n=(await cur.fetchone())["n"]
+        await q.edit_message_text(f"Permanently delete all {n} archived question(s)?\n\nQuiz links and answer-level attempt rows will also be removed; aggregate attempt totals remain. This cannot be undone.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Confirm delete archived",callback_data="qb:purgearchived")],[InlineKeyboardButton("Cancel",callback_data="qb:deletehub")]])); return
+    if data == "qb:purgearchived":
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM bank_quiz_questions WHERE question_id IN (SELECT id FROM question_bank WHERE status='archived')")
+                await conn.execute("DELETE FROM bank_quiz_attempt_answers WHERE question_id IN (SELECT id FROM question_bank WHERE status='archived')")
+                cur=await conn.execute("DELETE FROM question_bank WHERE status='archived' RETURNING id"); n=len(await cur.fetchall())
+        await q.edit_message_text(f"✅ Permanently deleted {n} archived question(s).",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Question deletion",callback_data="qb:deletehub")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
+    if data.startswith("qb:purgeconfirm:"):
+        qid=int(data.rsplit(":",1)[1])
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT question_en,status,(SELECT COUNT(*) FROM bank_quiz_questions WHERE question_id=%s) AS refs FROM question_bank WHERE id=%s",(qid,qid)); r=await cur.fetchone()
+        if not r: await q.edit_message_text("Question not found.",reply_markup=admin_keyboard()); return
+        await q.edit_message_text(f"Permanently delete question #{qid}?\n\nQuiz references: {r['refs']}\nStatus: {r['status']}\n\nThis removes it from quiz sets and removes answer-level attempt rows for this question; aggregate attempt totals remain. This cannot be undone.\n\n{r['question_en'][:500]}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Confirm permanent delete",callback_data=f"qb:purge:{qid}")],[InlineKeyboardButton("Cancel",callback_data=f"qb:detail:{qid}")]])); return
+    if data.startswith("qb:purge:"):
+        qid=int(data.rsplit(":",1)[1])
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM bank_quiz_questions WHERE question_id=%s",(qid,))
+                await conn.execute("DELETE FROM bank_quiz_attempt_answers WHERE question_id=%s",(qid,))
+                cur=await conn.execute("DELETE FROM question_bank WHERE id=%s RETURNING id",(qid,)); row=await cur.fetchone()
+        await q.edit_message_text(f"{'✅ Question #' + str(qid) + ' permanently deleted and removed from quiz sets.' if row else 'Question not found; no question was deleted.'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Delete more",callback_data="qb:deletehub")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
     if data == "qb:home":
         context.user_data.pop("qb_flow",None)
         if pool is not None:
@@ -567,6 +626,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
         await submit_attempt(q,context,pool); return
 
 
+async def show_question_list(q,pool,status="all",page=0):
+    if pool is None:
+        await q.edit_message_text("Database unavailable.",reply_markup=admin_keyboard()); return
+    page=max(0,int(page)); limit=10; offset=page*limit
+    async with pool.connection() as conn:
+        if status=="all":
+            cur=await conn.execute("SELECT id,question_en,subject,status FROM question_bank ORDER BY id DESC LIMIT %s OFFSET %s",(limit,offset)); rows=await cur.fetchall()
+            cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank"); total=(await cur.fetchone())["n"]
+        else:
+            cur=await conn.execute("SELECT id,question_en,subject,status FROM question_bank WHERE status=%s ORDER BY id DESC LIMIT %s OFFSET %s",(status,limit,offset)); rows=await cur.fetchall()
+            cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status=%s",(status,)); total=(await cur.fetchone())["n"]
+    lines=[f"🗃 Questions · {status.title()} · {total} total",f"Page {page+1} · showing {len(rows)}","",]
+    if not rows: lines.append("No questions on this page.")
+    buttons=[[InlineKeyboardButton(f"#{r['id']} · {r['question_en'][:38]}",callback_data=f"qb:detail:{r['id']}")] for r in rows]
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton("⬅ Previous",callback_data=f"qb:liststatus:{status}:{page-1}"))
+    if offset+len(rows)<total: nav.append(InlineKeyboardButton("Next ➡",callback_data=f"qb:liststatus:{status}:{page+1}"))
+    if nav: buttons.append(nav)
+    buttons += [[InlineKeyboardButton("🔎 Search",callback_data="qb:browse"),InlineKeyboardButton("🗑 Delete menu",callback_data="qb:deletehub")],[InlineKeyboardButton("⬅ Question Bank menu",callback_data="qb:home")]]
+    await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(buttons))
+
+
 async def show_search_results(q,pool,term):
     if pool is None: await q.edit_message_text("Database unavailable."); return
     async with pool.connection() as conn:
@@ -591,7 +672,7 @@ async def show_question_detail(q,pool,qid):
     if r["question_hi"]: text+="\n"+r["question_hi"]
     text+="\n\n"+"\n".join(f"{k}. {v}" for k,v in opts.items())+f"\n\nCorrect answer: {r['correct_option'] or 'Pending'}"
     if r["explanation_en"]: text+="\n\nExplanation: "+r["explanation_en"][:400]
-    rows=[[InlineKeyboardButton("✏️ Edit",callback_data=f"qb:edit:{qid}"),InlineKeyboardButton("Archive",callback_data=f"qb:archive:{qid}")],[InlineKeyboardButton("Delete if unused",callback_data=f"qb:delete:{qid}")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]]
+    rows=[[InlineKeyboardButton("✏️ Edit",callback_data=f"qb:edit:{qid}"),InlineKeyboardButton("Archive",callback_data=f"qb:archive:{qid}")],[InlineKeyboardButton("🗑 Permanent delete…",callback_data=f"qb:purgeconfirm:{qid}")],[InlineKeyboardButton("Question deletion",callback_data="qb:deletehub")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]]
     await q.edit_message_text(text[:4000],reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -690,6 +771,29 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not msg or not msg.text or not user or not is_authorized: return False
     flow=context.user_data.get("qb_flow",{})
     step=flow.get("step")
+    if step == "add_question_text":
+        record=parse_forwarded_text(msg.text,user.id)
+        if not record:
+            await msg.reply_text("I couldn't parse that MCQ. Please include a question, options A–D, and an Answer: B line. No changes were made."); return True
+        record["subject"]=flow.get("subject",SUBJECTS[-1])
+        context.user_data["qb_forward_preview"]=record
+        context.user_data.pop("qb_flow",None)
+        await msg.reply_text("📝 Question preview — not saved yet\n\n"+format_question(record)+f"\\nSubject: {record['subject']}\\n\\nSave this question?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Save question",callback_data="qb:saveforward")],[InlineKeyboardButton("✖ Discard",callback_data="qb:cancelforward")]])); return True
+    if step == "bulk_delete_ids":
+        import re as _re
+        ids=sorted(set(int(x) for x in _re.findall(r"\\d+",msg.text)))
+        if not ids:
+            await msg.reply_text("No numeric question IDs found. Send IDs separated by commas or spaces, or cancel."); return True
+        if len(ids)>100:
+            await msg.reply_text("Please process at most 100 IDs per batch."); return True
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT id,question_en,status FROM question_bank WHERE id = ANY(%s) ORDER BY id",(ids,)); found=await cur.fetchall()
+        context.user_data["qb_bulk_delete_ids"]=[int(r["id"]) for r in found]
+        if not found:
+            await msg.reply_text("None of those IDs exist in the question bank.",reply_markup=admin_keyboard()); context.user_data.pop("qb_flow",None); return True
+        preview="\\n".join(f"#{r['id']} [{r['status']}] {r['question_en'][:85]}" for r in found[:20])
+        extra=f"\\n…and {len(found)-20} more" if len(found)>20 else ""
+        await msg.reply_text(f"⚠️ Confirm bulk deletion of {len(found)} question(s)?\\n\\n{preview}{extra}\\n\\nQuiz links and answer-level attempt rows for these questions will be removed; aggregate attempt totals remain. This cannot be undone.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Confirm delete",callback_data="qb:bulkdeleteconfirm")],[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return True
     if step in {"edit_quiz_title","edit_quiz_duration","edit_quiz_marks"}:
         quiz_id=int(flow["quiz_id"])
         try:
@@ -963,7 +1067,7 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
         record=context.user_data.pop("qb_forward_preview",None)
         if not record: await q.answer("Preview expired",show_alert=True); return True
         result=await import_records(pool,[record],update.effective_user.id,"Forwarded Telegram message","forwarded",record["subject"],0)
-        await q.answer(); await q.edit_message_text(f"Saved forwarded question. Added: {result['imported']}; duplicates skipped: {result['duplicates']}; pending verification: {result['pending']}.",reply_markup=admin_keyboard()); return True
+        await q.answer(); await q.edit_message_text(f"Question saved. Added: {result['imported']}; duplicates skipped: {result['duplicates']}; pending verification: {result['pending']}.",reply_markup=admin_keyboard()); return True
     if data == "qb:cancelforward":
         context.user_data.pop("qb_forward_preview",None); await q.answer(); await q.edit_message_text("Forwarded question discarded.",reply_markup=admin_keyboard()); return True
     if data.startswith("play:prev") or data.startswith("play:next"):
