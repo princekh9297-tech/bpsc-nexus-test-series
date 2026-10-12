@@ -159,6 +159,15 @@ async def ensure_schema() -> None:
         "CREATE INDEX IF NOT EXISTS idx_premium_passes_user ON premium_passes(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_premium_passes_expiry ON premium_passes(expires_at) WHERE revoked_at IS NULL",
         "CREATE INDEX IF NOT EXISTS idx_tests_vault_key ON tests(vault_key)",
+        """CREATE TABLE IF NOT EXISTS bpsc_payment_requests (
+            id BIGSERIAL PRIMARY KEY, telegram_id BIGINT NOT NULL, product_code TEXT NOT NULL,
+            product_name TEXT NOT NULL, duration_days INTEGER NOT NULL, amount_inr INTEGER NOT NULL,
+            transaction_ref TEXT NOT NULL, screenshot_data TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+            submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ,
+            reviewed_by BIGINT, review_note TEXT, activated_pass_id BIGINT,
+            UNIQUE (transaction_ref))""",
+        "CREATE INDEX IF NOT EXISTS bpsc_payment_requests_status_idx ON bpsc_payment_requests(status, submitted_at DESC)",
     ]
     async with pool.connection() as conn:
         for statement in statements:
@@ -381,6 +390,7 @@ def main_user_keyboard() -> InlineKeyboardMarkup:
     keyboard = []
     if MINI_APP_URL.startswith("https://"):
         keyboard.append([InlineKeyboardButton("🚀 Open BPSC Nexus Mini App", web_app=WebAppInfo(url=MINI_APP_URL))])
+        keyboard.append([InlineKeyboardButton("💳 Buy / Renew Membership", web_app=WebAppInfo(url=MINI_APP_URL + "/membership"))])
     else:
         keyboard.append([InlineKeyboardButton("🚀 Open Mini App", callback_data="user:openapp")])
     keyboard.extend([
@@ -538,6 +548,7 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("👥 Manage Members", callback_data="adm:manage")],
         [InlineKeyboardButton("🗂 Pass Catalogue", callback_data="adm:catalogue"),
          InlineKeyboardButton("📊 Statistics", callback_data="adm:stats")],
+        [InlineKeyboardButton("💳 Payment Requests", callback_data="pay:pending")],
     ])
 
 
@@ -751,11 +762,88 @@ async def admin_stats(query) -> None:
     )
 
 
+async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    query = update.callback_query
+    data = query.data or ""
+    if not data.startswith("pay:"):
+        return False
+    if not admin_only(update):
+        await query.answer("Not authorized.", show_alert=True)
+        return True
+    await query.answer()
+    if data == "pay:pending":
+        async with pool.connection() as conn:
+            cur = await conn.execute("SELECT id,telegram_id,product_name,amount_inr,transaction_ref,submitted_at FROM bpsc_payment_requests WHERE status='pending' ORDER BY submitted_at ASC LIMIT 20")
+            rows = await cur.fetchall()
+        if not rows:
+            await query.edit_message_text("💳 Payment Requests\n\nNo pending payment requests.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Admin Panel", callback_data="adm:home")]]))
+            return True
+        buttons=[]
+        for r in rows:
+            buttons.append([InlineKeyboardButton(f"#{r['id']} · ₹{r['amount_inr']} · {str(r['product_name'])[:24]}", callback_data=f"pay:view:{r['id']}")])
+        buttons.append([InlineKeyboardButton("⬅ Admin Panel", callback_data="adm:home")])
+        await query.edit_message_text("💳 Pending payment requests\nSelect a request to review:", reply_markup=InlineKeyboardMarkup(buttons))
+        return True
+    parts=data.split(":")
+    if len(parts)>=3 and parts[1] in {"view","approve","reject"}:
+        try: rid=int(parts[2])
+        except ValueError:
+            await query.edit_message_text("Invalid payment request.", reply_markup=admin_home_keyboard()); return True
+        if parts[1]=="view":
+            async with pool.connection() as conn:
+                cur=await conn.execute("SELECT * FROM bpsc_payment_requests WHERE id=%s",(rid,)); r=await cur.fetchone()
+            if not r:
+                await query.edit_message_text("Payment request not found.", reply_markup=admin_home_keyboard()); return True
+            text=(f"💳 Payment request #{rid}\n\nUser: {r['telegram_id']}\nProduct: {r['product_name']}\nAmount: ₹{r['amount_inr']}\nDuration: {r['duration_days']} days\nUPI reference: {r['transaction_ref']}\nStatus: {r['status']}\nSubmitted: {r['submitted_at']}\n\nVerify the credit in your PhonePe/bank app before approving.")
+            buttons=[]
+            if r['status']=='pending': buttons=[[InlineKeyboardButton("✅ Approve & Activate",callback_data=f"pay:approve:{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"pay:reject:{rid}")]]
+            buttons.append([InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")])
+            await query.edit_message_text(text,reply_markup=InlineKeyboardMarkup(buttons))
+            try:
+                raw=r['screenshot_data'].split(',',1)[-1]
+                import base64
+                from io import BytesIO
+                await context.bot.send_photo(chat_id=update.effective_user.id,photo=BytesIO(base64.b64decode(raw)),caption=f"Payment proof for request #{rid}")
+            except Exception: logger.exception("Could not send payment screenshot to admin")
+            return True
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                cur=await conn.execute("SELECT * FROM bpsc_payment_requests WHERE id=%s FOR UPDATE",(rid,)); r=await cur.fetchone()
+                if not r:
+                    await query.edit_message_text("Payment request not found.", reply_markup=admin_home_keyboard()); return True
+                if r['status']!='pending':
+                    await query.edit_message_text(f"Request #{rid} was already {r['status']}.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")]])); return True
+                if parts[1]=='reject':
+                    await conn.execute("UPDATE bpsc_payment_requests SET status='rejected',reviewed_at=NOW(),reviewed_by=%s WHERE id=%s",(update.effective_user.id,rid))
+                    user_msg=f"Your BPSC Nexus payment request #{rid} was rejected. Please contact an admin if you believe this is an error."
+                else:
+                    cur=await conn.execute("SELECT id FROM app_users WHERE telegram_id=%s",(r['telegram_id'],)); u=await cur.fetchone()
+                    if not u:
+                        await query.edit_message_text("User is not registered in app_users. Ask them to press /start, then review again.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")]])); return True
+                    cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code='all_access' AND is_active=TRUE"); cat=await cur.fetchone()
+                    if not cat:
+                        await query.edit_message_text("All-Access pass is missing/inactive in pass_catalogue; no access was granted.",reply_markup=admin_home_keyboard()); return True
+                    cur=await conn.execute("SELECT MAX(expires_at) AS expiry FROM premium_passes WHERE user_id=%s AND pass_code='all_access' AND revoked_at IS NULL AND expires_at>NOW()",(u['id'],)); expiry=(await cur.fetchone())['expiry']
+                    # Renewal begins after current expiry when one exists, otherwise now.
+                    cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys)
+                        VALUES(%s,%s,%s,COALESCE(%s,NOW()),COALESCE(%s,NOW()) + (%s * INTERVAL '1 day'),%s,'all_access',ARRAY['*']::TEXT[]) RETURNING id""",
+                        (u['id'],cat['id'],update.effective_user.id,expiry,expiry,int(r['duration_days']),f"Manual UPI payment request #{rid}; ₹{r['amount_inr']}") )
+                    activated=(await cur.fetchone())['id']
+                    await conn.execute("UPDATE bpsc_payment_requests SET status='approved',reviewed_at=NOW(),reviewed_by=%s,activated_pass_id=%s WHERE id=%s",(update.effective_user.id,activated,rid))
+                    user_msg=f"✅ Your BPSC Nexus payment is approved. All Access for {r['duration_days']} days has been activated. Use /mypremium to check your membership."
+        try: await context.bot.send_message(chat_id=int(r['telegram_id']),text=user_msg)
+        except Exception: logger.warning("Could not notify user %s about payment request %s",r['telegram_id'],rid)
+        await query.edit_message_text(f"Request #{rid} {parts[1]}d. {'Membership activated.' if parts[1]=='approve' else 'No membership was granted.'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")],[InlineKeyboardButton("Admin Panel",callback_data="adm:home")]]))
+        return True
+    return True
+
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
         return
     data = query.data or ""
+    if await payment_review_callback(update, context):
+        return
     # Legacy Telegram quiz buttons must never start or continue a quiz attempt.
     if data.startswith("play:"):
         await query.answer("Quiz attempts are available only inside the BPSC Nexus Mini App.", show_alert=True)

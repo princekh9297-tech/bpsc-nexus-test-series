@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -352,6 +353,50 @@ async def arena_answer(request):
     return json_response({"saved":True,"score":score,"answered":done,"finished":done>=int(m["question_count"])})
 
 
+ALL_ACCESS_PRICES = {60: 90, 90: 130, 120: 150, 180: 180, 249: 220, 365: 300}
+
+async def payment_schema(conn):
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_payment_requests (
+        id BIGSERIAL PRIMARY KEY, telegram_id BIGINT NOT NULL, product_code TEXT NOT NULL,
+        product_name TEXT NOT NULL, duration_days INTEGER NOT NULL, amount_inr INTEGER NOT NULL,
+        transaction_ref TEXT NOT NULL, screenshot_data TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+        submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ,
+        reviewed_by BIGINT, review_note TEXT, activated_pass_id BIGINT, UNIQUE(transaction_ref))""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_payment_requests_status_idx ON bpsc_payment_requests(status, submitted_at DESC)")
+
+async def membership_page(request):
+    page = ROOT / "static" / "membership.html"
+    if not page.is_file(): raise web.HTTPNotFound()
+    return web.FileResponse(page)
+
+async def payment_options(request):
+    uid=request["telegram_user"]["id"]
+    async with request.app["pool"].connection() as conn:
+        cur=await conn.execute("SELECT id,product_name,duration_days,amount_inr,transaction_ref,status,submitted_at,reviewed_at FROM bpsc_payment_requests WHERE telegram_id=%s ORDER BY submitted_at DESC LIMIT 20",(uid,))
+        history=await cur.fetchall()
+    return json_response({"prices":[{"days":d,"price":p} for d,p in ALL_ACCESS_PRICES.items()],"history":[dict(r) for r in history]})
+
+async def submit_payment(request):
+    user=request["telegram_user"]
+    try: body=await request.json()
+    except Exception: return json_response({"error":"Invalid submission."},400)
+    try:
+        days=int(body.get("duration_days")); amount=ALL_ACCESS_PRICES[days]
+        ref=str(body.get("transaction_ref") or "").strip().upper()
+        screenshot=str(body.get("screenshot_data") or "")
+    except Exception: return json_response({"error":"Choose a valid membership duration."},400)
+    if not re.fullmatch(r"[A-Z0-9-]{6,40}",ref): return json_response({"error":"Enter a valid UPI transaction/reference ID (6–40 letters, digits or hyphens)."},400)
+    if not screenshot.startswith("data:image/") or len(screenshot)>900000: return json_response({"error":"Upload a clear payment screenshot under 650 KB."},400)
+    async with request.app["pool"].connection() as conn:
+        await payment_schema(conn)
+        cur=await conn.execute("SELECT status FROM bpsc_payment_requests WHERE transaction_ref=%s",(ref,))
+        old=await cur.fetchone()
+        if old: return json_response({"error":"This transaction/reference ID has already been submitted."},409)
+        cur=await conn.execute("INSERT INTO bpsc_payment_requests(telegram_id,product_code,product_name,duration_days,amount_inr,transaction_ref,screenshot_data) VALUES(%s,'all_access',%s,%s,%s,%s,%s) RETURNING id,submitted_at",(user["id"],f"All Access · {days} days",days,amount,ref,screenshot))
+        r=await cur.fetchone()
+    return json_response({"request_id":int(r["id"]),"status":"pending","amount":amount,"submitted_at":r["submitted_at"].isoformat()},201)
+
 async def index(request):
     # Resolve frontend relative to this file, not the process working directory.
     page = ROOT / "static" / "index.html"
@@ -669,6 +714,7 @@ async def startup(app):
     await pool.open(); await pool.wait()
     await qb.ensure_schema(pool)
     async with pool.connection() as conn:
+        await payment_schema(conn)
         await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_user_preferences (
             telegram_id BIGINT NOT NULL, preference_key TEXT NOT NULL, preference_value TEXT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (telegram_id, preference_key))""")
@@ -707,6 +753,9 @@ async def cleanup(app):
 def make_app():
     app = web.Application(middlewares=[telegram_auth], client_max_size=1024 * 1024)
     app.router.add_get("/", index)
+    app.router.add_get("/membership", membership_page)
+    app.router.add_get("/api/payments", payment_options)
+    app.router.add_post("/api/payments", submit_payment)
     app.router.add_get("/static/{filename}", static_asset)
     app.router.add_get("/healthz", health)
     app.router.add_get("/api/tasks", list_tasks)
