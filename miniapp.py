@@ -136,7 +136,7 @@ async def _result_payload(conn, attempt_id: int, telegram_id: int):
         else:
             agg["incorrect"] += 1
     subject_breakdown = sorted(by_subject.values(), key=lambda x: (-x["total"], x["subject"]))
-    return {"submitted": True, "attempt_id": int(attempt["id"]), "title": attempt["title"], "subject": attempt["subject"],
+    return {"submitted": True, "attempt_id": int(attempt["id"]), "quiz_id": int(attempt["quiz_id"]), "title": attempt["title"], "subject": attempt["subject"],
             "mode": attempt["mode"], "mode_label": mode_label, "total_questions": int(attempt["total_questions"]), "correct": int(attempt["correct_count"] or 0),
             "incorrect": int(attempt["incorrect_count"] or 0), "skipped": int(attempt["skipped_count"] or 0), "score": float(attempt["score"] or 0),
             "max_score": float(attempt["total_questions"]) * float(attempt["positive_marks"]),
@@ -171,6 +171,184 @@ async def save_theme_preference(request):
             VALUES(%s, 'theme', %s, NOW())
             ON CONFLICT(telegram_id, preference_key) DO UPDATE SET preference_value=EXCLUDED.preference_value, updated_at=NOW()""", (user_id, theme))
     return json_response({"saved": True, "theme": theme})
+
+# Personal study planner: additive tables, isolated by authenticated Telegram user.
+async def list_tasks(request):
+    user_id = request["telegram_user"]["id"]
+    async with request.app["pool"].connection() as conn:
+        cur = await conn.execute("""SELECT id,title,task_type,quiz_id,due_date,is_completed,created_at,completed_at
+            FROM bpsc_nexus_tasks WHERE telegram_id=%s ORDER BY is_completed ASC, due_date ASC NULLS LAST, created_at DESC LIMIT 200""", (user_id,))
+        rows = await cur.fetchall()
+    return json_response({"tasks": [{"id": int(r["id"]), "title": r["title"], "task_type": r["task_type"], "quiz_id": int(r["quiz_id"]) if r["quiz_id"] else None,
+        "due_date": r["due_date"].isoformat() if r["due_date"] else None, "is_completed": bool(r["is_completed"]),
+        "created_at": r["created_at"].isoformat() if r["created_at"] else None, "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None} for r in rows]})
+
+async def create_task(request):
+    user_id = request["telegram_user"]["id"]
+    try:
+        body = await request.json(); title = str(body.get("title", "")).strip()[:180]
+        task_type = "quiz" if body.get("quiz_id") else "custom"
+        quiz_id = int(body["quiz_id"]) if body.get("quiz_id") else None
+        due_date = str(body.get("due_date") or "").strip() or None
+        if not title: return json_response({"error": "Enter a task name."}, 400)
+        if due_date:
+            datetime.strptime(due_date, "%Y-%m-%d")
+    except (ValueError, TypeError, KeyError):
+        return json_response({"error": "Invalid task details or due date."}, 400)
+    async with request.app["pool"].connection() as conn:
+        if quiz_id:
+            cur = await conn.execute("SELECT 1 FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)", (quiz_id, user_id))
+            if not await cur.fetchone(): return json_response({"error": "That quiz is unavailable to this account."}, 404)
+        cur = await conn.execute("""INSERT INTO bpsc_nexus_tasks(telegram_id,title,task_type,quiz_id,due_date)
+            VALUES(%s,%s,%s,%s,%s) RETURNING id,title,task_type,quiz_id,due_date,is_completed,created_at,completed_at""", (user_id,title,task_type,quiz_id,due_date))
+        r = await cur.fetchone()
+    return json_response({"task": {"id": int(r["id"]), "title": r["title"], "task_type": r["task_type"], "quiz_id": int(r["quiz_id"]) if r["quiz_id"] else None, "due_date": r["due_date"].isoformat() if r["due_date"] else None, "is_completed": False, "created_at": r["created_at"].isoformat() if r["created_at"] else None}}, 201)
+
+async def update_task(request):
+    user_id = request["telegram_user"]["id"]
+    try: task_id = int(request.match_info["task_id"]); body = await request.json()
+    except Exception: return json_response({"error": "Invalid task request."}, 400)
+    fields=[]; params=[]
+    if "is_completed" in body:
+        completed = bool(body["is_completed"]); fields.append("is_completed=%s"); params.append(completed); fields.append("completed_at=CASE WHEN %s THEN NOW() ELSE NULL END"); params.append(completed)
+    if "title" in body:
+        title=str(body.get("title") or "").strip()[:180]
+        if not title: return json_response({"error":"Task title cannot be empty."},400)
+        fields.append("title=%s");params.append(title)
+    if "due_date" in body:
+        due=str(body.get("due_date") or "").strip() or None
+        try:
+            if due: datetime.strptime(due,"%Y-%m-%d")
+        except ValueError: return json_response({"error":"Invalid due date."},400)
+        fields.append("due_date=%s");params.append(due)
+    if not fields: return json_response({"error":"No supported task changes supplied."},400)
+    params.extend([task_id,user_id])
+    async with request.app["pool"].connection() as conn:
+        cur=await conn.execute("UPDATE bpsc_nexus_tasks SET "+", ".join(fields)+" WHERE id=%s AND telegram_id=%s RETURNING id",params)
+        if not await cur.fetchone(): return json_response({"error":"Task not found."},404)
+    return json_response({"saved":True})
+
+async def delete_task(request):
+    user_id=request["telegram_user"]["id"]
+    try: task_id=int(request.match_info["task_id"])
+    except ValueError: return json_response({"error":"Invalid task."},400)
+    async with request.app["pool"].connection() as conn:
+        cur=await conn.execute("DELETE FROM bpsc_nexus_tasks WHERE id=%s AND telegram_id=%s RETURNING id",(task_id,user_id))
+        if not await cur.fetchone(): return json_response({"error":"Task not found."},404)
+    return json_response({"deleted":True})
+
+# Arena foundation: invite-based/matchmaking 1v1 rooms, server-selected questions and server-side scoring.
+def _arena_code():
+    import secrets, string
+    return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+
+async def arena_list(request):
+    uid=request["telegram_user"]["id"]
+    async with request.app["pool"].connection() as conn:
+        cur=await conn.execute("""SELECT m.id,m.invite_code,m.status,m.created_at,m.question_count,p.score,p.rating_delta,
+            (SELECT COUNT(*) FROM bpsc_nexus_arena_players pp WHERE pp.match_id=m.id) AS players
+            FROM bpsc_nexus_arena_matches m JOIN bpsc_nexus_arena_players p ON p.match_id=m.id AND p.telegram_id=%s
+            ORDER BY m.created_at DESC LIMIT 20""",(uid,))
+        rows=await cur.fetchall()
+        cur=await conn.execute("SELECT rating,wins,losses,draws FROM bpsc_nexus_arena_ratings WHERE telegram_id=%s",(uid,)); rating=await cur.fetchone()
+    return json_response({"matches":[{"id":int(r["id"]),"invite_code":r["invite_code"],"status":r["status"],"created_at":r["created_at"].isoformat(),"question_count":int(r["question_count"]),"score":int(r["score"] or 0),"players":int(r["players"])} for r in rows],"rating":int(rating["rating"]) if rating else 1000,"wins":int(rating["wins"]) if rating else 0,"losses":int(rating["losses"]) if rating else 0,"draws":int(rating["draws"]) if rating else 0})
+
+async def arena_create(request):
+    uid=request["telegram_user"]["id"]
+    try: body=await request.json(); mode=str(body.get("mode","invite")); mode=mode if mode in {"invite","matchmaking"} else "invite"
+    except Exception: mode="invite"
+    async with request.app["pool"].connection() as conn:
+        # Matchmaking joins the oldest open queue room, if one exists.
+        if mode=="matchmaking":
+            cur=await conn.execute("""SELECT m.id FROM bpsc_nexus_arena_matches m JOIN bpsc_nexus_arena_players p ON p.match_id=m.id
+                WHERE m.status='waiting' AND m.match_type='matchmaking' AND p.telegram_id<>%s ORDER BY m.created_at FOR UPDATE OF m SKIP LOCKED LIMIT 1""",(uid,))
+            open_match=await cur.fetchone()
+            if open_match:
+                match_id=int(open_match["id"])
+                await conn.execute("INSERT INTO bpsc_nexus_arena_players(match_id,telegram_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",(match_id,uid))
+                await conn.execute("UPDATE bpsc_nexus_arena_matches SET status='active',started_at=NOW() WHERE id=%s AND status='waiting'",(match_id,))
+                return json_response({"match_id":match_id,"status":"active","joined":True})
+        cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' ORDER BY RANDOM() LIMIT 10")
+        qs=await cur.fetchall()
+        if len(qs)<5: return json_response({"error":"The question bank needs at least five verified questions before Arena can start."},503)
+        code=_arena_code()
+        cur=await conn.execute("""INSERT INTO bpsc_nexus_arena_matches(invite_code,match_type,status,question_count,created_by_telegram_id)
+            VALUES(%s,%s,'waiting',%s,%s) RETURNING id""",(code,mode,len(qs),uid))
+        match_id=int((await cur.fetchone())["id"])
+        await conn.execute("INSERT INTO bpsc_nexus_arena_players(match_id,telegram_id) VALUES(%s,%s)",(match_id,uid))
+        for pos,q in enumerate(qs,1):
+            await conn.execute("INSERT INTO bpsc_nexus_arena_questions(match_id,position,question_id) VALUES(%s,%s,%s)",(match_id,pos,int(q["id"])))
+    return json_response({"match_id":match_id,"invite_code":code,"status":"waiting","joined":False},201)
+
+async def arena_join(request):
+    uid=request["telegram_user"]["id"]
+    try: body=await request.json(); code=str(body.get("invite_code","")).strip().upper()
+    except Exception: return json_response({"error":"Invalid invite code."},400)
+    if not code: return json_response({"error":"Enter an invite code."},400)
+    async with request.app["pool"].connection() as conn:
+        cur=await conn.execute("SELECT id,status FROM bpsc_nexus_arena_matches WHERE invite_code=%s FOR UPDATE",(code,)); m=await cur.fetchone()
+        if not m: return json_response({"error":"No arena room found for that code."},404)
+        if m["status"]!="waiting": return json_response({"error":"This room has already started or finished."},409)
+        cur=await conn.execute("SELECT 1 FROM bpsc_nexus_arena_players WHERE match_id=%s AND telegram_id=%s",(m["id"],uid))
+        if await cur.fetchone(): return json_response({"error":"You are already in this room."},409)
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_arena_players WHERE match_id=%s",(m["id"],)); n=int((await cur.fetchone())["n"])
+        if n>=2: return json_response({"error":"This room is full."},409)
+        await conn.execute("INSERT INTO bpsc_nexus_arena_players(match_id,telegram_id) VALUES(%s,%s)",(m["id"],uid))
+        await conn.execute("UPDATE bpsc_nexus_arena_matches SET status='active',started_at=NOW() WHERE id=%s",(m["id"],))
+    return json_response({"match_id":int(m["id"]),"status":"active","joined":True})
+
+async def arena_match(request):
+    uid=request["telegram_user"]["id"]
+    try: mid=int(request.match_info["match_id"])
+    except ValueError: return json_response({"error":"Invalid match."},400)
+    async with request.app["pool"].connection() as conn:
+        cur=await conn.execute("SELECT m.id,m.invite_code,m.status,m.question_count,m.started_at FROM bpsc_nexus_arena_matches m JOIN bpsc_nexus_arena_players p ON p.match_id=m.id AND p.telegram_id=%s WHERE m.id=%s",(uid,mid)); m=await cur.fetchone()
+        if not m:return json_response({"error":"Arena match not found."},404)
+        cur=await conn.execute("SELECT telegram_id,score,finished_at FROM bpsc_nexus_arena_players WHERE match_id=%s ORDER BY joined_at",(mid,)); players=await cur.fetchall()
+        cur=await conn.execute("""SELECT q.position,q.question_id,b.subject,b.question_en,b.question_hi,b.options,a.selected_option
+            FROM bpsc_nexus_arena_questions q JOIN question_bank b ON b.id=q.question_id
+            LEFT JOIN bpsc_nexus_arena_answers a ON a.match_id=q.match_id AND a.position=q.position AND a.telegram_id=%s
+            WHERE q.match_id=%s ORDER BY q.position""",(uid,mid)); qs=await cur.fetchall()
+        cur=await conn.execute("SELECT position,selected_option FROM bpsc_nexus_arena_answers WHERE match_id=%s AND telegram_id=%s",(mid,uid)); answered={int(r["position"]):r["selected_option"] for r in await cur.fetchall()}
+    return json_response({"id":int(m["id"]),"invite_code":m["invite_code"],"status":m["status"],"question_count":int(m["question_count"]),"started_at":m["started_at"].isoformat() if m["started_at"] else None,"players":[{"is_you":int(p["telegram_id"])==uid,"score":int(p["score"] or 0),"finished":bool(p["finished_at"])} for p in players],"questions":[{"position":int(q["position"]),"id":int(q["question_id"]),"subject":q["subject"],"question_en":q["question_en"],"question_hi":q["question_hi"],"options":q["options"] if isinstance(q["options"],dict) else json.loads(q["options"] or "{}"),"selected_option":answered.get(int(q["position"]))} for q in qs]})
+
+async def arena_answer(request):
+    uid=request["telegram_user"]["id"]
+    try: mid=int(request.match_info["match_id"]); body=await request.json(); pos=int(body.get("position")); selected=str(body.get("selected_option",""));
+    except Exception:return json_response({"error":"Invalid answer."},400)
+    if selected not in {"A","B","C","D","E"}: return json_response({"error":"Choose a valid option."},400)
+    pool=request.app["pool"]
+    async with pool.connection() as conn:
+        cur=await conn.execute("SELECT status,question_count,started_at FROM bpsc_nexus_arena_matches WHERE id=%s FOR UPDATE",(mid,)); m=await cur.fetchone()
+        if not m:return json_response({"error":"Match not found."},404)
+        if m["status"]!="active":return json_response({"error":"This match is not active."},409)
+        if m["started_at"] and (datetime.now(timezone.utc)-m["started_at"].astimezone(timezone.utc)).total_seconds()>900:
+            await conn.execute("UPDATE bpsc_nexus_arena_matches SET status='finished',finished_at=NOW() WHERE id=%s",(mid,))
+            return json_response({"error":"Match expired. Start a new battle."},409)
+        cur=await conn.execute("SELECT 1 FROM bpsc_nexus_arena_players WHERE match_id=%s AND telegram_id=%s",(mid,uid))
+        if not await cur.fetchone():return json_response({"error":"You are not a participant in this match."},403)
+        cur=await conn.execute("SELECT q.question_id,b.correct_option FROM bpsc_nexus_arena_questions q JOIN question_bank b ON b.id=q.question_id WHERE q.match_id=%s AND q.position=%s",(mid,pos)); q=await cur.fetchone()
+        if not q:return json_response({"error":"Question not found."},404)
+        cur=await conn.execute("SELECT 1 FROM bpsc_nexus_arena_answers WHERE match_id=%s AND telegram_id=%s AND position=%s",(mid,uid,pos))
+        if await cur.fetchone():return json_response({"error":"This answer has already been recorded."},409)
+        correct=(selected==q["correct_option"])
+        await conn.execute("INSERT INTO bpsc_nexus_arena_answers(match_id,telegram_id,position,selected_option,is_correct) VALUES(%s,%s,%s,%s,%s)",(mid,uid,pos,selected,correct))
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_arena_answers WHERE match_id=%s AND telegram_id=%s AND is_correct=TRUE",(mid,uid)); score=int((await cur.fetchone())["n"])
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_arena_answers WHERE match_id=%s AND telegram_id=%s",(mid,uid)); done=int((await cur.fetchone())["n"])
+        await conn.execute("UPDATE bpsc_nexus_arena_players SET score=%s,finished_at=CASE WHEN %s>=(SELECT question_count FROM bpsc_nexus_arena_matches WHERE id=%s) THEN NOW() ELSE finished_at END WHERE match_id=%s AND telegram_id=%s",(score,done,mid,mid,uid))
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_arena_players WHERE match_id=%s AND finished_at IS NOT NULL",(mid,)); finished=int((await cur.fetchone())["n"])
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_arena_players WHERE match_id=%s",(mid,)); players=int((await cur.fetchone())["n"])
+        if players==2 and finished==2:
+            await conn.execute("UPDATE bpsc_nexus_arena_matches SET status='finished',finished_at=NOW() WHERE id=%s",(mid,))
+            cur=await conn.execute("SELECT telegram_id,score FROM bpsc_nexus_arena_players WHERE match_id=%s",(mid,)); standings=await cur.fetchall()
+            if len(standings)==2:
+                for row in standings:
+                    outcome="draws" if standings[0]["score"]==standings[1]["score"] else ("wins" if row["score"]==max(x["score"] for x in standings) else "losses")
+                    delta=0 if outcome=="draws" else (25 if outcome=="wins" else -25)
+                    await conn.execute("""INSERT INTO bpsc_nexus_arena_ratings(telegram_id,rating,wins,losses,draws) VALUES(%s,%s,%s,%s,%s)
+                        ON CONFLICT(telegram_id) DO UPDATE SET rating=GREATEST(100, bpsc_nexus_arena_ratings.rating+%s), wins=bpsc_nexus_arena_ratings.wins+%s, losses=bpsc_nexus_arena_ratings.losses+%s, draws=bpsc_nexus_arena_ratings.draws+%s""",(row["telegram_id"],1000+delta,1 if outcome=="wins" else 0,1 if outcome=="losses" else 0,1 if outcome=="draws" else 0,delta,1 if outcome=="wins" else 0,1 if outcome=="losses" else 0,1 if outcome=="draws" else 0))
+    return json_response({"saved":True,"score":score,"answered":done,"finished":done>=int(m["question_count"])})
+
 
 async def index(request):
     # Resolve frontend relative to this file, not the process working directory.
@@ -362,7 +540,7 @@ async def start_attempt(request):
             SELECT %s,qq.position,qb.id,qb.subject,qb.question_en,qb.question_hi,qb.options,qb.correct_option, qb.explanation_en,qb.explanation_hi
             FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
             WHERE qq.quiz_id=%s AND qb.status='ready' ORDER BY qq.position""", (attempt["id"], quiz_id))
-    return json_response({"attempt_id": int(attempt["id"]), "started_at": attempt["started_at"].isoformat(), "duration_minutes": int(quiz["duration_minutes"]), "question_time_seconds": int(quiz["question_time_seconds"] or 0), "shuffle_options": bool(quiz["shuffle_options"]), "mode": mode, "mode_label": requested_mode})
+    return json_response({"attempt_id": int(attempt["id"]), "quiz_id": int(quiz_id), "started_at": attempt["started_at"].isoformat(), "duration_minutes": int(quiz["duration_minutes"]), "question_time_seconds": int(quiz["question_time_seconds"] or 0), "shuffle_options": bool(quiz["shuffle_options"]), "mode": mode, "mode_label": requested_mode})
 
 
 async def get_attempt(request):
@@ -399,7 +577,7 @@ async def get_attempt(request):
                                  "explanation_en": r["explanation_en"], "explanation_hi": r["explanation_hi"]}
         questions.append(item)
     settings = attempt["quiz_settings"] if isinstance(attempt["quiz_settings"], dict) else json.loads(attempt["quiz_settings"] or "{}")
-    return json_response({"submitted": False, "attempt_id": attempt_id, "title": attempt["title"], "subject": attempt["subject"], "mode": attempt["mode"], "mode_label": settings.get("mode_label", attempt["mode"]),
+    return json_response({"submitted": False, "attempt_id": attempt_id, "quiz_id": int(attempt["quiz_id"]), "title": attempt["title"], "subject": attempt["subject"], "mode": attempt["mode"], "mode_label": settings.get("mode_label", attempt["mode"]),
                           "duration_minutes": int(attempt["duration_minutes"]), "question_time_seconds": int(attempt["question_time_seconds"] or 0), "shuffle_options": bool(attempt["shuffle_options"]), "started_at": attempt["started_at"].isoformat(), "deadline": datetime.fromtimestamp(deadline, timezone.utc).isoformat(),
                           "positive_marks": float(attempt["positive_marks"]), "negative_marks": float(attempt["negative_marks"]), "questions": questions})
 
@@ -490,12 +668,30 @@ async def startup(app):
     await qb.ensure_schema(pool)
     async with pool.connection() as conn:
         await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_user_preferences (
-            telegram_id BIGINT NOT NULL,
-            preference_key TEXT NOT NULL,
-            preference_value TEXT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (telegram_id, preference_key)
-        )""")
+            telegram_id BIGINT NOT NULL, preference_key TEXT NOT NULL, preference_value TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (telegram_id, preference_key))""")
+        await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_tasks (
+            id BIGSERIAL PRIMARY KEY, telegram_id BIGINT NOT NULL, title VARCHAR(180) NOT NULL,
+            task_type VARCHAR(12) NOT NULL DEFAULT 'custom', quiz_id BIGINT NULL, due_date DATE NULL,
+            is_completed BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ NULL)""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_nexus_tasks_user_idx ON bpsc_nexus_tasks(telegram_id,is_completed,due_date)")
+        await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_arena_matches (
+            id BIGSERIAL PRIMARY KEY, invite_code VARCHAR(8) UNIQUE NOT NULL, match_type VARCHAR(20) NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'waiting', question_count INTEGER NOT NULL DEFAULT 10,
+            created_by_telegram_id BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), started_at TIMESTAMPTZ NULL, finished_at TIMESTAMPTZ NULL)""")
+        await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_arena_players (
+            match_id BIGINT NOT NULL REFERENCES bpsc_nexus_arena_matches(id) ON DELETE CASCADE, telegram_id BIGINT NOT NULL,
+            score INTEGER NOT NULL DEFAULT 0, joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), finished_at TIMESTAMPTZ NULL,
+            PRIMARY KEY(match_id,telegram_id))""")
+        await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_arena_questions (
+            match_id BIGINT NOT NULL REFERENCES bpsc_nexus_arena_matches(id) ON DELETE CASCADE, position INTEGER NOT NULL,
+            question_id BIGINT NOT NULL, PRIMARY KEY(match_id,position))""")
+        await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_arena_answers (
+            match_id BIGINT NOT NULL, telegram_id BIGINT NOT NULL, position INTEGER NOT NULL, selected_option VARCHAR(1) NOT NULL,
+            is_correct BOOLEAN NOT NULL, answered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(match_id,telegram_id,position))""")
+        await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_arena_ratings (
+            telegram_id BIGINT PRIMARY KEY, rating INTEGER NOT NULL DEFAULT 1000, wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0, draws INTEGER NOT NULL DEFAULT 0)""")
     app["pool"] = pool
     log.info("Mini App API connected; question bank schema and user preferences verified.")
 
@@ -511,6 +707,15 @@ def make_app():
     app.router.add_get("/", index)
     app.router.add_get("/static/{filename}", static_asset)
     app.router.add_get("/healthz", health)
+    app.router.add_get("/api/tasks", list_tasks)
+    app.router.add_post("/api/tasks", create_task)
+    app.router.add_patch("/api/tasks/{task_id}", update_task)
+    app.router.add_delete("/api/tasks/{task_id}", delete_task)
+    app.router.add_get("/api/arena", arena_list)
+    app.router.add_post("/api/arena/matches", arena_create)
+    app.router.add_post("/api/arena/join", arena_join)
+    app.router.add_get("/api/arena/matches/{match_id}", arena_match)
+    app.router.add_post("/api/arena/matches/{match_id}/answers", arena_answer)
     app.router.add_get("/api/preferences/theme", get_theme_preference)
     app.router.add_put("/api/preferences/theme", save_theme_preference)
     app.router.add_get("/api/quizzes", list_quizzes)

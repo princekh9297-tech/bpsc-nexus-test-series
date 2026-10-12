@@ -1,21 +1,32 @@
-# BPSC Nexus Premium Mini App redesign
+# BPSC Nexus Mini App — Premium Redesign + Planner + Arena MVP
+
+This package preserves the existing bot, group quiz engine, question bank module, quiz APIs and shared PostgreSQL setup. The `bot.py`, `group_quiz.py`, and `question_bank.py` files are carried forward unchanged from the latest supplied project; the main changes are in `miniapp.py` and `static/index.html`.
 
 ## Included
-- Branded splash: “Made with Pure 💗” / “BpscNexus × P r I n C e” with a short, skippable fade-in.
-- Four themes: Midnight Elite (`graphite`), Emerald Royale (`emerald`), Cosmic Amethyst (`amethyst`), Ivory Prestige (`ivory`).
-- Theme persistence per verified Telegram user through the authenticated Mini App API; localStorage is used as a fallback.
-- A small additive PostgreSQL preference table is created idempotently on Mini App startup. Existing tables are not dropped or reset.
-- Previous CBT routes and UI are retained; PDF-to-quiz is not included.
 
-## Deploy
-1. Replace the matching files in the existing repository, especially `static/index.html` and `miniapp.py`.
-2. Keep the current Render environment variables, including `BOT_TOKEN` and `DATABASE_URL`.
-3. Deploy the Mini App service first, then test `/healthz`, open the app from Telegram, switch themes, close/reopen the app and confirm the theme persists.
-4. Test a practice attempt and an exam attempt before public release.
+- Branded splash screen with the requested “Made with Pure 💗” and “BpscNexus × P r I n C e” identity. It stays for about 3.5 seconds on a fresh webview session, can be skipped, and does not replay during the same session.
+- Four themes: Midnight Elite, Emerald Royale, Cosmic Amethyst, and Ivory Prestige. Theme preferences sync to the authenticated Telegram user in PostgreSQL, with local fallback.
+- Personal Study Planner: custom tasks, optional due dates, completion checkboxes, overdue indicators, filters (all/today/upcoming/completed), delete action, and links from quiz cards via “Add to My Tasks”. Submitting a linked quiz automatically completes its linked task.
+- Battle Arena MVP: 1v1 invite rooms, 6-character invite codes, matchmaking queue, server-selected question set, one-time answer submission, server-side scoring, result view and basic rating/win/loss/draw counters.
+- Existing Test Series, quiz builder, practice/exam flows, result analysis, and theme/profile panels remain in place.
+- Additive database tables are created with `CREATE TABLE IF NOT EXISTS`; no existing tables are dropped or reset.
 
-## Validation performed
-- Python compilation for bot.py, miniapp.py, group_quiz.py, question_bank.py.
-- JavaScript syntax check and HTML ID reference checks.
-- ZIP integrity check.
+## Deployment
 
-Live Telegram/PostgreSQL integration and real-device performance testing still need to be performed in the deployed environment.
+1. Back up the current deployment repository and database as a precaution.
+2. Replace the Mini App service's `miniapp.py` with this package's `miniapp.py`.
+3. Replace `static/index.html` with this package's `static/index.html` (the `static/` directory must sit beside `miniapp.py`).
+4. Keep `BOT_TOKEN`, `DATABASE_URL`, the current Render start command, and the shared database configuration unchanged.
+5. Deploy the Mini App service. On startup, the service applies only additive `CREATE TABLE IF NOT EXISTS` statements.
+6. Open the Mini App from the Telegram bot and test theme persistence, adding/completing/deleting planner tasks, adding a quiz to tasks, submitting that quiz, creating an invite duel, joining with a second Telegram account, and completing a match.
+
+## Arena MVP limitations — read before announcing it as a finished competitive system
+
+- Matchmaking is queue-based and the initial MVP refreshes match state when the user reopens/refreshes a room; it is not yet a WebSocket-based live arena with synchronized countdowns or live opponent progress.
+- The first release implements 1v1 only. Squad battles, tournaments, seasonal ranks, anti-abuse monitoring, sophisticated Elo-style ratings, and push notifications are not included in this package.
+- The backend validates participation and records each answer once, and it calculates scores server-side. Before high-stakes competitive launches, add automated integration tests, rate limits, room expiry/abandonment rules, server-authoritative per-question deadlines, reconnect testing, and independent security review.
+- No live Telegram, PostgreSQL, or Render integration test was possible in this packaging pass. Python/JavaScript syntax and package integrity checks should be completed before deployment; still perform the listed live checks in staging.
+
+## Data safety
+
+All new planner and arena records are keyed to authenticated Telegram user IDs. The existing quiz bank, attempts, bot data, and shared database tables are not dropped. Take a database backup before any deployment, as you should for every production release.
