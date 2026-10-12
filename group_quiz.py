@@ -36,6 +36,8 @@ DDL = [
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS announcement_sent BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS report_sent BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS summary_sent BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS answer_key_sent BOOLEAN NOT NULL DEFAULT FALSE",
 
     "CREATE INDEX IF NOT EXISTS idx_group_quiz_sessions_due ON group_quiz_sessions(status,next_at) WHERE status='active'",
     """CREATE TABLE IF NOT EXISTS group_quiz_session_questions (
@@ -228,8 +230,8 @@ async def group_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not await _require_group_membership(message, pool, chat):
         return
     async with pool.connection() as conn:
-        cur = await conn.execute("""SELECT id,quiz_title,questions_count,current_index,mode,interval_seconds,next_at,started_by
-            FROM group_quiz_sessions WHERE chat_id=%s AND status='active' ORDER BY id DESC LIMIT 1""", (chat.id,))
+        cur = await conn.execute("""SELECT id,quiz_title,questions_count,current_index,mode,interval_seconds,next_at,started_by,status
+            FROM group_quiz_sessions WHERE chat_id=%s AND status IN ('active','paused') ORDER BY id DESC LIMIT 1""", (chat.id,))
         row = await cur.fetchone()
     if not row:
         await message.reply_text("ℹ️ There is no active or scheduled group quiz right now. A group admin can start one with /groupquiz.")
@@ -237,6 +239,7 @@ async def group_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
     starts = row["next_at"].strftime("%Y-%m-%d %H:%M UTC") if row["next_at"] else "soon"
     await message.reply_text(
         f"🧩 Group Quiz Status · #{row['id']}\n\n{row['quiz_title']}\n"
+        f"Status: {'Paused' if row.get('status') == 'paused' else 'Active'}\n"
         f"Mode: {row['mode'].title()}\nQuestions: {row['questions_count']}\n"
         f"Progress: {min(int(row['current_index']) + 1, int(row['questions_count']))}/{row['questions_count']}\n"
         f"Voting window: {row['interval_seconds']} seconds\nNext activity: {starts}"
@@ -244,13 +247,13 @@ async def group_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def group_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel this group's active/scheduled quiz; only Telegram admins/owner may do so."""
+    """Stop an active group quiz early and finalize it as completed, with analysis."""
     chat = update.effective_chat; user = update.effective_user; message = update.effective_message
     pool = context.application.bot_data.get("db_pool")
     if not chat or not user or not message or pool is None:
         return
     if chat.type == ChatType.PRIVATE:
-        await message.reply_text("Run /groupstop inside the group whose quiz you want to stop.")
+        await message.reply_text("Run /stopquiz inside the group whose quiz you want to stop.")
         return
     if not await _require_group_membership(message, pool, chat):
         return
@@ -258,23 +261,88 @@ async def group_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text("Only this group's administrators or owner can stop its quiz.")
         return
     async with pool.connection() as conn:
-        cur = await conn.execute("""SELECT s.id,q.poll_id,q.message_id FROM group_quiz_sessions s
+        cur = await conn.execute("""SELECT s.*,q.poll_id,q.message_id
+            FROM group_quiz_sessions s
             LEFT JOIN group_quiz_session_questions q ON q.session_id=s.id AND q.position=s.current_index
             WHERE s.chat_id=%s AND s.status='active' ORDER BY s.id DESC LIMIT 1""", (chat.id,))
         row = await cur.fetchone()
         if row:
-            await conn.execute("UPDATE group_quiz_sessions SET status='cancelled',completed_at=NOW() WHERE id=%s AND status='active'", (row["id"],))
-            if row["poll_id"]:
-                await conn.execute("UPDATE group_quiz_session_questions SET status='closed',updated_at=NOW() WHERE session_id=%s AND position=(SELECT current_index FROM group_quiz_sessions WHERE id=%s)", (row["id"], row["id"]))
+            if row.get("poll_id"):
+                await conn.execute("UPDATE group_quiz_session_questions SET status='closed',updated_at=NOW() WHERE session_id=%s AND position=%s", (row["id"], row["current_index"]))
+            # Leave the session active until _finish_session atomically marks it completed.
+            # Moving the cursor to the end prevents the scheduler from publishing another question.
+            await conn.execute("UPDATE group_quiz_sessions SET current_index=questions_count,next_at=NOW() WHERE id=%s AND status='active'", (row["id"],))
     if not row:
-        await message.reply_text("There is no active or scheduled quiz to stop.")
+        await message.reply_text("There is no active quiz to stop.")
         return
-    if row["message_id"]:
+    if row.get("message_id"):
         try:
             await context.bot.stop_poll(chat_id=chat.id, message_id=int(row["message_id"]))
         except Exception:
-            log.info("Poll for cancelled session %s was already closed or unavailable", row["id"])
-    await message.reply_text(f"🛑 Group quiz #{row['id']} has been cancelled by an administrator.")
+            log.info("Poll for stopped session %s was already closed or unavailable", row["id"])
+    try:
+        await _finish_session(context.application, pool, row)
+    except Exception:
+        log.exception("Early stop finalization failed for session %s", row["id"])
+        await message.reply_text(f"⚠️ Quiz #{row['id']} has been stopped. Its final report is being retried; run /quizstatus in a moment.")
+        return
+    await message.reply_text(f"🏁 Quiz #{row['id']} stopped early and marked COMPLETED. The summary, leaderboard and detailed admin analysis are being finalized.")
+
+
+async def group_pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pause the active quiz; close the current question and resume from the next one."""
+    chat=update.effective_chat; user=update.effective_user; message=update.effective_message
+    pool=context.application.bot_data.get("db_pool")
+    if not chat or not user or not message or pool is None: return
+    if chat.type==ChatType.PRIVATE:
+        await message.reply_text("Run /pausequiz inside the group."); return
+    if not await _require_group_membership(message,pool,chat): return
+    if not await _is_chat_admin(context,chat.id,user.id):
+        await message.reply_text("Only this group's administrators or owner can pause its quiz."); return
+    async with pool.connection() as conn:
+        cur=await conn.execute("""SELECT s.id,s.current_index,q.message_id,q.status AS question_status
+            FROM group_quiz_sessions s LEFT JOIN group_quiz_session_questions q
+            ON q.session_id=s.id AND q.position=s.current_index
+            WHERE s.chat_id=%s AND s.status='active' ORDER BY s.id DESC LIMIT 1""",(chat.id,))
+        row=await cur.fetchone()
+        if row:
+            if row.get("message_id"):
+                await conn.execute("UPDATE group_quiz_session_questions SET status='closed',updated_at=NOW() WHERE session_id=%s AND position=%s AND status='open'",(row['id'],row['current_index']))
+            # A Telegram poll cannot be reopened. Resume from the next question to avoid reposting the same question.
+            next_index=int(row['current_index']) + (1 if row.get('question_status') in ('open','posting') else 0)
+            await conn.execute("UPDATE group_quiz_sessions SET status='paused',current_index=%s,next_at=NOW() WHERE id=%s AND status='active'",(next_index,row['id']))
+    if not row:
+        await message.reply_text("There is no active quiz to pause."); return
+    if row.get('message_id'):
+        try: await context.bot.stop_poll(chat_id=chat.id,message_id=int(row['message_id']))
+        except Exception: log.info("Poll already closed during pause for session %s",row['id'])
+    await message.reply_text(f"⏸️ Quiz #{row['id']} paused. The current question is closed; /resumequiz will continue from the next question.")
+
+
+async def group_resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resume a paused group quiz from its persisted next question."""
+    chat=update.effective_chat; user=update.effective_user; message=update.effective_message
+    pool=context.application.bot_data.get("db_pool")
+    if not chat or not user or not message or pool is None: return
+    if chat.type==ChatType.PRIVATE:
+        await message.reply_text("Run /resumequiz inside the group."); return
+    if not await _require_group_membership(message,pool,chat): return
+    if not await _is_chat_admin(context,chat.id,user.id):
+        await message.reply_text("Only this group's administrators or owner can resume its quiz."); return
+    async with pool.connection() as conn:
+        cur=await conn.execute("""UPDATE group_quiz_sessions SET status='active',next_at=NOW()
+            WHERE id=(SELECT id FROM group_quiz_sessions WHERE chat_id=%s AND status='paused' ORDER BY id DESC LIMIT 1)
+            AND status='paused' RETURNING id,current_index,questions_count""",(chat.id,))
+        row=await cur.fetchone()
+    if not row:
+        await message.reply_text("There is no paused quiz to resume."); return
+    if int(row['current_index'])>=int(row['questions_count']):
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT * FROM group_quiz_sessions WHERE id=%s",(row['id'],)); session=await cur.fetchone()
+        await _finish_session(context.application,pool,session)
+        await message.reply_text(f"🏁 Quiz #{row['id']} had reached the end and has been finalized.")
+        return
+    await message.reply_text(f"▶️ Quiz #{row['id']} resumed from question {int(row['current_index'])+1}/{row['questions_count']}.")
 
 
 async def group_quiz_schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -682,7 +750,9 @@ async def _post_question(application, pool, session, question):
 async def _finish_session(application, pool, session):
     sid=int(session["id"])
     async with pool.connection() as conn:
-        cur=await conn.execute("UPDATE group_quiz_sessions SET status='completed',completed_at=NOW() WHERE id=%s AND status='active' RETURNING questions_count,quiz_title,positive_marks,negative_marks,started_by,chat_id,started_at,mode",(sid,))
+        cur=await conn.execute("""UPDATE group_quiz_sessions SET status='completed',completed_at=COALESCE(completed_at,NOW())
+            WHERE id=%s AND (status='active' OR (status='completed' AND report_sent=FALSE))
+            RETURNING questions_count,quiz_title,positive_marks,negative_marks,started_by,chat_id,started_at,mode,summary_sent,answer_key_sent""",(sid,))
         finished=await cur.fetchone()
         if not finished: return
         positive=float(finished["positive_marks"] or 1); negative=float(finished["negative_marks"] or 0.333)
@@ -733,13 +803,19 @@ async def _finish_session(application, pool, session):
         c=int(row["correct"] or 0); w=int(row["incorrect"] or 0); attempted=int(row["attempted"] or 0); skipped=max(0,total-attempted); score=c*positive-w*negative; accuracy=(100*c/attempted) if attempted else 0
         lines.append(f"{rank}. {name} — {score:.2f} pts · {accuracy:.0f}% accuracy · {c}✓ {w}✗ {skipped} unanswered")
     lines += ["","Practice more with @BpscNexustestbot: https://t.me/BpscNexustestbot"]
-    # Group summary stays concise; answer key appears in the group only after the Exam Mode has fully submitted.
-    try: await application.bot.send_message(
-        chat_id=int(finished["chat_id"]), text="\n".join(lines)[:3900],
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Full Admin Analysis (admins only)",callback_data=f"gq:report:{sid}")]])
-    )
-    except Exception: log.exception("Could not publish group quiz summary for %s",sid)
-    if finished.get("mode")=="exam":
+    # Group summary stays concise; a persisted guard prevents duplicate announcements on retries.
+    if not finished.get("summary_sent",False):
+        try:
+            await application.bot.send_message(
+                chat_id=int(finished["chat_id"]), text="\n".join(lines)[:3900],
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Full Admin Analysis (admins only)",callback_data=f"gq:report:{sid}")]])
+            )
+            async with pool.connection() as conn:
+                await conn.execute("UPDATE group_quiz_sessions SET summary_sent=TRUE WHERE id=%s",(sid,))
+        except Exception:
+            log.exception("Could not publish group quiz summary for %s",sid)
+            raise
+    if finished.get("mode")=="exam" and not finished.get("answer_key_sent",False):
         key_lines=["📝 Exam answer key (quiz submitted)"]
         for row in answer_key:
             opts=row["options"] if isinstance(row["options"],dict) else json.loads(row["options"] or "{}")
@@ -754,7 +830,11 @@ async def _finish_session(application, pool, session):
         if buf: chunks.append(buf)
         for chunk in chunks:
             try: await application.bot.send_message(chat_id=int(finished["chat_id"]),text=chunk)
-            except Exception: log.exception("Could not post final exam answer key for %s",sid); break
+            except Exception:
+                log.exception("Could not post final exam answer key for %s",sid)
+                raise
+        async with pool.connection() as conn:
+            await conn.execute("UPDATE group_quiz_sessions SET answer_key_sent=TRUE WHERE id=%s",(sid,))
     admin_lines=[f"📊 FULL ADMIN REPORT · Group Quiz #{sid}",str(finished["quiz_title"]),f"Participants: {participants} · Questions: {total}",f"Correct: {correct} · Wrong: {wrong} · Unanswered: {unanswered}",f"Scoring: +{positive:g} / −{negative:g}",f"Elapsed: {elapsed//60}m {elapsed%60}s",f"Score average/median/high/low: {average_score:.2f}/{median_score:.2f}/{high_score:.2f}/{low_score:.2f}","","INDIVIDUAL PERFORMANCE"]
     for row in scores:
         name=(row["first_name"] or row["username"] or f"Student {row['telegram_id']}").replace("\n"," ")[:32]
@@ -791,7 +871,9 @@ async def _finish_session(application, pool, session):
     for chunk in chunks:
         try: await application.bot.send_message(chat_id=int(finished["started_by"]),text=chunk)
         except Exception:
-            log.info("Could not DM full admin report for session %s; group summary remains available",sid,exc_info=True); break
+            log.info("Could not DM full admin report for session %s; group report button remains available",sid,exc_info=True); break
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE group_quiz_sessions SET report_sent=TRUE WHERE id=%s",(sid,))
 
 
 async def scheduler(application, pool):
@@ -799,10 +881,13 @@ async def scheduler(application, pool):
     while True:
         try:
             async with pool.connection() as conn:
-                cur = await conn.execute("SELECT * FROM group_quiz_sessions WHERE status='active' AND next_at<=NOW() ORDER BY next_at,id LIMIT 10")
+                cur = await conn.execute("SELECT * FROM group_quiz_sessions WHERE (status='active' AND next_at<=NOW()) OR (status='completed' AND report_sent=FALSE) ORDER BY next_at,id LIMIT 10")
                 sessions = await cur.fetchall()
             for session in sessions:
                 sid = int(session["id"]); position = int(session["current_index"])
+                if session.get("status") == "completed":
+                    await _finish_session(application, pool, session)
+                    continue
                 if not await _group_is_authorized(pool, int(session["chat_id"])):
                     async with pool.connection() as conn:
                         await conn.execute("UPDATE group_quiz_sessions SET status='cancelled',completed_at=NOW() WHERE id=%s AND status='active'", (sid,))

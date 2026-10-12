@@ -231,11 +231,13 @@ async def post_init(application: Application) -> None:
         ], scope=BotCommandScopeAllPrivateChats())
         await application.bot.set_my_commands([
             BotCommand("start", "Show group quiz commands"),
-            BotCommand("groupquiz", "Create/start a group quiz (admins)"),
-            BotCommand("groupquiz_schedule", "Schedule a group quiz (admins)"),
-            BotCommand("grouprank", "Show group leaderboard"),
-            BotCommand("groupstatus", "Show current group quiz"),
-            BotCommand("groupstop", "Stop current group quiz (admins)"),
+            BotCommand("startquiz", "Create/start a group quiz (admins)"),
+            BotCommand("pausequiz", "Pause the current group quiz (admins)"),
+            BotCommand("resumequiz", "Resume a paused group quiz (admins)"),
+            BotCommand("stopquiz", "Stop and finalize quiz with results (admins)"),
+            BotCommand("schedulequiz", "Schedule a group quiz (admins)"),
+            BotCommand("leaderboard", "Show group leaderboard"),
+            BotCommand("quizstatus", "Show current group quiz status"),
             BotCommand("help", "Show group commands"),
         ], scope=BotCommandScopeAllGroupChats())
     except Exception:
@@ -382,9 +384,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_message:
             await update.effective_message.reply_text(
                 "🧩 BPSC Nexus Group Quiz\n\n"
-                "Group admins/owners can use /groupquiz to create a quiz, "
-                "/groupquiz_schedule to schedule one, /grouprank for the leaderboard, "
-                "/groupstatus to check the current session, and /groupstop to stop it.\n\n"
+                "Group admins/owners: /startquiz to create a quiz, /pausequiz to pause, "
+                "/resumequiz to continue, /stopquiz to complete early and publish results, "
+                "/schedulequiz to schedule, /leaderboard for rankings, and /quizstatus for status.\n\n"
                 "Use /help to see all group commands. Personal Mini App features open in private chat."
             )
         return
@@ -482,11 +484,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if message:
             await message.reply_text(
                 "🧩 BPSC Nexus — Group Commands\n\n"
-                "/groupquiz — create a quiz from published tests or verified question bank (group admins/owner)\n"
-                "/groupquiz_schedule <quiz_id> <YYYY-MM-DDTHH:MMZ> [15|30|60|120|300] [learning|exam] — schedule in UTC\n"
-                "/grouprank — cumulative leaderboard for this group\n"
-                "/groupstatus — active/scheduled quiz status\n"
-                "/groupstop — cancel the current group quiz (group admins/owner)\n"
+                "/startquiz — create a quiz and choose its fixed question range (admins/owner)\n"
+                "/pausequiz — pause the active quiz (current poll closes; resume continues at next question)\n"
+                "/resumequiz — resume a paused quiz\n"
+                "/stopquiz — stop early, mark completed, and publish analysis + leaderboard\n"
+                "/schedulequiz <quiz_id> <YYYY-MM-DDTHH:MMZ> [15|30|60|120|300] [learning|exam] — schedule in UTC\n"
+                "/leaderboard — cumulative leaderboard for this group\n"
+                "/quizstatus — active/paused/scheduled quiz status\n"
+                "Legacy aliases still work: /groupquiz, /groupquiz_schedule, /grouprank, /groupstatus, /groupstop\n"
                 "/start — show this group guide\n\n"
                 "Make the bot an administrator with permission to send messages and create polls."
             )
@@ -1354,6 +1359,14 @@ def main() -> None:
     application.add_handler(CommandHandler("mypremium", mypremium_command))
     application.add_handler(CommandHandler("tutorial", tutorial_command))
     application.add_handler(CommandHandler("admin", admin_command))
+    # New one-word group command names; old aliases remain registered for backwards compatibility.
+    application.add_handler(CommandHandler("startquiz", gq.group_quiz_command))
+    application.add_handler(CommandHandler("pausequiz", gq.group_pause_command))
+    application.add_handler(CommandHandler("resumequiz", gq.group_resume_command))
+    application.add_handler(CommandHandler("stopquiz", gq.group_stop_command))
+    application.add_handler(CommandHandler("schedulequiz", gq.group_quiz_schedule_command))
+    application.add_handler(CommandHandler("leaderboard", gq.group_leaderboard_command))
+    application.add_handler(CommandHandler("quizstatus", gq.group_status_command))
     application.add_handler(CommandHandler("groupquiz", gq.group_quiz_command))
     application.add_handler(CommandHandler("groupquiz_schedule", gq.group_quiz_schedule_command))
     application.add_handler(CommandHandler("grouprank", gq.group_leaderboard_command))
