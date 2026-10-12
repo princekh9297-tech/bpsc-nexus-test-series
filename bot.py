@@ -1155,6 +1155,10 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     if message is None or not message.text or user is None:
         return
+    # Group-quiz range/timer/scoring prompts are handled before the owner-only admin text flow.
+    # The handler returns True only when this message belongs to an active group-quiz setup.
+    if await gq.group_quiz_text_input(update, context):
+        return
     # Ignore ordinary user text completely; admin text prompts work only in private chat.
     if not admin_only(update):
         return

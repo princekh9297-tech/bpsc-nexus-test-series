@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from datetime import datetime, timedelta, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -30,6 +31,12 @@ DDL = [
         completed_at TIMESTAMPTZ
     )""",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'learning'",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS positive_marks NUMERIC(8,3) NOT NULL DEFAULT 1",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS negative_marks NUMERIC(8,3) NOT NULL DEFAULT 0.333",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS announcement_sent BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS report_sent BOOLEAN NOT NULL DEFAULT FALSE",
+
     "CREATE INDEX IF NOT EXISTS idx_group_quiz_sessions_due ON group_quiz_sessions(status,next_at) WHERE status='active'",
     """CREATE TABLE IF NOT EXISTS group_quiz_session_questions (
         session_id BIGINT NOT NULL REFERENCES group_quiz_sessions(id) ON DELETE CASCADE,
@@ -62,6 +69,7 @@ DDL = [
     )""",
     "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS message_id BIGINT",
     "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ",
     "CREATE INDEX IF NOT EXISTS idx_group_quiz_answers_session ON group_quiz_answers(session_id,telegram_id)",
     """CREATE TABLE IF NOT EXISTS group_quiz_memberships (
         chat_id BIGINT PRIMARY KEY,
@@ -163,7 +171,7 @@ async def group_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         quizzes = await cur.fetchall()
     buttons = [[InlineKeyboardButton("🧩 Build from Question Bank", callback_data="gq:bank")]]
     buttons += [[InlineKeyboardButton(f"#{r['id']} · {r['title'][:35]} ({r['n']} Q)", callback_data=f"gq:quiz:{r['id']}")] for r in quizzes]
-    await message.reply_text("🧩 **BPSC Nexus Group Quiz**\n\nBuild a fresh mixed/subject quiz from verified bank questions, or choose a published quiz. Then set question count, mode and voting window.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    await message.reply_text("🧩 **BPSC Nexus Group Quiz**\n\nBuild a quiz from a fixed subject/range or choose a published quiz. Configure mode, per-question timer and scoring before launch.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def group_leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -179,18 +187,19 @@ async def group_leaderboard_command(update: Update, context: ContextTypes.DEFAUL
             COUNT(DISTINCT a.session_id) AS quizzes,
             COUNT(*) FILTER (WHERE a.selected_letter=q.correct_option) AS correct,
             COUNT(*) FILTER (WHERE a.selected_letter IS NOT NULL AND a.selected_letter<>q.correct_option) AS incorrect,
-            COUNT(*) FILTER (WHERE a.selected_letter IS NOT NULL) AS attempted
+            COUNT(*) FILTER (WHERE a.selected_letter IS NOT NULL) AS attempted,
+            SUM(CASE WHEN a.selected_letter=q.correct_option THEN s.positive_marks WHEN a.selected_letter IS NOT NULL THEN -s.negative_marks ELSE 0 END) AS score
             FROM group_quiz_answers a JOIN group_quiz_session_questions q USING(session_id,position)
             JOIN group_quiz_sessions s ON s.id=a.session_id
             WHERE s.chat_id=%s AND s.status='completed'
-            GROUP BY a.telegram_id ORDER BY (COUNT(*) FILTER (WHERE a.selected_letter=q.correct_option)-COUNT(*) FILTER (WHERE a.selected_letter IS NOT NULL AND a.selected_letter<>q.correct_option)/3.0) DESC,correct DESC,incorrect ASC LIMIT 20""",(chat.id,))
+            GROUP BY a.telegram_id ORDER BY SUM(CASE WHEN a.selected_letter=q.correct_option THEN s.positive_marks WHEN a.selected_letter IS NOT NULL THEN -s.negative_marks ELSE 0 END) DESC,correct DESC,incorrect ASC LIMIT 20""",(chat.id,))
         rows=await cur.fetchall()
     if not rows:
         await message.reply_text("No completed group quizzes with recorded answers yet."); return
-    lines=[f"🏆 {chat.title or 'Group'} · Cumulative Quiz Leaderboard","","Scoring: +1 correct, −⅓ incorrect"]
+    lines=[f"🏆 {chat.title or 'Group'} · Cumulative Quiz Leaderboard","","Scores use each quiz's configured marking scheme."]
     for rank,r in enumerate(rows,1):
         name=(r["first_name"] or r["username"] or f"Student {r['telegram_id']}").replace("\n"," ")[:32]
-        correct=int(r["correct"] or 0); incorrect=int(r["incorrect"] or 0); score=correct-incorrect/3
+        correct=int(r["correct"] or 0); incorrect=int(r["incorrect"] or 0); score=float(r["score"] or 0)
         lines.append(f"{rank}. {name} — {score:.2f} pts · {correct}✓ {incorrect}✗ · {r['quizzes']} quizzes")
     await message.reply_text("\n".join(lines)[:4000])
 
@@ -342,13 +351,9 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
         else:
             try: selected=subjects[int(value)]; subject=selected["name"]; label=subject
             except (ValueError,IndexError): await q.answer("Subject selection expired. Run /groupquiz again.",show_alert=True); return True
-        context.user_data["group_quiz_pending"]={"source_type":"bank","subject":subject,"subject_label":label,"chat_id":chat.id,"chat_title":chat.title or "Telegram group"}
         eligible=sum(x["n"] for x in subjects) if subject is None else next((x["n"] for x in subjects if x["name"]==subject),0)
-        choices=[n for n in (5,10,20,30,50,75,100) if n<=eligible]
-        buttons=[[InlineKeyboardButton(f"{n} questions",callback_data=f"gq:count:{n}") for n in choices[i:i+2]] for i in range(0,len(choices),2)]
-        if eligible and eligible<5: buttons=[[InlineKeyboardButton(f"Use all {eligible} questions",callback_data=f"gq:count:{eligible}")]]
-        buttons.append([InlineKeyboardButton("Cancel",callback_data="gq:cancel")])
-        await q.answer(); await q.edit_message_text(f"Question pool: {label}\nVerified questions available: {eligible}\n\nChoose the number of questions:",reply_markup=InlineKeyboardMarkup(buttons)); return True
+        context.user_data["group_quiz_pending"]={"source_type":"bank","subject":subject,"subject_label":label,"chat_id":chat.id,"chat_title":chat.title or "Telegram group","stage":"range_start","eligible":eligible}
+        await q.answer(); await q.edit_message_text(f"Question pool: {label}\nEligible questions: {eligible}\n\nEnter the START position (1–{eligible}) as a number in this group. Example: 1",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
     if data.startswith("gq:count:"):
         pending=context.user_data.get("group_quiz_pending")
         if not pending or pending.get("chat_id")!=chat.id or pending.get("source_type")!="bank":
@@ -381,7 +386,7 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
         pending.update({"quiz_id":quiz_id,"source_type":"published","generated_title":title,"count":count})
         context.user_data["group_quiz_pending"]=pending
         await q.answer("Question set created.")
-        await q.edit_message_text(f"Question set ready: {title}\n\nChoose answer-reveal mode.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Learning — reveal answer",callback_data="gq:mode:learning")],[InlineKeyboardButton("⏱ Exam simulation — reveal after poll closes",callback_data="gq:mode:exam")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+        await q.edit_message_text(f"Question set ready: {title}\n\nChoose answer-reveal mode.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Learning — answer after each poll",callback_data="gq:mode:learning")],[InlineKeyboardButton("⏱ Exam Mode — reveal answers after final submission",callback_data="gq:mode:exam")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
     if data.startswith("gq:quiz:"):
         quiz_id = int(data.rsplit(":", 1)[1])
         async with pool.connection() as conn:
@@ -393,8 +398,8 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
         context.user_data["group_quiz_pending"] = {"quiz_id": quiz_id, "source_type": "published", "chat_id": chat.id, "chat_title": chat.title or "Telegram group"}
         await q.answer()
         await q.edit_message_text(f"Selected: {quiz['title']}\n\nChoose how answers should be revealed.", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧠 Learning — reveal answer", callback_data="gq:mode:learning")],
-            [InlineKeyboardButton("⏱ Exam simulation — reveal after poll closes", callback_data="gq:mode:exam")],
+            [InlineKeyboardButton("🧠 Learning — answer after each poll", callback_data="gq:mode:learning")],
+            [InlineKeyboardButton("⏱ Exam Mode — reveal answers after final submission", callback_data="gq:mode:exam")],
             [InlineKeyboardButton("Cancel", callback_data="gq:cancel")],
         ]))
         return True
@@ -406,11 +411,11 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
         pending["mode"]=mode
         context.user_data["group_quiz_pending"]=pending
         await q.answer()
-        mode_text="Learning mode (answer shown by Telegram)" if mode=="learning" else "Exam simulation (answer hidden until voting closes)"
-        await q.edit_message_text(f"Mode: {mode_text}\n\nChoose the voting window per question.",reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("15 seconds",callback_data="gq:interval:15"),InlineKeyboardButton("30 seconds",callback_data="gq:interval:30")],
-            [InlineKeyboardButton("1 minute",callback_data="gq:interval:60"),InlineKeyboardButton("2 minutes",callback_data="gq:interval:120")],
-            [InlineKeyboardButton("5 minutes",callback_data="gq:interval:300")],
+        mode_text="Learning Mode — answer and explanation after each poll" if mode=="learning" else "Exam Mode — answers hidden until final submission"
+        await q.edit_message_text(f"Mode: {mode_text}\n\nChoose time per question.",reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("15 sec",callback_data="gq:interval:15"),InlineKeyboardButton("20 sec",callback_data="gq:interval:20")],
+            [InlineKeyboardButton("25 sec",callback_data="gq:interval:25"),InlineKeyboardButton("30 sec",callback_data="gq:interval:30")],
+            [InlineKeyboardButton("Custom time…",callback_data="gq:interval:custom")],
             [InlineKeyboardButton("Cancel",callback_data="gq:cancel")],
         ])); return True
     if data == "gq:cancel":
@@ -419,57 +424,131 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
         await q.edit_message_text("Group quiz setup cancelled.")
         return True
     if data.startswith("gq:interval:"):
-        interval = int(data.rsplit(":", 1)[1])
-        pending = context.user_data.get("group_quiz_pending")
-        if not pending or pending.get("chat_id") != chat.id or interval not in (15, 30, 60, 120, 300):
-            await q.answer("Setup expired. Run /groupquiz again.", show_alert=True)
-            return True
+        raw=data.rsplit(":",1)[1]; pending=context.user_data.get("group_quiz_pending")
+        if not pending or pending.get("chat_id")!=chat.id:
+            await q.answer("Setup expired. Run /groupquiz again.",show_alert=True); return True
+        if raw=="custom":
+            pending["stage"]="custom_timer"; context.user_data["group_quiz_pending"]=pending
+            await q.answer(); await q.edit_message_text("Enter custom time per question in whole seconds (5–600).",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+        try: interval=int(raw)
+        except ValueError: await q.answer("Invalid duration.",show_alert=True); return True
+        if interval not in (15,20,25,30): await q.answer("Choose 15, 20, 25 or 30 seconds, or Custom.",show_alert=True); return True
+        pending["interval_seconds"]=interval; pending["stage"]="positive_marks"; context.user_data["group_quiz_pending"]=pending
+        await q.answer(); await q.edit_message_text(f"Time per question: {interval}s. Choose marks for a correct answer.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("+1",callback_data="gq:positive:1"),InlineKeyboardButton("+2",callback_data="gq:positive:2"),InlineKeyboardButton("+3",callback_data="gq:positive:3")],[InlineKeyboardButton("Custom…",callback_data="gq:positive:custom")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+    if data.startswith("gq:positive:"):
+        pending=context.user_data.get("group_quiz_pending")
+        if not pending or pending.get("chat_id")!=chat.id: await q.answer("Setup expired.",show_alert=True); return True
+        raw=data.rsplit(":",1)[1]
+        if raw=="custom":
+            pending["stage"]="custom_positive"; context.user_data["group_quiz_pending"]=pending
+            await q.answer(); await q.edit_message_text("Enter marks per correct answer (0.01–100).",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+        pending["positive_marks"]=float(raw); pending["stage"]="negative_marks"; context.user_data["group_quiz_pending"]=pending
+        await q.answer(); await q.edit_message_text("Choose the negative-mark penalty per wrong answer.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("0",callback_data="gq:negative:0"),InlineKeyboardButton("−0.25",callback_data="gq:negative:0.25")],[InlineKeyboardButton("−0.33",callback_data="gq:negative:0.33"),InlineKeyboardButton("−0.50",callback_data="gq:negative:0.5")],[InlineKeyboardButton("−1",callback_data="gq:negative:1"),InlineKeyboardButton("Custom…",callback_data="gq:negative:custom")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+    if data.startswith("gq:negative:"):
+        pending=context.user_data.get("group_quiz_pending")
+        if not pending or pending.get("chat_id")!=chat.id: await q.answer("Setup expired.",show_alert=True); return True
+        raw=data.rsplit(":",1)[1]
+        if raw=="custom":
+            pending["stage"]="custom_negative"; context.user_data["group_quiz_pending"]=pending
+            await q.answer(); await q.edit_message_text("Enter the negative-mark penalty magnitude (0–100). Enter 0 for no negative marking.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+        pending["negative_marks"]=float(raw); pending["stage"]="confirm_launch"; context.user_data["group_quiz_pending"]=pending
+        await q.answer(); await q.edit_message_text(_pending_preview(pending),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Confirm & Start Quiz",callback_data="gq:launch")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+    if data=="gq:launch":
+        pending=context.user_data.get("group_quiz_pending")
+        if not pending or pending.get("chat_id")!=chat.id or pending.get("stage")!="confirm_launch":
+            await q.answer("Setup expired. Run /groupquiz again.",show_alert=True); return True
+        return await _launch_pending_quiz(q,context,pool,pending,user)
+    return True
+
+
+def _pending_preview(pending):
+    range_label=(f"{pending.get('range_start')}–{pending.get('range_end')}" if pending.get('range_start') is not None else "Published quiz selection")
+    count_label=str(pending.get('count')) if pending.get('count') is not None else "From selected quiz"
+    return ("🧾 FINAL QUIZ PREVIEW\n\n"
+        f"Subject / quiz: {pending.get('subject_label') or pending.get('generated_title') or 'Selected quiz'}\n"
+        f"Question range: {range_label}\n"
+        f"Questions: {count_label}\n"
+        f"Mode: {str(pending.get('mode','learning')).title()}\n"
+        f"Time per question: {pending.get('interval_seconds',20)} seconds\n"
+        f"Scoring: +{float(pending.get('positive_marks',1)):g} correct / −{float(pending.get('negative_marks',0.333)):g} wrong\n"
+        "Question order: shuffled\n\nConfirm to start. The timer begins when each poll is published.")
+
+
+async def _launch_pending_quiz(q,context,pool,pending,user):
+    chat_id=int(pending["chat_id"]); interval=int(pending.get("interval_seconds",20)); mode=pending.get("mode","learning")
+    positive=float(pending.get("positive_marks",1)); negative=float(pending.get("negative_marks",0.333))
+    async with pool.connection() as conn:
+        cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND (is_published=TRUE OR (is_custom=TRUE AND custom_owner_telegram_id=%s))",(pending["quiz_id"],user.id)); quiz=await cur.fetchone()
+        if not quiz: await q.answer("Quiz is no longer available.",show_alert=True); return True
+        cur=await conn.execute("SELECT b.id,b.question_en,b.question_hi,b.options,b.correct_option,b.explanation_en,b.explanation_hi FROM bank_quiz_questions qq JOIN question_bank b ON b.id=qq.question_id WHERE qq.quiz_id=%s AND b.status='ready' ORDER BY qq.position",(quiz["id"],)); source=await cur.fetchall()
+        prepared=[]
+        for row in source:
+            opts=row["options"] if isinstance(row["options"],dict) else json.loads(row["options"] or "{}")
+            letters=[letter for letter in "ABCDE" if str(opts.get(letter,"")).strip() and not (letter=="E" and (str(opts.get(letter,"")).lower().startswith("not attempted") or str(opts.get(letter,"")).startswith("प्रयास नहीं किया")))]
+            if len(letters)>=2 and row["correct_option"] in letters: prepared.append((row,opts,letters))
+        if not prepared: await q.answer("No valid questions available for Telegram polls.",show_alert=True); return True
+        expected_count=pending.get("count")
+        if pending.get("source_type")=="range" and expected_count is not None and len(prepared)!=int(expected_count):
+            await q.answer(f"That fixed range contains {int(expected_count)-len(prepared)} question(s) that cannot be displayed as Telegram polls. Choose a different range so no question is silently omitted.",show_alert=True); return True
+        random.shuffle(prepared)
+        cur=await conn.execute("SELECT id FROM group_quiz_sessions WHERE chat_id=%s AND status='active' LIMIT 1",(chat_id,)); active=await cur.fetchone()
+        if active: await q.answer(f"This group already has active quiz session #{active['id']}.",show_alert=True); return True
+        cur=await conn.execute("INSERT INTO group_quiz_sessions(chat_id,chat_title,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at,positive_marks,negative_marks,started_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,0,'active',NOW()+INTERVAL '5 seconds',%s,%s,NOW()) RETURNING id",(chat_id,pending.get("chat_title","Telegram group"),quiz["id"],quiz["title"],user.id,interval,len(prepared),mode,positive,negative)); sid=int((await cur.fetchone())["id"])
+        for position,(row,opts,letters) in enumerate(prepared):
+            await conn.execute("INSERT INTO group_quiz_session_questions(session_id,position,question_id,question_en,question_hi,options,option_letters,correct_option,explanation_en,explanation_hi) VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)",(sid,position,row["id"],row["question_en"],row["question_hi"],json.dumps(opts,ensure_ascii=False),json.dumps(letters),row["correct_option"],row["explanation_en"],row["explanation_hi"]))
+    context.user_data.pop("group_quiz_pending",None)
+    await q.answer("Quiz launched.")
+    await q.edit_message_text(f"✅ Group quiz #{sid} queued\n{quiz['title']}\n{len(prepared)} questions · {mode.title()} Mode · {interval}s/question\nScoring: +{positive:g} correct / −{negative:g} wrong")
+    return True
+
+
+async def group_quiz_text_input(update: Update,context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Consume group-quiz setup text only; all other messages remain untouched."""
+    message=update.effective_message; chat=update.effective_chat; user=update.effective_user; pending=context.user_data.get("group_quiz_pending")
+    if not message or not message.text or not chat or not user or not pending or int(pending.get("chat_id",0))!=chat.id: return False
+    stage=pending.get("stage")
+    if stage not in {"range_start","range_end","custom_timer","custom_positive","custom_negative"}: return False
+    pool=context.application.bot_data.get("db_pool")
+    if pool is None or chat.type==ChatType.PRIVATE or not await _is_chat_admin(context,chat.id,user.id): return False
+    raw=message.text.strip()
+    if stage in {"range_start","range_end"}:
+        try: value=int(raw)
+        except ValueError: await message.reply_text("Enter a whole-number question position."); return True
+        eligible=int(pending.get("eligible",0))
+        if not 1<=value<=eligible: await message.reply_text(f"Enter a position from 1 to {eligible}."); return True
+        if stage=="range_start":
+            pending["range_start"]=value; pending["stage"]="range_end"; context.user_data["group_quiz_pending"]=pending
+            await message.reply_text(f"Start position: {value}. Enter the END position ({value}–{eligible})."); return True
+        startpos=int(pending["range_start"])
+        if value<startpos: await message.reply_text(f"End position must be {startpos} or higher."); return True
+        count=value-startpos+1
+        if count>500: await message.reply_text("Maximum is 500 questions per group quiz. Choose a smaller range."); return True
         async with pool.connection() as conn:
-            cur = await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks FROM bank_quizzes WHERE id=%s AND (is_published=TRUE OR (is_custom=TRUE AND custom_owner_telegram_id=%s))", (pending["quiz_id"], user.id))
-            quiz = await cur.fetchone()
-            if not quiz:
-                await q.answer("Quiz is no longer available.", show_alert=True)
-                return True
-            cur = await conn.execute("""SELECT b.id,b.question_en,b.question_hi,b.options,b.correct_option,b.explanation_en,b.explanation_hi
-                FROM bank_quiz_questions qq JOIN question_bank b ON b.id=qq.question_id
-                WHERE qq.quiz_id=%s AND b.status='ready' ORDER BY qq.position""", (quiz["id"],))
-            source_questions = await cur.fetchall()
-            if not source_questions:
-                await q.answer("This quiz has no verified questions.", show_alert=True)
-                return True
-            prepared = []
-            for row in source_questions:
-                opts = row["options"] if isinstance(row["options"], dict) else json.loads(row["options"] or "{}")
-                letters = []
-                for letter in "ABCDE":
-                    value = str(opts.get(letter, "")).strip()
-                    if not value:
-                        continue
-                    if letter == "E" and (value.lower().startswith("not attempted") or value.startswith("प्रयास नहीं किया")):
-                        continue
-                    letters.append(letter)
-                if len(letters) < 2 or row["correct_option"] not in letters:
-                    continue
-                prepared.append((row, opts, letters))
-            if not prepared:
-                await q.answer("No questions have valid answer options for Telegram polls.", show_alert=True)
-                return True
-            cur = await conn.execute("SELECT id FROM group_quiz_sessions WHERE chat_id=%s AND status='active' LIMIT 1", (chat.id,))
-            active = await cur.fetchone()
-            if active:
-                await q.answer(f"This group already has active quiz session #{active['id']}.", show_alert=True)
-                return True
-            mode=pending.get("mode","learning")
-            cur = await conn.execute("""INSERT INTO group_quiz_sessions(chat_id,chat_title,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,0,'active',NOW()) RETURNING id""", (chat.id, pending["chat_title"], quiz["id"], quiz["title"], user.id, interval, len(prepared), mode))
-            session_id = int((await cur.fetchone())["id"])
-            for position, (row, opts, letters) in enumerate(prepared):
-                await conn.execute("""INSERT INTO group_quiz_session_questions(session_id,position,question_id,question_en,question_hi,options,option_letters,correct_option,explanation_en,explanation_hi)
-                    VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)""", (session_id, position, row["id"], row["question_en"], row["question_hi"], json.dumps(opts, ensure_ascii=False), json.dumps(letters), row["correct_option"], row["explanation_en"], row["explanation_hi"]))
-        context.user_data.pop("group_quiz_pending", None)
-        await q.answer("Quiz scheduled.")
-        await q.edit_message_text(f"✅ Group quiz #{session_id} queued.\n\n{quiz['title']}\nMode: {mode.title()}\nQuestions: {len(prepared)}\nVoting window: {interval} seconds per question\n\nThe first poll will be posted automatically.")
-        return True
+            if pending.get("subject"):
+                cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' AND subject=%s ORDER BY id OFFSET %s LIMIT %s",(pending["subject"],startpos-1,count))
+            else: cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' ORDER BY id OFFSET %s LIMIT %s",(startpos-1,count))
+            ids=[int(r["id"]) for r in await cur.fetchall()]
+            if len(ids)!=count: await message.reply_text(f"Only {len(ids)} eligible questions found. Please enter a valid range."); return True
+            random.shuffle(ids)
+            title=f"Group · {pending['subject_label']} · Q{startpos}-{value} · {datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}"
+            cur=await conn.execute("INSERT INTO bank_quizzes(title,description,subject,created_by_telegram_id,is_published,is_custom,custom_owner_telegram_id) VALUES(%s,%s,%s,%s,FALSE,TRUE,%s) RETURNING id",(title,f"Fixed question range {startpos}-{value}; shuffled",pending["subject_label"],user.id,user.id)); quiz_id=int((await cur.fetchone())["id"])
+            for pos,qid in enumerate(ids,1): await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)",(quiz_id,pos,qid))
+        pending.update({"quiz_id":quiz_id,"source_type":"range","generated_title":title,"count":count,"range_end":value,"stage":None}); context.user_data["group_quiz_pending"]=pending
+        await message.reply_text(f"✅ Fixed range {startpos}–{value} saved ({count} questions). Order is shuffled. Choose mode:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Learning Mode",callback_data="gq:mode:learning")],[InlineKeyboardButton("📝 Exam Mode",callback_data="gq:mode:exam")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+    try: value=float(raw)
+    except ValueError: await message.reply_text("Enter a valid number."); return True
+    if stage=="custom_timer":
+        if not value.is_integer() or not 5<=value<=600: await message.reply_text("Enter whole seconds from 5 to 600."); return True
+        pending["interval_seconds"]=int(value); pending["stage"]="positive_marks"; context.user_data["group_quiz_pending"]=pending
+        await message.reply_text("Choose correct-answer marks:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("+1",callback_data="gq:positive:1"),InlineKeyboardButton("+2",callback_data="gq:positive:2"),InlineKeyboardButton("+3",callback_data="gq:positive:3")],[InlineKeyboardButton("Custom…",callback_data="gq:positive:custom")]])); return True
+    if stage=="custom_positive":
+        if not 0.01<=value<=100: await message.reply_text("Enter marks from 0.01 to 100."); return True
+        pending["positive_marks"]=value; pending["stage"]="negative_marks"; context.user_data["group_quiz_pending"]=pending
+        await message.reply_text("Choose wrong-answer penalty:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("0",callback_data="gq:negative:0"),InlineKeyboardButton("−0.25",callback_data="gq:negative:0.25")],[InlineKeyboardButton("−0.33",callback_data="gq:negative:0.33"),InlineKeyboardButton("−0.50",callback_data="gq:negative:0.5")],[InlineKeyboardButton("−1",callback_data="gq:negative:1"),InlineKeyboardButton("Custom…",callback_data="gq:negative:custom")]])); return True
+    if stage=="custom_negative":
+        if not 0<=value<=100: await message.reply_text("Enter a penalty magnitude from 0 to 100."); return True
+        pending["negative_marks"]=value; pending["stage"]="confirm_launch"; context.user_data["group_quiz_pending"]=pending
+        await message.reply_text(_pending_preview(pending),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Confirm & Start Quiz",callback_data="gq:launch")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
     return True
 
 
@@ -486,6 +565,20 @@ async def _post_question(application, pool, session, question):
                 await conn.execute("UPDATE group_quiz_sessions SET status='paused' WHERE id=%s", (sid,))
                 await application.bot.send_message(chat_id=session["chat_id"], text=f"⚠️ Group quiz #{sid} paused because a poll's send status could not be confirmed after a restart. Start a new session to avoid duplicate questions.")
             return
+    async with pool.connection() as conn:
+        cur=await conn.execute("SELECT announcement_sent FROM group_quiz_sessions WHERE id=%s",(sid,))
+        promo_row=await cur.fetchone()
+    if promo_row and not promo_row["announcement_sent"]:
+        try:
+            await application.bot.send_message(chat_id=int(session["chat_id"]),text=f"🚀 BPSC NEXUS · GROUP QUIZ #{sid}\n{session.get('quiz_title','Group Quiz')}\n{int(session['questions_count'])} questions · {str(session.get('mode','learning')).title()} Mode · {int(session['interval_seconds'])}s/question\n\nPractice more with @BpscNexustestbot: https://t.me/BpscNexustestbot")
+        except Exception:
+            log.warning("Promotional announcement failed; proceeding with quiz session %s",sid,exc_info=True)
+        finally:
+            try:
+                async with pool.connection() as conn:
+                    await conn.execute("UPDATE group_quiz_sessions SET announcement_sent=TRUE WHERE id=%s",(sid,))
+            except Exception:
+                log.warning("Could not persist announcement guard for session %s",sid,exc_info=True)
     opts = question["options"] if isinstance(question["options"], dict) else json.loads(question["options"] or "{}")
     letters = question["option_letters"] if isinstance(question["option_letters"], list) else json.loads(question["option_letters"] or "[]")
     question_text = str(question["question_en"] or "Question")
@@ -508,7 +601,7 @@ async def _post_question(application, pool, session, question):
                 open_period=int(session["interval_seconds"]),
             )
         async with pool.connection() as conn:
-            await conn.execute("UPDATE group_quiz_session_questions SET poll_id=%s,message_id=%s,status='open',updated_at=NOW() WHERE session_id=%s AND position=%s", (str(poll.poll.id), int(poll.message_id), sid, position))
+            await conn.execute("UPDATE group_quiz_session_questions SET poll_id=%s,message_id=%s,status='open',opened_at=NOW(),updated_at=NOW() WHERE session_id=%s AND position=%s", (str(poll.poll.id), int(poll.message_id), sid, position))
             await conn.execute("UPDATE group_quiz_sessions SET next_at=NOW()+(%s * INTERVAL '1 second') WHERE id=%s", (int(session["interval_seconds"]), sid))
     except Exception:
         log.exception("Failed to publish group poll for session %s position %s", sid, position)
@@ -522,41 +615,110 @@ async def _post_question(application, pool, session, question):
 
 
 async def _finish_session(application, pool, session):
-    sid = int(session["id"])
+    sid=int(session["id"])
     async with pool.connection() as conn:
-        cur = await conn.execute("UPDATE group_quiz_sessions SET status='completed',completed_at=NOW() WHERE id=%s AND status='active' RETURNING questions_count,quiz_title", (sid,))
-        finished = await cur.fetchone()
-        if not finished:
-            return
-        cur = await conn.execute("""SELECT a.telegram_id,a.first_name,a.username,
+        cur=await conn.execute("UPDATE group_quiz_sessions SET status='completed',completed_at=NOW() WHERE id=%s AND status='active' RETURNING questions_count,quiz_title,positive_marks,negative_marks,started_by,chat_id,started_at,mode",(sid,))
+        finished=await cur.fetchone()
+        if not finished: return
+        positive=float(finished["positive_marks"] or 1); negative=float(finished["negative_marks"] or 0.333)
+        cur=await conn.execute("""SELECT a.telegram_id,MAX(a.first_name) AS first_name,MAX(a.username) AS username,
             COUNT(*) FILTER (WHERE a.selected_letter=q.correct_option) AS correct,
             COUNT(*) FILTER (WHERE a.selected_letter IS NOT NULL AND a.selected_letter<>q.correct_option) AS incorrect,
-            COUNT(*) FILTER (WHERE a.selected_letter IS NOT NULL) AS attempted
+            COUNT(*) FILTER (WHERE a.selected_letter IS NOT NULL) AS attempted,
+            MIN(a.answered_at) AS first_answer,MAX(a.answered_at) AS last_answer,
+            SUM(GREATEST(0,EXTRACT(EPOCH FROM (a.answered_at-q.opened_at)))) FILTER (WHERE a.selected_letter IS NOT NULL AND q.opened_at IS NOT NULL) AS total_response_seconds,
+            AVG(GREATEST(0,EXTRACT(EPOCH FROM (a.answered_at-q.opened_at)))) FILTER (WHERE a.selected_letter IS NOT NULL AND q.opened_at IS NOT NULL) AS avg_response_seconds
             FROM group_quiz_answers a JOIN group_quiz_session_questions q USING(session_id,position)
-            WHERE a.session_id=%s GROUP BY a.telegram_id,a.first_name,a.username
-            ORDER BY correct DESC,incorrect ASC,attempted DESC,a.telegram_id ASC LIMIT 20""", (sid,))
-        scores = await conn.fetchall()
-        cur = await conn.execute("""SELECT COUNT(DISTINCT telegram_id) AS participants,
+            WHERE a.session_id=%s GROUP BY a.telegram_id ORDER BY
+            (COUNT(*) FILTER (WHERE a.selected_letter=q.correct_option)*%s-COUNT(*) FILTER (WHERE a.selected_letter IS NOT NULL AND a.selected_letter<>q.correct_option)*%s) DESC,
+            correct DESC,incorrect ASC,MAX(a.answered_at)-MIN(a.answered_at) ASC,a.telegram_id ASC LIMIT 50""",(sid,positive,negative))
+        scores=await conn.fetchall()
+        cur=await conn.execute("""SELECT COUNT(DISTINCT telegram_id) AS participants,
             COUNT(*) FILTER (WHERE selected_letter IS NOT NULL) AS votes,
             COUNT(*) FILTER (WHERE selected_letter=q.correct_option) AS correct,
             COUNT(*) FILTER (WHERE selected_letter IS NOT NULL AND selected_letter<>q.correct_option) AS incorrect
-            FROM group_quiz_answers a JOIN group_quiz_session_questions q USING(session_id,position)
-            WHERE a.session_id=%s""", (sid,))
-        agg = await cur.fetchone()
-    lines = [f"🏁 Group Quiz Complete · #{sid}", str(finished["quiz_title"]), "", f"Questions: {finished['questions_count']}", f"Participants: {agg['participants']}", f"Votes recorded: {agg['votes']}", f"Correct votes: {agg['correct']}", f"Incorrect votes: {agg['incorrect']}", "", "🏆 Leaderboard (1 mark correct, −⅓ incorrect)"]
-    if not scores:
-        lines.append("No participant answers were recorded.")
-    for rank, row in enumerate(scores[:10], 1):
-        name = (row["first_name"] or "Student").replace("\n", " ")[:35]
-        attempted = int(row["attempted"] or 0)
-        skipped = max(0, int(finished["questions_count"]) - attempted)
-        correct = int(row["correct"] or 0); incorrect = int(row["incorrect"] or 0)
-        score = correct - incorrect / 3
-        lines.append(f"{rank}. {name} — {score:.2f} pts · {correct}✓ {incorrect}✗ {skipped} skipped")
-    try:
-        await application.bot.send_message(chat_id=session["chat_id"], text="\n".join(lines)[:4000])
-    except Exception:
-        log.exception("Could not publish group quiz results for %s", sid)
+            FROM group_quiz_answers a JOIN group_quiz_session_questions q USING(session_id,position) WHERE a.session_id=%s""",(sid,))
+        agg=await cur.fetchone()
+        cur=await conn.execute("SELECT position,question_en,question_hi,options,correct_option,explanation_en,explanation_hi FROM group_quiz_session_questions WHERE session_id=%s ORDER BY position",(sid,))
+        answer_key=await conn.fetchall()
+        cur=await conn.execute("""SELECT q.position,COUNT(a.telegram_id) FILTER (WHERE a.selected_letter IS NOT NULL) AS attempted,
+            COUNT(a.telegram_id) FILTER (WHERE a.selected_letter=q.correct_option) AS correct,
+            COUNT(a.telegram_id) FILTER (WHERE a.selected_letter IS NOT NULL AND a.selected_letter<>q.correct_option) AS incorrect,
+            AVG(EXTRACT(EPOCH FROM (a.answered_at-q.opened_at))) FILTER (WHERE a.selected_letter IS NOT NULL AND q.opened_at IS NOT NULL) AS avg_response_seconds,
+            (SELECT a2.selected_letter FROM group_quiz_answers a2 WHERE a2.session_id=q.session_id AND a2.position=q.position AND a2.selected_letter IS NOT NULL AND a2.selected_letter<>q.correct_option GROUP BY a2.selected_letter ORDER BY COUNT(*) DESC,a2.selected_letter LIMIT 1) AS most_common_wrong
+            FROM group_quiz_session_questions q LEFT JOIN group_quiz_answers a ON a.session_id=q.session_id AND a.position=q.position
+            WHERE q.session_id=%s GROUP BY q.position,q.session_id,q.correct_option ORDER BY q.position""",(sid,))
+        question_stats=await conn.fetchall()
+    total=int(finished["questions_count"] or 0); participants=int(agg["participants"] or 0); votes=int(agg["votes"] or 0); correct=int(agg["correct"] or 0); wrong=int(agg["incorrect"] or 0)
+    started=finished["started_at"]
+    if started and started.tzinfo is None: started=started.replace(tzinfo=timezone.utc)
+    elapsed=max(0,int((datetime.now(timezone.utc)-(started or datetime.now(timezone.utc))).total_seconds()))
+    unanswered=max(0,total*participants-votes)
+    score_values=sorted((int(row["correct"] or 0)*positive-int(row["incorrect"] or 0)*negative) for row in scores)
+    if score_values:
+        average_score=sum(score_values)/len(score_values)
+        middle=len(score_values)//2
+        median_score=score_values[middle] if len(score_values)%2 else (score_values[middle-1]+score_values[middle])/2
+        high_score=max(score_values); low_score=min(score_values)
+    else:
+        average_score=median_score=high_score=low_score=0.0
+    lines=[f"🏁 BPSC Nexus Group Quiz Complete · #{sid}",str(finished["quiz_title"]),f"Questions: {total} · Participants: {participants}",f"Responses: {votes} · Correct: {correct} · Wrong: {wrong} · Unanswered: {unanswered}",f"Scoring: +{positive:g} correct / −{negative:g} wrong",f"Quiz elapsed: {elapsed//60}m {elapsed%60}s",f"Score average/median/high/low: {average_score:.2f}/{median_score:.2f}/{high_score:.2f}/{low_score:.2f}","","🏆 LEADERBOARD"]
+    for rank,row in enumerate(scores[:10],1):
+        name=(row["first_name"] or row["username"] or f"Student {row['telegram_id']}").replace("\n"," ")[:30]
+        c=int(row["correct"] or 0); w=int(row["incorrect"] or 0); attempted=int(row["attempted"] or 0); skipped=max(0,total-attempted); score=c*positive-w*negative; accuracy=(100*c/attempted) if attempted else 0
+        lines.append(f"{rank}. {name} — {score:.2f} pts · {accuracy:.0f}% accuracy · {c}✓ {w}✗ {skipped} unanswered")
+    lines += ["","Practice more with @BpscNexustestbot: https://t.me/BpscNexustestbot"]
+    # Group summary stays concise; answer key appears in the group only after the Exam Mode has fully submitted.
+    try: await application.bot.send_message(chat_id=int(finished["chat_id"]),text="\n".join(lines)[:3900])
+    except Exception: log.exception("Could not publish group quiz summary for %s",sid)
+    if finished.get("mode")=="exam":
+        key_lines=["📝 Exam answer key (quiz submitted)"]
+        for row in answer_key:
+            opts=row["options"] if isinstance(row["options"],dict) else json.loads(row["options"] or "{}")
+            item=f"Q{int(row['position'])+1}. {row['correct_option']}. {opts.get(row['correct_option'],'')}"
+            if row.get("explanation_en"): item += "\n"+str(row["explanation_en"])[:180]
+            if row.get("explanation_hi"): item += "\n"+str(row["explanation_hi"])[:180]
+            key_lines.append(item)
+        chunks=[]; buf=""
+        for line in key_lines:
+            if len(buf)+len(line)+1>3500: chunks.append(buf); buf=""
+            buf += ("\n" if buf else "")+line
+        if buf: chunks.append(buf)
+        for chunk in chunks:
+            try: await application.bot.send_message(chat_id=int(finished["chat_id"]),text=chunk)
+            except Exception: log.exception("Could not post final exam answer key for %s",sid); break
+    admin_lines=[f"📊 FULL ADMIN REPORT · Group Quiz #{sid}",str(finished["quiz_title"]),f"Participants: {participants} · Questions: {total}",f"Correct: {correct} · Wrong: {wrong} · Unanswered: {unanswered}",f"Scoring: +{positive:g} / −{negative:g}",f"Elapsed: {elapsed//60}m {elapsed%60}s",f"Score average/median/high/low: {average_score:.2f}/{median_score:.2f}/{high_score:.2f}/{low_score:.2f}","","INDIVIDUAL PERFORMANCE"]
+    for row in scores:
+        name=(row["first_name"] or row["username"] or f"Student {row['telegram_id']}").replace("\n"," ")[:32]
+        c=int(row["correct"] or 0); w=int(row["incorrect"] or 0); attempted=int(row["attempted"] or 0); score=c*positive-w*negative; acc=100*c/attempted if attempted else 0
+        span=0
+        if row["first_answer"] and row["last_answer"]: span=max(0,int((row["last_answer"]-row["first_answer"]).total_seconds()))
+        response_total=float(row["total_response_seconds"] or 0); response_avg=float(row["avg_response_seconds"] or 0)
+        admin_lines.append(f"{name}: {score:.2f} pts | {acc:.1f}% accuracy | {c} correct, {w} wrong, {max(0,total-attempted)} unanswered | active response time {response_total:.1f}s total, {response_avg:.1f}s avg/question | answer span {span}s")
+    admin_lines += ["","QUESTION ANALYSIS (attempted / correct / wrong / average response seconds)"]
+    for stat in question_stats:
+        attempted_q=int(stat["attempted"] or 0); correct_q=int(stat["correct"] or 0); wrong_q=int(stat["incorrect"] or 0)
+        accuracy_q=(100*correct_q/attempted_q) if attempted_q else 0
+        avg_seconds=float(stat["avg_response_seconds"] or 0)
+        common_wrong=stat["most_common_wrong"] or "—"
+        admin_lines.append(f"Q{int(stat['position'])+1}: {attempted_q} attempted, {correct_q} correct, {wrong_q} wrong, {accuracy_q:.1f}% accuracy, avg {avg_seconds:.1f}s, most common wrong option {common_wrong}")
+    for row in answer_key:
+        opts=row["options"] if isinstance(row["options"],dict) else json.loads(row["options"] or "{}")
+        item=f"Q{int(row['position'])+1}. {row['correct_option']}. {opts.get(row['correct_option'],'')}"
+        if row.get("explanation_en"): item += " — "+str(row["explanation_en"])[:220]
+        if row.get("explanation_hi"): item += " / "+str(row["explanation_hi"])[:220]
+        admin_lines.append(item)
+    chunks=[]; buf=""
+    for line in admin_lines:
+        if len(buf)+len(line)+1>3500: chunks.append(buf); buf=""
+        buf += ("\n" if buf else "")+line
+    if buf: chunks.append(buf)
+    if chunks:
+        chunks[-1] += "\n\nContinue practising with @BpscNexustestbot: https://t.me/BpscNexustestbot"
+    for chunk in chunks:
+        try: await application.bot.send_message(chat_id=int(finished["started_by"]),text=chunk)
+        except Exception:
+            log.info("Could not DM full admin report for session %s; group summary remains available",sid,exc_info=True); break
 
 
 async def scheduler(application, pool):
@@ -595,15 +757,6 @@ async def scheduler(application, pool):
                     except Exception:
                         # Telegram may have auto-closed the poll at open_period; that is expected.
                         log.debug("Poll already closed or message unavailable for session %s", sid)
-                    if session.get("mode","learning")=="exam":
-                        opts=question["options"] if isinstance(question["options"],dict) else json.loads(question["options"] or "{}")
-                        answer_text=f"📝 Answer revealed · Question {position+1}\nCorrect option: {question['correct_option']}. {opts.get(question['correct_option'],'')}"
-                        if question.get("explanation_en"): answer_text += "\n\n"+str(question["explanation_en"])[:700]
-                        if question.get("explanation_hi"): answer_text += "\n\n"+str(question["explanation_hi"])[:700]
-                        try:
-                            await application.bot.send_message(chat_id=session["chat_id"],text=answer_text[:3500])
-                        except Exception:
-                            log.exception("Could not reveal exam answer for session %s position %s",sid,position)
                     async with pool.connection() as conn:
                         await conn.execute("UPDATE group_quiz_session_questions SET status='closed',updated_at=NOW() WHERE session_id=%s AND position=%s", (sid, position))
                         next_pos = position + 1
@@ -638,7 +791,7 @@ async def group_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pa or not pa.user or pool is None:
         return
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT session_id,position,option_letters FROM group_quiz_session_questions WHERE poll_id=%s", (str(pa.poll_id),))
+        cur = await conn.execute("SELECT q.session_id,q.position,q.option_letters FROM group_quiz_session_questions q JOIN group_quiz_sessions s ON s.id=q.session_id WHERE q.poll_id=%s AND q.status='open' AND s.status='active'", (str(pa.poll_id),))
         row = await cur.fetchone()
         if not row:
             return
