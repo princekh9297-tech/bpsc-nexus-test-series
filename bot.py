@@ -353,15 +353,15 @@ async def has_vault_access(telegram_id: int, vault_key: str) -> bool:
 
 
 async def reply_with_uluk(message, caption: str, reply_markup=None) -> None:
-    """Send ULUK mascot branding where the bundled asset is available; fall back safely."""
-    mascot_path = Path(__file__).resolve().parent / "static" / "uluk.png"
+    """Send a compact mascot emote for branded bot messages; fall back safely."""
+    mascot_path = Path(__file__).resolve().parent / "static" / "emotes" / "hello.webp"
     if mascot_path.is_file():
         try:
             with mascot_path.open("rb") as mascot:
                 await message.reply_photo(photo=mascot, caption=caption, reply_markup=reply_markup)
             return
         except Exception:
-            logger.exception("Could not send ULUK mascot image; falling back to text")
+            logger.exception("Could not send mascot emote; falling back to text")
     await message.reply_text(caption, reply_markup=reply_markup)
 
 
@@ -380,7 +380,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await reply_with_uluk(
         message,
-        f"Welcome to BPSC Nexus, {user.first_name or 'Aspirant'}! 🦉\n\nMeet ULUK, your BPSC Nexus mascot. Your quizzes, planner, results and study tools are available in the Mini App.",
+        f"Welcome to BPSC Nexus, {user.first_name or 'Aspirant'}! 🦉\n\nYour quizzes, planner, results and study tools are available in the Mini App.",
         reply_markup=main_user_keyboard(),
     )
 
@@ -407,7 +407,7 @@ async def tutorial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await reply_with_uluk(
         message,
-        "📘 BPSC Nexus — Quick Tutorial · ULUK\n\n"
+        "📘 BPSC Nexus — Quick Tutorial\n\n"
         "1. Tap Open Mini App to enter your study workspace.\n"
         "2. Use Test Series to attempt published quizzes.\n"
         "3. Use Create to build a quiz from the available question bank.\n"
