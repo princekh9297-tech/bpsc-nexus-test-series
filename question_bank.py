@@ -318,95 +318,221 @@ def _flatten_chapters(obj: Any) -> list[dict]:
     return _extract_json_records(obj)
 
 
+def _balanced_js_value(raw: str, start: int):
+    """Read one JSON-compatible array/object without executing JavaScript."""
+    decoder = json.JSONDecoder()
+    try:
+        value, _ = decoder.raw_decode(raw[start:])
+        return value
+    except Exception:
+        return None
+
+
+class _VisibleTextExtractor(HTMLParser):
+    """Extract readable HTML text while ignoring scripts, styles and hidden payloads."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts=[]; self.skip=0
+    def handle_starttag(self, tag, attrs):
+        attrs=dict(attrs)
+        if tag.lower() in ("script", "style", "noscript", "svg"): self.skip += 1
+        if not self.skip and tag.lower() in ("br", "p", "div", "li", "tr", "td", "th", "h1", "h2", "h3", "h4", "section", "article"):
+            self.parts.append("\n")
+    def handle_endtag(self, tag):
+        if tag.lower() in ("script", "style", "noscript", "svg") and self.skip: self.skip -= 1
+        if not self.skip and tag.lower() in ("p", "div", "li", "tr", "td", "th", "section", "article"):
+            self.parts.append("\n")
+    def handle_data(self, data):
+        if not self.skip and data.strip(): self.parts.append(data.strip()+" ")
+
+
+def _generic_question_rows(obj: Any) -> list[dict]:
+    """Recursively discover question records inside common export wrappers."""
+    out=[]
+    question_keys={"question","question_en","question_text","questiontext","questionenglish","q","prompt","stem","ques","प्रश्न"}
+    container_keys=("questions","questionlist","question_list","mcqs","items","data","results","records","quiz","quizdata","questionbank","question_bank","allquestions","all_questions","examquestions","exam_questions","list")
+    if isinstance(obj, list):
+        # First flatten chapter/subject wrappers while retaining their labels.
+        for item in obj:
+            if isinstance(item, dict):
+                child_key=next((k for k in item if str(k).lower() in container_keys and isinstance(item[k],list)),None)
+                if child_key:
+                    label=item.get("chapter") or item.get("chapterNameEn") or item.get("name") or item.get("title") or item.get("subject") or item.get("section") or item.get("topic") or ""
+                    hi_label=item.get("chapterNameHi") or item.get("hiName") or item.get("subject_hi") or ""
+                    children=_generic_question_rows(item[child_key])
+                    for row in children:
+                        row.setdefault("topic",label)
+                        if hi_label: row.setdefault("topic_hi",hi_label)
+                    out.extend(children)
+                elif any(str(k).lower().replace(" ","_") in question_keys for k in item):
+                    out.append(item)
+                else:
+                    nested=_generic_question_rows(item)
+                    out.extend(nested)
+            else:
+                continue
+        return out
+    if isinstance(obj, dict):
+        keys={str(k).lower().replace(" ","_") for k in obj}
+        if keys & question_keys:
+            return [obj]
+        for key,val in obj.items():
+            if isinstance(val,(dict,list)) and (str(key).lower().replace("-","_") in container_keys or isinstance(val,list)):
+                got=_generic_question_rows(val)
+                if got:
+                    # A wrapper label is useful as a topic/subject fallback.
+                    label=obj.get("name") or obj.get("title") or obj.get("subject") or obj.get("section") or obj.get("chapter") or ""
+                    for row in got: row.setdefault("topic",label)
+                    return got
+    return out
+
+
+def _adapt_generic_row(row: dict, default_subject: str, source: str) -> dict:
+    """Map common English/Hindi field aliases to the question-bank schema."""
+    def first(*keys):
+        return _get(row,*keys,default=None)
+    q=first("question_en","questionEnglish","question_text","questionText","question","prompt","stem","ques","q","title","प्रश्न")
+    qhi=first("question_hi","questionHindi","hindi_question","question_hin","hiQuestion","questionHindiText","प्रश्न_हिंदी")
+    if isinstance(q,dict):
+        qhi=qhi or q.get("hi") or q.get("hindi")
+        q=q.get("en") or q.get("english") or q.get("text") or qhi
+    opts=first("options","opts","choices","answers","alternatives","optionList","option_list","answerOptions","answer_options")
+    if isinstance(opts,dict):
+        # Handle {en:[...], hi:[...]} and {A:{en:...,hi:...}} shapes.
+        if any(str(k).lower() in ("en","english","hi","hindi") for k in opts):
+            en=opts.get("en") or opts.get("english") or opts.get("hi") or opts.get("hindi") or []
+            hi=opts.get("hi") or opts.get("hindi") or []
+            opts=en
+            if isinstance(opts,list) and isinstance(hi,list):
+                opts=[(str(v)+(" / "+str(hi[i]) if i<len(hi) and hi[i] else "")) for i,v in enumerate(opts)]
+        else:
+            normalized={}
+            for k,v in opts.items():
+                if isinstance(v,dict):
+                    en=v.get("en") or v.get("english") or v.get("text") or v.get("value") or ""
+                    hi=v.get("hi") or v.get("hindi") or ""
+                    normalized[k]=str(en)+(" / "+str(hi) if hi else "")
+                else: normalized[k]=v
+            opts=normalized
+    if isinstance(opts,list):
+        opts={LETTERS[i]:v for i,v in enumerate(opts[:5])}
+    if not isinstance(opts,dict): opts={}
+    # Separate Hindi options found under parallel fields.
+    hiopts=first("hiopts","options_hi","hindi_options","optionHindi","option_hindi")
+    if isinstance(hiopts,list):
+        for i,val in enumerate(hiopts[:5]):
+            letter=LETTERS[i]
+            if val and letter in opts and str(val) not in str(opts[letter]): opts[letter]=str(opts[letter])+" / "+str(val)
+    ans=first("correct_option","correctAnswer","correct_answer","answer_key","answerKey","correct","answer","ans","key","rightAnswer","right_answer","correctIndex","correct_index","answerIndex","answer_index","solutionIndex")
+    if isinstance(ans,dict): ans=ans.get("option") or ans.get("key") or ans.get("index") or ans.get("answer") or ans.get("en")
+    # Explicit index fields are conventionally zero-based; generic answer fields usually are 1-based.
+    anskey=str(next((k for k in row if str(k).lower().replace(" ","_") in ("ans","correctindex","correct_index","answerindex","answer_index","solutionindex")),"")).lower()
+    if anskey and isinstance(ans,(int,float)) and not isinstance(ans,bool):
+        # Explicit index-style fields (including the common `ans`) are zero-based.
+        ans=LETTERS[int(ans)] if 0 <= int(ans) < min(len(opts),5) else None
+    elif isinstance(ans,(int,float)) and not isinstance(ans,bool):
+        n=int(ans); ans=LETTERS[n-1] if 1 <= n <= min(len(opts),5) else (LETTERS[0] if n==0 else None)
+    exp=first("explanation_en","explanationEnglish","explanation","solution","reason","exp","rationale","解析","解説")
+    exp_hi=first("explanation_hi","explanationHindi","hindi_explanation","hiexp","व्याख्या")
+    if isinstance(exp,dict):
+        exp_hi=exp_hi or exp.get("hi") or exp.get("hindi")
+        exp=exp.get("en") or exp.get("english") or exp.get("text") or ""
+    subject=first("subject","subjectName","category","categoryName","section","paper","exam","group") or default_subject or "Other / Unclassified"
+    topic=first("topic","subtopic","chapter","chapterNameEn","unit","lesson","sectionName","page","tag")
+    if isinstance(q,list): q="\n".join(map(str,q))
+    if isinstance(qhi,list): qhi="\n".join(map(str,qhi))
+    return {"question":str(q or ""),"question_hi":str(qhi or ""),"options":opts,"correct_answer":ans,
+            "explanation":str(exp or ""),"explanation_hi":str(exp_hi or ""),"subject":str(subject),"topic":str(topic or ""),"source":source}
+
+
 def _html_to_records(raw: str) -> list[dict]:
-    # Format A: compact BPSCVEERS HTML, const RAW = [...].
-    raw_payload = _js_value_after_assignment(raw, ("RAW",))
-    if isinstance(raw_payload, list) and raw_payload:
+    """Format-adaptive HTML importer. Never executes uploaded JavaScript."""
+    candidates=[]
+    # Known compact format used by earlier BPSC Nexus exports.
+    raw_payload=_js_value_after_assignment(raw,("RAW",))
+    if isinstance(raw_payload,list) and raw_payload:
         converted=[]
         for item in raw_payload:
-            if not isinstance(item, dict): continue
-            qparts=item.get("i") or []
-            if isinstance(qparts,str): qparts=[qparts]
+            if not isinstance(item,dict): continue
+            qparts=item.get("i") or []; qparts=[qparts] if isinstance(qparts,str) else qparts
             qtext="\n".join(str(x) for x in qparts if x is not None)
-            tail=item.get("tl") or []
-            if isinstance(tail,str): tail=[tail]
-            if tail: qtext += ("\n" if qtext else "") + "\n".join(str(x) for x in tail if x is not None)
+            tail=item.get("tl") or []; tail=[tail] if isinstance(tail,str) else tail
+            if tail: qtext += ("\n" if qtext else "")+"\n".join(str(x) for x in tail if x is not None)
             opts_raw=item.get("o") or []
             opts={LETTERS[i]:str(v) for i,v in enumerate(opts_raw[:5]) if v is not None and _norm(v)} if isinstance(opts_raw,list) else opts_raw
             correct=_answer_index_to_letter(item.get("a"),len(opts))
             exp=item.get("x") or {}; exp_parts=exp.get("w",[]) if isinstance(exp,dict) else exp
             if isinstance(exp_parts,str): exp_parts=[exp_parts]
             explanation="\n".join(str(x) for x in exp_parts if x is not None)
-            if str(item.get("t","mcq")).lower()=="match":
-                li,lii=item.get("li") or [],item.get("lii") or []
-                if li or lii: qtext += "\n\nMatch the following:\nList I: "+" | ".join(map(str,li))+"\nList II: "+" | ".join(map(str,lii))
             converted.append({"question":qtext or str(item.get("id") or "Question"),"options":opts,"correct_answer":correct,"explanation":explanation,
                 "subject":item.get("s") or "Other / Unclassified","topic":item.get("c") or item.get("s") or None,"source":"BPSCVEERS HTML import"})
-        if converted: return converted
+        if converted: candidates.append(converted)
 
-    # Format B: script#quiz-data type=application/json, often an array of chapter objects.
-    script_matches = re.findall(r"<script\b([^>]*)>(.*?)</script\s*>", raw, flags=re.I|re.S)
-    for attrs, body in script_matches:
-        if "application/json" not in attrs.lower() and not re.search(r"id\s*=\s*['\"](?:quiz-data|question-data|quizdata)['\"]",attrs,re.I):
-            continue
-        try:
-            candidate=json.loads(body.strip())
-            source_records=_flatten_chapters(candidate)
-            if source_records:
-                converted=[]
-                for row in source_records:
-                    if not isinstance(row,dict): continue
-                    opts=row.get("opts",row.get("options",row.get("choices",{})))
-                    if isinstance(opts,list):
-                        english={LETTERS[i]:str(v) for i,v in enumerate(opts[:5]) if v is not None}
-                    elif isinstance(opts,dict): english=opts
-                    else: english={}
-                    hiopts=row.get("hiopts")
-                    if isinstance(hiopts,list):
-                        for i,v in enumerate(hiopts[:5]):
-                            if v is not None and LETTERS[i] in english: english[LETTERS[i]]=f"{english[LETTERS[i]]} / {v}"
-                    correct=_answer_index_to_letter(row.get("ans",row.get("answer",row.get("correct_option"))),len(english))
-                    exp=_norm(row.get("exp",row.get("explanation",row.get("explanation_en", ""))))
-                    hiexp=_norm(row.get("hiexp",row.get("explanation_hi", "")))
-                    if hiexp: exp=(exp+" / "+hiexp).strip(" /")
-                    q=_norm(row.get("q",row.get("question",row.get("question_en", ""))))
-                    hi=_norm(row.get("hi",row.get("question_hi", "")))
-                    if hi: q=(q+"\n"+hi).strip()
-                    topic=_norm(row.get("topic") or row.get("subtopic") or row.get("chapter") or row.get("chapterNameEn") or "")
-                    subject=_norm(row.get("subject") or row.get("section") or row.get("category") or "")
-                    if not subject: subject="Current Affairs"
-                    converted.append({"question":q,"options":english,"correct_answer":correct,"explanation":exp,"subject":subject,"topic":topic or None,"source":"Embedded HTML JSON import"})
-                if converted: return converted
-        except Exception as exc:
-            log.warning("Could not parse embedded JSON script: %s",exc)
+    # Try all embedded data scripts, not only scripts with a specific ID/type.
+    for attrs,body in re.findall(r"<script\b([^>]*)>(.*?)</script\s*>",raw,flags=re.I|re.S):
+        if not body.strip(): continue
+        parsed=[]
+        try: parsed.append(json.loads(html.unescape(body.strip())))
+        except Exception: pass
+        # JS scripts frequently declare an array/object in a named variable.
+        for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([\[{])",body):
+            val=_balanced_js_value(body,match.start(2))
+            if val is not None: parsed.append(val)
+        for obj in parsed:
+            rows=_generic_question_rows(obj)
+            if rows:
+                candidates.append([_adapt_generic_row(r,"Other / Unclassified","Adaptive embedded HTML import") for r in rows if isinstance(r,dict)])
 
-    # Format C: const DATA = [...] (question-per-object JavaScript data).
-    data_payload=_js_value_after_assignment(raw,("DATA","questions","quizData","questionData"))
-    if isinstance(data_payload,list) and data_payload:
-        converted=[]
-        for row in data_payload:
-            if not isinstance(row,dict): continue
-            opts_raw=row.get("opts",row.get("options",row.get("choices",{})))
-            opts={LETTERS[i]:str(v) for i,v in enumerate(opts_raw[:5]) if v is not None and _norm(v)} if isinstance(opts_raw,list) else opts_raw
-            correct=_answer_index_to_letter(row.get("ans",row.get("answer",row.get("correct_option"))),len(opts))
-            exp=_norm(row.get("exp",row.get("explanation", "")))
-            hi=_norm(row.get("hi",row.get("question_hi", "")))
-            q=_norm(row.get("q",row.get("question",row.get("question_en", ""))))
-            if hi: q=(q+"\n"+hi).strip()
-            subject=_norm(row.get("section") or row.get("subject") or row.get("category") or "Other / Unclassified")
-            topic=_norm(row.get("subtopic") or row.get("topic") or row.get("page") or "")
-            converted.append({"question":q,"options":opts,"correct_answer":correct,"explanation":exp,"subject":subject,"topic":topic or None,"source":"JavaScript DATA HTML import"})
-        if converted: return converted
+    # Search assignments anywhere in the document, including minified scripts and unconventional variable names.
+    for match in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([\[{])",raw):
+        name=match.group(1); val=_balanced_js_value(raw,match.start(2))
+        if val is None: continue
+        rows=_generic_question_rows(val)
+        if rows:
+            candidates.append([_adapt_generic_row(r,"Other / Unclassified",f"JavaScript {name} import") for r in rows if isinstance(r,dict)])
 
-    # Fallback: general JSON script or conventional JS arrays.
-    for pattern in (r"(?:const|let|var)\s+(?:questions|quizData|questionData)\s*=\s*(\[.*?\])\s*;",r"<script[^>]*type=['\"]application/json['\"][^>]*>(.*?)</script>"):
-        for match in re.finditer(pattern,raw,flags=re.I|re.S):
-            try:
-                candidate=json.loads(html.unescape(match.group(1)))
-                return _flatten_chapters(candidate)
-            except Exception: pass
+    # Last structured-data fallback: locate JSON-looking arrays/objects anywhere, useful for
+    # JSON blobs in data attributes or scripts with missing/malformed type attributes.
+    decoder=json.JSONDecoder()
+    for m in re.finditer(r"[\[{]",raw):
+        # Avoid rescanning every nested bracket in huge documents.
+        if m.start() and raw[m.start()-1] not in "=:[,\n\r\t ": continue
+        val=_balanced_js_value(raw,m.start())
+        if val is None: continue
+        rows=_generic_question_rows(val)
+        if rows:
+            candidates.append([_adapt_generic_row(r,"Other / Unclassified","Embedded structured-data import") for r in rows if isinstance(r,dict)])
 
-    raise ValueError("Could not recognize this HTML question format. Supported: embedded JSON scripts, chapter-wrapped questions, const DATA/RAW arrays, and common JSON-compatible quiz arrays. The importer never executes uploaded JavaScript.")
+    # DOM/text fallback for HTML quizzes that render questions as ordinary elements or tables.
+    # This is intentionally conservative: only records with a question and at least two options survive normalization.
+    text_parser=_VisibleTextExtractor()
+    try:
+        text_parser.feed(raw)
+        visible="\n".join(text_parser.parts)
+        pattern=re.compile(r"(?ims)(?:^|\n)\s*(?:Q(?:uestion)?\s*)?(\d{1,5})\s*[.)\-:]\s*(.+?)(?=(?:\n\s*[A-E][.)]\s)|\Z)")
+        rows=[]
+        for qm in pattern.finditer(visible):
+            block=qm.group(2).strip(); optmatches=list(re.finditer(r"(?im)(?:^|\n)\s*([A-E])[.)]\s*(.+?)(?=(?:\n\s*[A-E][.)]\s)|\Z)",block))
+            if len(optmatches)<2: continue
+            firstopt=optmatches[0].start(); qtext=block[:firstopt].strip()
+            opts={om.group(1):om.group(2).strip() for om in optmatches}
+            answer_match=re.search(r"(?im)(?:correct\s+answer|answer|ans|सही\s+उत्तर)\s*[:：\-]\s*\(?([A-E])\)?",block)
+            explanation_match=re.search(r"(?im)(?:explanation|solution|व्याख्या)\s*[:：]\s*(.+)$",block)
+            rows.append({"question":qtext,"options":opts,"correct_answer":answer_match.group(1) if answer_match else None,
+                         "explanation":explanation_match.group(1).strip() if explanation_match else "","subject":"Other / Unclassified","source":"Visible HTML text import"})
+        if rows: candidates.append(rows)
+    except Exception: pass
+
+    # Prefer the candidate with the largest plausible question set. Duplicate candidates can arise
+    # because a single payload is discoverable both in a script and as a global assignment.
+    plausible=[]
+    for candidate in candidates:
+        if not candidate: continue
+        cleaned=[r for r in candidate if isinstance(r,dict) and _norm(_get(r,"question","question_en","q","prompt","stem"))]
+        if cleaned: plausible.append(cleaned)
+    if plausible:
+        return max(plausible,key=len)
+    raise ValueError("Could not identify a usable question set in this HTML. The importer tried embedded JSON, JavaScript arrays/objects, nested chapter data and visible HTML question blocks. This file may use an unsupported layout, encrypted data, or dynamically fetched questions. No uploaded JavaScript was executed.")
 
 
 def parse_file(filename: str, raw: bytes, subject: str, owner_id: int) -> tuple[list[dict], str]:

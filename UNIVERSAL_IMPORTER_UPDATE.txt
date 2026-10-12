@@ -1,0 +1,19 @@
+BPSC Nexus — Universal HTML Importer Update
+
+Replace only the repository-root file:
+  question_bank.py
+
+This update broadens HTML detection to inspect embedded JSON scripts, JSON-compatible JavaScript arrays/objects with varying variable names, nested chapter/subject wrappers, common bilingual question schemas, and a conservative visible-text fallback. It never executes uploaded JavaScript.
+
+Validated locally against the three supplied sample HTML files:
+- Current_Quiz_2026_Complete_Interactive.html: 683 detected, 0 invalid
+- BpscNexus_Speedy_Current_Affairs_2026_FINAL_ENGLISH.html: 3,739 detected, 0 invalid
+- BPSCVEERS_EPFO_1900_MCQ_Quiz.html: 1,912 detected, 0 invalid
+Also passed synthetic checks for alternate JSON script IDs, unconventional JS array names, nested data wrappers, and zero-based answer indices.
+
+Important limitations:
+- “Universal” means adaptive to many common structures, not literally every HTML file.
+- Encrypted/obfuscated payloads, questions fetched only from a remote API, unusual DOM layouts, and answer formats without machine-readable keys may still need a format-specific adapter.
+- The importer does not execute scripts, fetch external resources, or infer missing correct answers. Always inspect preview/invalid counts before confirming import.
+
+No database schema changes are included in this parser-only update. Keep all existing database records and environment variables unchanged.
