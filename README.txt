@@ -1,13 +1,16 @@
-BPSC Nexus — Group Quiz Startup Speed Fix
+BPSC Nexus Group Quiz — Advisory Lock Fix
 
-Replace the existing group_quiz.py with the included file. No database reset is required.
-Commit/push to GitHub and redeploy the Telegram bot service on Render.
+Files:
+- bot.py
+- group_quiz.py
 
-Performance changes:
-- First question is published immediately after the launch confirmation; the scheduler remains as a recovery fallback.
-- Removed the artificial five-second delay before a session becomes due.
-- Batch-inserts question-range snapshots and session question snapshots to reduce serial database round-trips for large quizzes.
-- Reduced scheduler polling interval to 0.75 seconds for faster progression/recovery.
-- Preserves the one-active-quiz-per-group advisory-lock/reconciliation safeguards and completed-report recovery logic.
+Fix:
+PostgreSQL pg_advisory_xact_lock(int, bigint) is not a valid overload. The two group-quiz lock sites now use the supported single-bigint overload with hashtextextended(), namespaced by group chat ID. This preserves per-group locking without casting Telegram's 64-bit chat IDs down to 32-bit integers.
 
-Validation: Python syntax compilation and ZIP integrity checks only. Live Telegram/PostgreSQL performance was not tested.
+Deployment:
+1. Replace both files in the GitHub repository with these files.
+2. Commit and push.
+3. Redeploy the existing Render bot service.
+4. Do not reset or delete the database.
+
+Checks: Python syntax compilation passed for both files; ZIP integrity checked after packaging. Live PostgreSQL/Telegram integration was not run in this environment.

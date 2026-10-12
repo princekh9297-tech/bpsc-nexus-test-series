@@ -430,7 +430,7 @@ async def group_quiz_schedule_command(update: Update, context: ContextTypes.DEFA
         cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,user.id)); quiz=await cur.fetchone()
         if not quiz:
             await message.reply_text("Published quiz not found."); return
-        await conn.execute("SELECT pg_advisory_xact_lock(741923, %s)", (int(chat.id),))
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 741923))", (f"bpsc_nexus_group_quiz:{int(chat.id)}",))
         active_id = await _reconcile_chat_quizzes(conn, chat.id)
         if active_id is not None:
             await message.reply_text(f"This group already has live or scheduled quiz session #{active_id}. Finish it before scheduling another."); return
@@ -675,7 +675,7 @@ async def _launch_pending_quiz(q,context,pool,pending,user):
         if len(prepared)!=int(expected_count):
             await q.answer(f"That fixed range contains {int(expected_count)-len(prepared)} question(s) that cannot be displayed as Telegram polls. Choose a different range so no question is silently omitted.",show_alert=True); return True
         random.shuffle(prepared)
-        await conn.execute("SELECT pg_advisory_xact_lock(741923, %s)", (int(chat_id),))
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 741923))", (f"bpsc_nexus_group_quiz:{int(chat_id)}",))
         active_id = await _reconcile_chat_quizzes(conn, chat_id)
         if active_id is not None:
             await q.answer(f"This group already has live or scheduled quiz session #{active_id}. Finish it first.",show_alert=True); return True
