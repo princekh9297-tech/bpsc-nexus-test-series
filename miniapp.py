@@ -144,6 +144,34 @@ async def _result_payload(conn, attempt_id: int, telegram_id: int):
             "negative_marks": float(attempt["negative_marks"]), "subject_breakdown": subject_breakdown, "review": review}
 
 
+
+VALID_THEMES = {"graphite", "emerald", "amethyst", "ivory"}
+
+async def get_theme_preference(request):
+    user_id = request["telegram_user"]["id"]
+    async with request.app["pool"].connection() as conn:
+        cur = await conn.execute("SELECT preference_value FROM bpsc_nexus_user_preferences WHERE telegram_id=%s AND preference_key='theme'", (user_id,))
+        row = await cur.fetchone()
+    theme = row["preference_value"] if row else "graphite"
+    if theme not in VALID_THEMES:
+        theme = "graphite"
+    return json_response({"theme": theme})
+
+async def save_theme_preference(request):
+    user_id = request["telegram_user"]["id"]
+    try:
+        body = await request.json()
+        theme = str(body.get("theme", ""))
+    except Exception:
+        return json_response({"error": "Invalid preference payload."}, 400)
+    if theme not in VALID_THEMES:
+        return json_response({"error": "Unsupported theme."}, 400)
+    async with request.app["pool"].connection() as conn:
+        await conn.execute("""INSERT INTO bpsc_nexus_user_preferences(telegram_id, preference_key, preference_value, updated_at)
+            VALUES(%s, 'theme', %s, NOW())
+            ON CONFLICT(telegram_id, preference_key) DO UPDATE SET preference_value=EXCLUDED.preference_value, updated_at=NOW()""", (user_id, theme))
+    return json_response({"saved": True, "theme": theme})
+
 async def index(request):
     # Resolve frontend relative to this file, not the process working directory.
     page = ROOT / "static" / "index.html"
@@ -460,8 +488,16 @@ async def startup(app):
     pool = AsyncConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, open=False, kwargs={"row_factory": dict_row, "connect_timeout": 10})
     await pool.open(); await pool.wait()
     await qb.ensure_schema(pool)
+    async with pool.connection() as conn:
+        await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_user_preferences (
+            telegram_id BIGINT NOT NULL,
+            preference_key TEXT NOT NULL,
+            preference_value TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (telegram_id, preference_key)
+        )""")
     app["pool"] = pool
-    log.info("Mini App API connected; question bank schema verified.")
+    log.info("Mini App API connected; question bank schema and user preferences verified.")
 
 
 async def cleanup(app):
@@ -475,6 +511,8 @@ def make_app():
     app.router.add_get("/", index)
     app.router.add_get("/static/{filename}", static_asset)
     app.router.add_get("/healthz", health)
+    app.router.add_get("/api/preferences/theme", get_theme_preference)
+    app.router.add_put("/api/preferences/theme", save_theme_preference)
     app.router.add_get("/api/quizzes", list_quizzes)
     app.router.add_get("/api/history", attempt_history)
     app.router.add_get("/api/quiz-builder/meta", quiz_builder_meta)
