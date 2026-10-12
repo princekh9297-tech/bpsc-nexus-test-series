@@ -396,8 +396,45 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
             [InlineKeyboardButton("All questions",callback_data="qb:liststatus:all:0")],
             [InlineKeyboardButton("Verified / Ready",callback_data="qb:liststatus:ready:0"),InlineKeyboardButton("Pending",callback_data="qb:liststatus:pending:0")],
             [InlineKeyboardButton("Archived",callback_data="qb:liststatus:archived:0")],
-            [InlineKeyboardButton("🧹 Delete archived questions",callback_data="qb:purgearchivedconfirm")],
+            [InlineKeyboardButton("🧹 Bulk delete ALL questions",callback_data="qb:bulkstatus:all")],
+            [InlineKeyboardButton("Delete all Ready",callback_data="qb:bulkstatus:ready"),InlineKeyboardButton("Delete all Pending",callback_data="qb:bulkstatus:pending")],
+            [InlineKeyboardButton("Delete all Archived",callback_data="qb:bulkstatus:archived")],
             [InlineKeyboardButton("⬅ Question Bank menu",callback_data="qb:home")]])); return
+    if data.startswith("qb:bulkstatus:"):
+        status=data.rsplit(":",1)[1]
+        if status not in {"all","ready","pending","archived"}:
+            await q.edit_message_text("Invalid bulk-delete filter.",reply_markup=admin_keyboard()); return
+        async with pool.connection() as conn:
+            if status == "all":
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank")
+            else:
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status=%s",(status,))
+            count=int((await cur.fetchone())["n"])
+        if count == 0:
+            await q.edit_message_text(f"No {status} questions to delete.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to deletion",callback_data="qb:deletehub")]])); return
+        context.user_data["qb_bulk_status"] = status
+        label = "ALL questions" if status == "all" else f"all {status} questions"
+        await q.edit_message_text(
+            f"⚠️ BULK DELETE CONFIRMATION\n\nYou are about to permanently delete {count} {label}.\n\nThis removes those questions from quiz sets and removes answer-level attempt records for those questions. Aggregate attempt totals remain. This cannot be undone.\n\nContinue only if this is the intended group.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑 Permanently delete {count}",callback_data="qb:bulkstatusconfirm")],[InlineKeyboardButton("Cancel",callback_data="qb:deletehub")]])
+        ); return
+    if data == "qb:bulkstatusconfirm":
+        status=context.user_data.get("qb_bulk_status")
+        if status not in {"all","ready","pending","archived"}:
+            await q.edit_message_text("Bulk-delete selection expired. Start again.",reply_markup=admin_keyboard()); return
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                if status == "all":
+                    await conn.execute("DELETE FROM bank_quiz_questions WHERE question_id IN (SELECT id FROM question_bank)")
+                    await conn.execute("DELETE FROM bank_quiz_attempt_answers WHERE question_id IN (SELECT id FROM question_bank)")
+                    cur=await conn.execute("DELETE FROM question_bank RETURNING id")
+                else:
+                    await conn.execute("DELETE FROM bank_quiz_questions WHERE question_id IN (SELECT id FROM question_bank WHERE status=%s)",(status,))
+                    await conn.execute("DELETE FROM bank_quiz_attempt_answers WHERE question_id IN (SELECT id FROM question_bank WHERE status=%s)",(status,))
+                    cur=await conn.execute("DELETE FROM question_bank WHERE status=%s RETURNING id",(status,))
+                deleted=len(await cur.fetchall())
+        context.user_data.pop("qb_bulk_status",None)
+        await q.edit_message_text(f"✅ Bulk deletion complete.\n\nQuestions permanently deleted: {deleted}\nFilter: {status.title()}\n\nNo database tables were dropped.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Delete another group",callback_data="qb:deletehub")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
     if data.startswith("qb:liststatus:"):
         _,_,status,page=data.split(":",3); page=max(0,int(page)); await show_question_list(q,pool,status,page); return
     if data == "qb:bulkdelete":

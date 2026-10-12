@@ -1,30 +1,17 @@
-# BPSC Nexus — Admin Panel Refinement (Admin-only patch)
+# BPSC Nexus Admin Panel — Bulk Delete Fix
 
-This package contains only the two Python files needed for the Telegram admin-panel update:
-- `bot.py`
-- `question_bank.py`
+## What changed
+- The Question deletion screen now has button-driven bulk actions: delete all questions, all Ready, all Pending, or all Archived.
+- Each action first counts the matching rows and presents an explicit confirmation button with the count.
+- Confirmed bulk deletion removes quiz links and answer-level attempt rows for only the matching questions, then deletes those question records in one database transaction.
+- The original ID-based bulk delete remains available when you want to remove a specific subset.
+- No database tables are dropped and no schema migration is required.
 
-No Mini App files, database migrations, schema resets, or Battle Arena code are included.
+## Deploy
+1. Back up your GitHub repository.
+2. Replace only `question_bank.py` with the included file (keep the existing `bot.py` from your current deployment if it already routes `qb:` callbacks to `question_bank.handle_callback`).
+3. Commit and deploy the bot service.
+4. In Telegram, open the private admin panel → Question Bank & Quiz Studio → Delete Questions.
+5. Choose a bulk-delete button, review the matching count, then press the explicit permanent-delete confirmation.
 
-## New button-led admin tools
-- Add One Question: select subject, send a formatted MCQ, preview it, then confirm save.
-- Delete Questions: browse all, ready, pending, or archived questions with pagination.
-- Per-question permanent delete with a confirmation screen; removes the question from quiz sets first.
-- Bulk Delete by IDs: press the button, enter comma/space-separated question IDs, review the list, and confirm.
-- Delete Archived Questions: bulk cleanup with confirmation.
-- Existing search/edit/archive, import/undo, quiz management, pending verification, and quality audit remain available.
-
-## Deletion behavior
-Permanent deletion removes matching `bank_quiz_questions` links and answer-level `bank_quiz_attempt_answers` rows that would otherwise prevent deletion. Aggregate attempt totals remain, but answer-level history for deleted questions is removed. The confirmation screen explains that deletion cannot be undone.
-
-## Apply safely
-1. Back up the current GitHub repository first.
-2. Replace only `bot.py` and `question_bank.py` with these files.
-3. Keep existing Render environment variables and the same PostgreSQL database.
-4. Do not reset the database or run a destructive migration.
-5. Deploy and test the admin panel in a private chat as an authorized admin.
-
-## Checks performed
-- Python compilation passed for both files.
-- Callback paths and button-driven flows were checked statically.
-- Live Telegram/Render/database testing has not been performed in this environment.
+**Warning:** Bulk deletion is permanent. `ALL questions` deletes every record in `question_bank`. Prefer a status-specific action if that is what you intend. Quiz links and answer-level attempts for deleted questions are removed; aggregate attempt totals remain.
