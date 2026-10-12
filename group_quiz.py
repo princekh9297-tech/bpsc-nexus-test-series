@@ -881,11 +881,30 @@ async def scheduler(application, pool):
     while True:
         try:
             async with pool.connection() as conn:
-                cur = await conn.execute("SELECT * FROM group_quiz_sessions WHERE (status='active' AND next_at<=NOW()) OR (status='completed' AND report_sent=FALSE) ORDER BY next_at,id LIMIT 10")
+                # Recover sessions whose final question finished even if next_at/current_index
+                # were left stale by an older deployment or a restart. The NOT EXISTS clause
+                # only matches sessions where no question remains pending, posting, or open.
+                cur = await conn.execute("""SELECT s.* FROM group_quiz_sessions s
+                    WHERE (s.status='active' AND (
+                        s.next_at<=NOW()
+                        OR s.current_index>=s.questions_count
+                        OR (
+                            EXISTS (SELECT 1 FROM group_quiz_session_questions q
+                                    WHERE q.session_id=s.id AND q.status='closed')
+                            AND NOT EXISTS (SELECT 1 FROM group_quiz_session_questions q
+                                            WHERE q.session_id=s.id AND q.status IN ('pending','posting','open'))
+                        )
+                    )) OR (s.status='completed' AND s.report_sent=FALSE)
+                    ORDER BY s.next_at,s.id LIMIT 10""")
                 sessions = await cur.fetchall()
             for session in sessions:
                 sid = int(session["id"]); position = int(session["current_index"])
                 if session.get("status") == "completed":
+                    await _finish_session(application, pool, session)
+                    continue
+                # Finalization takes priority over membership checks: a quiz that has
+                # already exhausted its questions must produce its results, not be cancelled.
+                if position >= int(session["questions_count"]):
                     await _finish_session(application, pool, session)
                     continue
                 if not await _group_is_authorized(pool, int(session["chat_id"])):
@@ -895,9 +914,6 @@ async def scheduler(application, pool):
                         await application.bot.send_message(chat_id=int(session["chat_id"]), text="🔒 BPSC Nexus Quiz membership is inactive for this group. This quiz has been stopped.")
                     except Exception:
                         log.info("Could not notify group %s about inactive membership", session["chat_id"])
-                    continue
-                if position >= int(session["questions_count"]):
-                    await _finish_session(application, pool, session)
                     continue
                 async with pool.connection() as conn:
                     cur = await conn.execute("SELECT * FROM group_quiz_session_questions WHERE session_id=%s AND position=%s", (sid, position))
@@ -922,6 +938,15 @@ async def scheduler(application, pool):
                     if next_pos >= int(session["questions_count"]):
                         async with pool.connection() as conn:
                             cur = await conn.execute("SELECT * FROM group_quiz_sessions WHERE id=%s", (sid,)); fresh = await cur.fetchone()
+                        await _finish_session(application, pool, fresh)
+                elif question["status"] == "closed":
+                    # Backward-compatible recovery for sessions from older code that
+                    # closed the poll but failed to advance current_index.
+                    async with pool.connection() as conn:
+                        await conn.execute("UPDATE group_quiz_sessions SET current_index=GREATEST(current_index,%s),next_at=NOW() WHERE id=%s AND status='active'", (position + 1, sid))
+                        cur = await conn.execute("SELECT * FROM group_quiz_sessions WHERE id=%s", (sid,))
+                        fresh = await cur.fetchone()
+                    if fresh and int(fresh["current_index"]) >= int(fresh["questions_count"]):
                         await _finish_session(application, pool, fresh)
                 elif question["status"] == "failed":
                     async with pool.connection() as conn:
