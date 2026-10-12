@@ -204,20 +204,18 @@ async def post_init(application: Application) -> None:
     await qb.ensure_schema(pool)
     await gq.ensure_schema(pool)
     application.bot_data["db_pool"] = pool
-    application.bot_data["group_quiz_scheduler_task"] = application.create_task(gq.scheduler(application, pool), name="bpsc-nexus-group-quiz-scheduler")
     try:
         await application.bot.set_my_commands([
-            BotCommand("start", "Open BPSC Nexus"),
-            BotCommand("quiz", "Browse quizzes"),
-            BotCommand("tests", "Browse published tests"),
-            BotCommand("mypremium", "Check membership"),
-            BotCommand("help", "Help and commands"),
+            BotCommand("start", "Open BPSC Nexus Mini App"),
+            BotCommand("mypremium", "View membership status"),
+            BotCommand("tutorial", "How to use BPSC Nexus"),
+            BotCommand("help", "Open the quick tutorial"),
         ], scope=BotCommandScopeAllPrivateChats())
+        # Quiz-taking commands are intentionally not exposed in groups; attempts belong in the Mini App.
         await application.bot.set_my_commands([
-            BotCommand("groupquiz", "Admin: configure a group quiz"),
-            BotCommand("groupquiz_schedule", "Admin: schedule a future quiz (UTC)"),
-            BotCommand("grouprank", "Show this group's cumulative quiz leaderboard"),
-            BotCommand("help", "Help and commands"),
+            BotCommand("start", "Open BPSC Nexus"),
+            BotCommand("tutorial", "How to use BPSC Nexus"),
+            BotCommand("help", "Open the quick tutorial"),
         ], scope=BotCommandScopeAllGroupChats())
     except Exception:
         logger.exception("Could not register Telegram command menus")
@@ -363,37 +361,45 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if user is None or message is None:
         return
     await save_user(update)
-    # Shareable quiz deep links use /start quiz_<id> and are always re-validated against publication status.
     if context.args and context.args[0].startswith("quiz_"):
-        try:
-            shared_quiz_id=int(context.args[0].split("_",1)[1])
-        except (ValueError, IndexError):
-            shared_quiz_id=0
-        if shared_quiz_id and pool is not None:
-            async with pool.connection() as conn:
-                cur=await conn.execute("SELECT q.id,q.title,q.subject,COUNT(qq.question_id) AS n FROM bank_quizzes q JOIN bank_quiz_questions qq ON qq.quiz_id=q.id JOIN question_bank qb ON qb.id=qq.question_id AND qb.status='ready' WHERE q.id=%s AND q.is_published=TRUE AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s) GROUP BY q.id",(shared_quiz_id,user.id))
-                shared=await cur.fetchone()
-            if shared:
-                await message.reply_text(f"🧩 Shared BPSC Nexus quiz\n\n{shared['title']}\n{shared['subject']} · {shared['n']} questions\n\nChoose how you want to attempt it.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Practice",callback_data=f"play:mode:practice:{shared_quiz_id}"),InlineKeyboardButton("⏱ Exam",callback_data=f"play:mode:exam:{shared_quiz_id}")],[InlineKeyboardButton("Browse all quizzes",callback_data="play:list")]]))
-                return
-            await message.reply_text("This shared quiz is unavailable or is no longer published. Use /quiz to browse available tests.")
-            return
-    passes = await active_passes_for_user(user.id)
-    lines = [
-        "Welcome to BPSC Nexus | Prelims Test Series!",
-        "",
-        f"Active pass entitlements: {len(passes)}",
-        "Use the buttons below or commands /tests and /mypremium.",
-    ]
-    keyboard = [[InlineKeyboardButton("📚 Browse Tests", callback_data="user:tests")],
-                [InlineKeyboardButton("🧩 Take a Quiz", callback_data="user:quizzes")]]
-    if MINI_APP_URL.startswith("https://"):
-        keyboard.append([InlineKeyboardButton("🚀 Open Personal CBT", web_app=WebAppInfo(url=MINI_APP_URL))])
-    keyboard.append([InlineKeyboardButton("💎 My Membership", callback_data="user:premium")])
-    if is_admin(update):
-        keyboard.append([InlineKeyboardButton("🛡️ Open Admin Panel", callback_data="adm:home")])
-    await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
+        await message.reply_text("This quiz is available only inside the BPSC Nexus Mini App. Open the app below.", reply_markup=main_user_keyboard())
+        return
+    await message.reply_text(
+        f"Welcome to BPSC Nexus, {user.first_name or 'Aspirant'}!\n\nYour quizzes, planner, results and study tools are available in the Mini App.",
+        reply_markup=main_user_keyboard(),
+    )
 
+
+def main_user_keyboard() -> InlineKeyboardMarkup:
+    keyboard = []
+    if MINI_APP_URL.startswith("https://"):
+        keyboard.append([InlineKeyboardButton("🚀 Open BPSC Nexus Mini App", web_app=WebAppInfo(url=MINI_APP_URL))])
+    else:
+        keyboard.append([InlineKeyboardButton("🚀 Open Mini App", callback_data="user:openapp")])
+    keyboard.extend([
+        [InlineKeyboardButton("💎 My Membership", callback_data="user:premium")],
+        [InlineKeyboardButton("📘 Tutorial", callback_data="user:tutorial")],
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def tutorial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    if not is_private(update):
+        await message.reply_text("Please open a private chat with BPSC Nexus to launch the Mini App and view the tutorial.")
+        return
+    await message.reply_text(
+        "📘 BPSC Nexus — Quick Tutorial\n\n"
+        "1. Tap Open Mini App to enter your study workspace.\n"
+        "2. Use Test Series to attempt published quizzes.\n"
+        "3. Use Create to build a quiz from the available question bank.\n"
+        "4. Use the Study Planner to manage tasks.\n"
+        "5. Check Analytics for submitted quiz results and use Profile to change themes.\n\n"
+        "Quiz attempts are available only inside the Mini App.",
+        reply_markup=main_user_keyboard(),
+    )
 
 async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_private(update):
@@ -436,24 +442,7 @@ async def question_bank_poll_handler(update: Update, context: ContextTypes.DEFAU
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if message is None:
-        return
-    if not is_private(update):
-        await message.reply_text("BPSC Nexus group commands\n\n/groupquiz — Start a group quiz (group admins)\n/groupquiz_schedule — Schedule a quiz in UTC (group admins)\n/grouprank — View this group's cumulative leaderboard\n/help — Show commands")
-        return
-    text = (
-        "BPSC Nexus Test Series\n\n"
-        "/start — Open the bot\n"
-        "/tests — Browse existing published tests\n"
-        "/quiz — Take a published question-bank quiz\n"
-        "/mypremium — Check your membership\n"
-        "/help — Show this help"
-    )
-    if is_admin(update):
-        text += "\n/admin — Open the private admin panel"
-    await message.reply_text(text)
-
+    await tutorial_command(update, context)
 
 async def mypremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_private(update):
@@ -463,31 +452,18 @@ async def mypremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if user is None or message is None:
         return
     await save_user(update)
-    # Shareable quiz deep links use /start quiz_<id> and are always re-validated against publication status.
-    if context.args and context.args[0].startswith("quiz_"):
-        try:
-            shared_quiz_id=int(context.args[0].split("_",1)[1])
-        except (ValueError, IndexError):
-            shared_quiz_id=0
-        if shared_quiz_id and pool is not None:
-            async with pool.connection() as conn:
-                cur=await conn.execute("SELECT q.id,q.title,q.subject,COUNT(qq.question_id) AS n FROM bank_quizzes q JOIN bank_quiz_questions qq ON qq.quiz_id=q.id JOIN question_bank qb ON qb.id=qq.question_id AND qb.status='ready' WHERE q.id=%s AND q.is_published=TRUE AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s) GROUP BY q.id",(shared_quiz_id,user.id))
-                shared=await cur.fetchone()
-            if shared:
-                await message.reply_text(f"🧩 Shared BPSC Nexus quiz\n\n{shared['title']}\n{shared['subject']} · {shared['n']} questions\n\nChoose how you want to attempt it.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Practice",callback_data=f"play:mode:practice:{shared_quiz_id}"),InlineKeyboardButton("⏱ Exam",callback_data=f"play:mode:exam:{shared_quiz_id}")],[InlineKeyboardButton("Browse all quizzes",callback_data="play:list")]]))
-                return
-            await message.reply_text("This shared quiz is unavailable or is no longer published. Use /quiz to browse available tests.")
-            return
     passes = await active_passes_for_user(user.id)
     if not passes:
-        await message.reply_text("You currently have standard access. No active Premium Pass was found.")
+        await message.reply_text(
+            "💎 My Membership\n\nNo active Premium Pass was found on your account. Your standard Mini App access remains available.",
+            reply_markup=main_user_keyboard(),
+        )
         return
     lines = ["💎 Your active Premium Passes", ""]
     for item in passes:
         lines.append(f"• {pass_label(item['pass_code'], item['vault_keys'])}")
         lines.append(f"  {duration_label(item['expires_at'])}")
-    await message.reply_text("\n".join(lines))
-
+    await message.reply_text("\n".join(lines), reply_markup=main_user_keyboard())
 
 async def tests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_private(update):
@@ -772,7 +748,9 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if query is None:
         return
     data = query.data or ""
-    if await gq.route_callback(update, context, pool):
+    # Legacy Telegram quiz buttons must never start or continue a quiz attempt.
+    if data.startswith("play:"):
+        await query.answer("Quiz attempts are available only inside the BPSC Nexus Mini App.", show_alert=True)
         return
     handled = await qb.route_callback(update, context, pool, admin_only(update))
     if handled:
@@ -1028,15 +1006,17 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # User callbacks never expose admin actions.
-    if data == "user:tests":
-        await query.answer()
-        await tests_command(update, context)
-    elif data == "user:premium":
+    if data == "user:premium":
         await query.answer()
         await mypremium_command(update, context)
-    elif data == "user:quizzes":
+    elif data == "user:tutorial":
         await query.answer()
-        await quiz_command(update, context)
+        await tutorial_command(update, context)
+    elif data == "user:openapp":
+        await query.answer()
+        await query.message.reply_text("Set MINI_APP_URL to your Mini App's public HTTPS URL in the bot service settings, then reopen /start.")
+    elif data in {"user:tests", "user:quizzes"}:
+        await query.answer("Please open BPSC Nexus Mini App to access quizzes.", show_alert=True)
     else:
         await query.answer("This action is no longer available.", show_alert=True)
 
@@ -1164,13 +1144,8 @@ def main() -> None:
     )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("tests", tests_command))
-    application.add_handler(CommandHandler("quiz", quiz_command))
-    application.add_handler(CommandHandler("groupquiz", gq.group_quiz_command))
-    application.add_handler(CommandHandler("groupquiz_schedule", gq.group_quiz_schedule_command))
-    application.add_handler(CommandHandler("grouprank", gq.group_leaderboard_command))
-    application.add_handler(PollAnswerHandler(gq.group_poll_answer))
     application.add_handler(CommandHandler("mypremium", mypremium_command))
+    application.add_handler(CommandHandler("tutorial", tutorial_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(admin_callback))
     application.add_handler(MessageHandler(filters.Document.ALL, question_bank_file_handler))

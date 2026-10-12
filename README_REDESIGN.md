@@ -30,3 +30,12 @@ This package preserves the existing bot, group quiz engine, question bank module
 ## Data safety
 
 All new planner and arena records are keyed to authenticated Telegram user IDs. The existing quiz bank, attempts, bot data, and shared database tables are not dropped. Take a database backup before any deployment, as you should for every production release.
+
+
+## V7 refinement and user-access policy
+
+V7 is a refinement release, not a feature expansion. It improves spacing, typography hierarchy, question/option readability, focus states, touch targets, planner controls, bottom navigation, and reduced-motion handling. The five themes and current Mini App workflows are retained.
+
+For ordinary students, the Telegram bot now exposes only `/start`, `/mypremium`, `/tutorial`, and `/help`. Quiz browsing and attempts, including group quiz polls, are routed exclusively through the Mini App. `/admin` and admin-only question-bank import/management remain available to configured administrators as an operational exception because those maintenance screens are not yet in the Mini App. Battle Arena remains a static Coming Soon screen; Arena backend code and API routes were not modified.
+
+No database reset or destructive migration is included. Before deployment, back up the repository, replace the packaged application files, keep existing Render environment variables, and confirm the bot service has the correct `MINI_APP_URL`. This package has passed local syntax checks but has not been verified against the live Render service.
