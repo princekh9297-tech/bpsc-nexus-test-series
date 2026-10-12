@@ -80,6 +80,13 @@ DDL = [
         revoked_at TIMESTAMPTZ
     )""",
     "CREATE INDEX IF NOT EXISTS idx_group_quiz_memberships_active ON group_quiz_memberships(is_active,chat_id)",
+    """CREATE TABLE IF NOT EXISTS group_quiz_admin_reports (
+        session_id BIGINT NOT NULL REFERENCES group_quiz_sessions(id) ON DELETE CASCADE,
+        chunk_no INTEGER NOT NULL,
+        report_text TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(session_id,chunk_no)
+    )""",
 ]
 
 
@@ -169,9 +176,14 @@ async def group_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             JOIN question_bank b ON b.id=qq.question_id AND b.status='ready'
             WHERE q.is_published=TRUE AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s) GROUP BY q.id ORDER BY q.id DESC LIMIT 20""", (user.id,))
         quizzes = await cur.fetchall()
-    buttons = [[InlineKeyboardButton("🧩 Build from Question Bank", callback_data="gq:bank")]]
-    buttons += [[InlineKeyboardButton(f"#{r['id']} · {r['title'][:35]} ({r['n']} Q)", callback_data=f"gq:quiz:{r['id']}")] for r in quizzes]
-    await message.reply_text("🧩 **BPSC Nexus Group Quiz**\n\nBuild a quiz from a fixed subject/range or choose a published quiz. Configure mode, per-question timer and scoring before launch.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    buttons = [[InlineKeyboardButton("🧩 Choose Subject + Fixed Question Range", callback_data="gq:bank")]]
+    buttons += [[InlineKeyboardButton(f"📚 #{r['id']} · {r['title'][:30]} ({r['n']} Q)", callback_data=f"gq:quiz:{r['id']}")] for r in quizzes]
+    buttons.append([InlineKeyboardButton("Cancel", callback_data="gq:cancel")])
+    await message.reply_text(
+        "🧩 **BPSC Nexus Group Quiz**\n\n"
+        "First choose a subject or published quiz, then select the exact question range.\n"
+        "Example: 1–50 today, 51–100 next time. The full bank will NEVER launch without a confirmed range.",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def group_leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -316,6 +328,40 @@ async def group_quiz_schedule_command(update: Update, context: ContextTypes.DEFA
     await message.reply_text(f"📅 Quiz scheduled\n\n#{session_id} · {quiz['title']}\nStarts: {when.isoformat()} (UTC)\nMode: {mode.title()}\nQuestions: {len(prepared)}\nVoting window: {interval}s per question")
 
 
+async def _create_range_quiz(pool, pending, user, startpos: int, endpos: int):
+    """Snapshot a fixed 1-based range from a subject pool or published quiz into a private quiz."""
+    count=endpos-startpos+1
+    if count < 1 or count > 500:
+        return None
+    async with pool.connection() as conn:
+        if pending.get("source_type")=="published_range":
+            cur=await conn.execute("""SELECT b.id FROM bank_quiz_questions qq
+                JOIN question_bank b ON b.id=qq.question_id AND b.status='ready'
+                WHERE qq.quiz_id=%s ORDER BY qq.position OFFSET %s LIMIT %s""",
+                (int(pending["quiz_id"]),startpos-1,count))
+        elif pending.get("subject"):
+            cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' AND subject=%s ORDER BY id OFFSET %s LIMIT %s",
+                (pending["subject"],startpos-1,count))
+        else:
+            cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' ORDER BY id OFFSET %s LIMIT %s",
+                (startpos-1,count))
+        ids=[int(r["id"]) for r in await cur.fetchall()]
+        if len(ids)!=count:
+            return None
+        # Snapshot the exact range first; randomize only its order.
+        random.shuffle(ids)
+        label=str(pending.get("subject_label") or "Question Bank")
+        title=f"Group · {label[:80]} · Q{startpos}-{endpos} · {datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        cur=await conn.execute("""INSERT INTO bank_quizzes(title,description,subject,created_by_telegram_id,is_published,is_custom,custom_owner_telegram_id)
+            VALUES(%s,%s,%s,%s,FALSE,TRUE,%s) RETURNING id""",
+            (title,f"Fixed question range {startpos}-{endpos}; shuffled within selected range",label,user.id,user.id))
+        quiz_id=int((await cur.fetchone())["id"])
+        for pos,qid in enumerate(ids,1):
+            await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)",(quiz_id,pos,qid))
+    return {"quiz_id":quiz_id,"source_type":"range","generated_title":title,"count":count,
+            "range_start":startpos,"range_end":endpos,"range_label":f"{startpos}–{endpos}"}
+
+
 async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, pool) -> bool:
     q = update.callback_query
     if not q or not (q.data or "").startswith("gq:"):
@@ -352,56 +398,61 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
             try: selected=subjects[int(value)]; subject=selected["name"]; label=subject
             except (ValueError,IndexError): await q.answer("Subject selection expired. Run /groupquiz again.",show_alert=True); return True
         eligible=sum(x["n"] for x in subjects) if subject is None else next((x["n"] for x in subjects if x["name"]==subject),0)
-        context.user_data["group_quiz_pending"]={"source_type":"bank","subject":subject,"subject_label":label,"chat_id":chat.id,"chat_title":chat.title or "Telegram group","stage":"range_start","eligible":eligible}
-        await q.answer(); await q.edit_message_text(f"Question pool: {label}\nEligible questions: {eligible}\n\nEnter the START position (1–{eligible}) as a number in this group. Example: 1",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
-    if data.startswith("gq:count:"):
+        context.user_data["group_quiz_pending"]={"source_type":"bank","subject":subject,"subject_label":label,"chat_id":chat.id,"chat_title":chat.title or "Telegram group","stage":"choose_range","eligible":eligible}
+        buttons=[]
+        for startpos in range(1, eligible+1, 50):
+            endpos=min(startpos+49,eligible)
+            buttons.append([InlineKeyboardButton(f"Questions {startpos}–{endpos} ({endpos-startpos+1})",callback_data=f"gq:range:{startpos}:{endpos}")])
+        buttons.append([InlineKeyboardButton("✍️ Custom range…",callback_data="gq:range_custom")])
+        buttons.append([InlineKeyboardButton("Cancel",callback_data="gq:cancel")])
+        await q.answer(); await q.edit_message_text(f"Question pool: {label}\nEligible questions: {eligible}\n\nChoose exactly which questions to use. Each button selects a fixed 50-question block (last block may be shorter). You can also enter a custom range. No questions will start until you confirm the range.",reply_markup=InlineKeyboardMarkup(buttons)); return True
+    if data == "gq:range_custom":
         pending=context.user_data.get("group_quiz_pending")
-        if not pending or pending.get("chat_id")!=chat.id or pending.get("source_type")!="bank":
+        if not pending or pending.get("chat_id")!=chat.id:
             await q.answer("Setup expired. Run /groupquiz again.",show_alert=True); return True
-        try: count=int(data.rsplit(":",1)[1])
-        except ValueError: await q.answer("Invalid count.",show_alert=True); return True
-        if not 1<=count<=100: await q.answer("Count must be 1–100.",show_alert=True); return True
-        async with pool.connection() as conn:
-            base="q.status='ready' AND NOT EXISTS (SELECT 1 FROM group_quiz_session_questions sq JOIN group_quiz_sessions gs ON gs.id=sq.session_id WHERE gs.chat_id=%s AND gs.status='completed' AND sq.question_id=q.id)"
-            params=[chat.id]
-            if pending.get("subject"):
-                base += " AND q.subject=%s"; params.append(pending["subject"])
-            cur=await conn.execute("SELECT q.id FROM question_bank q WHERE "+base+" ORDER BY RANDOM() LIMIT %s",tuple(params+[count]))
-            ids=[int(r["id"]) for r in await cur.fetchall()]
-            if len(ids)<count:
-                # Repeat prevention is best-effort: fall back to the whole eligible pool rather than blocking a valid quiz.
-                if pending.get("subject"):
-                    cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' AND subject=%s ORDER BY RANDOM() LIMIT %s",(pending["subject"],count))
-                else:
-                    cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' ORDER BY RANDOM() LIMIT %s",(count,))
-                ids=[int(r["id"]) for r in await cur.fetchall()]
-            if len(ids)<count:
-                await q.answer(f"Only {len(ids)} eligible questions remain. Choose a smaller count.",show_alert=True); return True
-            title=f"Group · {pending['subject_label']} · {count}Q · {datetime.now(timezone.utc).strftime('%m%d%H%M')}"
-            cur=await conn.execute("""INSERT INTO bank_quizzes(title,description,subject,created_by_telegram_id,is_published,is_custom,custom_owner_telegram_id)
-                VALUES(%s,%s,%s,%s,FALSE,TRUE,%s) RETURNING id""",(title,"Generated from verified question bank for a Telegram group",pending["subject_label"],user.id,user.id))
-            quiz_id=int((await cur.fetchone())["id"])
-            for pos,qid in enumerate(ids,1):
-                await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)",(quiz_id,pos,qid))
-        pending.update({"quiz_id":quiz_id,"source_type":"published","generated_title":title,"count":count})
-        context.user_data["group_quiz_pending"]=pending
-        await q.answer("Question set created.")
-        await q.edit_message_text(f"Question set ready: {title}\n\nChoose answer-reveal mode.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Learning — answer after each poll",callback_data="gq:mode:learning")],[InlineKeyboardButton("⏱ Exam Mode — reveal answers after final submission",callback_data="gq:mode:exam")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+        pending["stage"]="range_start"; context.user_data["group_quiz_pending"]=pending
+        await q.answer(); await q.edit_message_text(f"Enter the START question position (1–{int(pending.get('eligible',0))}). Example: 1",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+    if data.startswith("gq:range:"):
+        pending=context.user_data.get("group_quiz_pending")
+        if not pending or pending.get("chat_id")!=chat.id:
+            await q.answer("Setup expired. Run /groupquiz again.",show_alert=True); return True
+        try:
+            parts=data.split(":")
+            startpos,endpos=int(parts[2]),int(parts[3])
+        except (ValueError,IndexError):
+            await q.answer("Invalid range. Choose it again.",show_alert=True); return True
+        eligible=int(pending.get("eligible",0))
+        if not (1<=startpos<=endpos<=eligible) or endpos-startpos+1>500:
+            await q.answer("Range is invalid or exceeds the 500-question limit.",show_alert=True); return True
+        created=await _create_range_quiz(pool,pending,user,startpos,endpos)
+        if not created:
+            await q.answer("Could not create that range. Check the eligible question count and try again.",show_alert=True); return True
+        pending.update(created); pending["stage"]=None; context.user_data["group_quiz_pending"]=pending
+        await q.answer("Fixed range selected.")
+        await q.edit_message_text(f"✅ Fixed range confirmed: questions {startpos}–{endpos} ({endpos-startpos+1} questions).\nThe questions will be shuffled only within this selected range.\n\nChoose quiz mode:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Learning Mode",callback_data="gq:mode:learning")],[InlineKeyboardButton("📝 Exam Mode",callback_data="gq:mode:exam")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
     if data.startswith("gq:quiz:"):
         quiz_id = int(data.rsplit(":", 1)[1])
         async with pool.connection() as conn:
-            cur = await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE", (quiz_id,))
+            cur = await conn.execute("""SELECT q.id,q.title,q.subject,COUNT(qq.question_id) AS n
+                FROM bank_quizzes q JOIN bank_quiz_questions qq ON qq.quiz_id=q.id
+                JOIN question_bank b ON b.id=qq.question_id AND b.status='ready'
+                WHERE q.id=%s AND q.is_published=TRUE GROUP BY q.id""", (quiz_id,))
             quiz = await cur.fetchone()
         if not quiz:
-            await q.answer("Quiz is not published.", show_alert=True)
+            await q.answer("Quiz is not published or has no eligible questions.", show_alert=True)
             return True
-        context.user_data["group_quiz_pending"] = {"quiz_id": quiz_id, "source_type": "published", "chat_id": chat.id, "chat_title": chat.title or "Telegram group"}
+        eligible=int(quiz["n"])
+        pending={"quiz_id":quiz_id,"source_type":"published_range","subject_label":quiz["title"],"subject":None,
+                 "chat_id":chat.id,"chat_title":chat.title or "Telegram group","stage":"choose_range","eligible":eligible}
+        context.user_data["group_quiz_pending"]=pending
+        buttons=[]
+        for startpos in range(1, eligible+1, 50):
+            endpos=min(startpos+49,eligible)
+            buttons.append([InlineKeyboardButton(f"Questions {startpos}–{endpos} ({endpos-startpos+1})",callback_data=f"gq:range:{startpos}:{endpos}")])
+        buttons.append([InlineKeyboardButton("✍️ Custom range…",callback_data="gq:range_custom")])
+        buttons.append([InlineKeyboardButton("Cancel",callback_data="gq:cancel")])
         await q.answer()
-        await q.edit_message_text(f"Selected: {quiz['title']}\n\nChoose how answers should be revealed.", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧠 Learning — answer after each poll", callback_data="gq:mode:learning")],
-            [InlineKeyboardButton("⏱ Exam Mode — reveal answers after final submission", callback_data="gq:mode:exam")],
-            [InlineKeyboardButton("Cancel", callback_data="gq:cancel")],
-        ]))
+        await q.edit_message_text(f"Selected published quiz: {quiz['title']}\nEligible questions: {eligible}\n\nChoose the exact range to use. The full quiz will not start automatically.",reply_markup=InlineKeyboardMarkup(buttons))
         return True
     if data.startswith("gq:mode:"):
         mode=data.rsplit(":",1)[1]
@@ -418,6 +469,24 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
             [InlineKeyboardButton("Custom time…",callback_data="gq:interval:custom")],
             [InlineKeyboardButton("Cancel",callback_data="gq:cancel")],
         ])); return True
+    if data.startswith("gq:report:"):
+        try: sid=int(data.rsplit(":",1)[1])
+        except ValueError:
+            await q.answer("Invalid report reference.",show_alert=True); return True
+        async with pool.connection() as conn:
+            cur=await conn.execute("""SELECT r.chunk_no,r.report_text FROM group_quiz_admin_reports r
+                JOIN group_quiz_sessions s ON s.id=r.session_id
+                WHERE r.session_id=%s AND s.chat_id=%s AND s.status='completed' ORDER BY r.chunk_no""",(sid,chat.id))
+            reports=await cur.fetchall()
+        if not reports:
+            await q.answer("The report is still being prepared. Tap again in a few seconds.",show_alert=True); return True
+        try:
+            for report in reports:
+                await context.bot.send_message(chat_id=user.id,text=report["report_text"])
+            await q.answer("Detailed analysis sent privately.")
+        except Exception:
+            await q.answer("Open @BpscNexustestbot and press Start, then tap this report button again.",show_alert=True)
+        return True
     if data == "gq:cancel":
         context.user_data.pop("group_quiz_pending", None)
         await q.answer("Cancelled.")
@@ -462,7 +531,7 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
 
 
 def _pending_preview(pending):
-    range_label=(f"{pending.get('range_start')}–{pending.get('range_end')}" if pending.get('range_start') is not None else "Published quiz selection")
+    range_label=(f"{pending.get('range_start')}–{pending.get('range_end')}" if pending.get('range_start') is not None else (pending.get("range_label") or "Not set"))
     count_label=str(pending.get('count')) if pending.get('count') is not None else "From selected quiz"
     return ("🧾 FINAL QUIZ PREVIEW\n\n"
         f"Subject / quiz: {pending.get('subject_label') or pending.get('generated_title') or 'Selected quiz'}\n"
@@ -488,7 +557,9 @@ async def _launch_pending_quiz(q,context,pool,pending,user):
             if len(letters)>=2 and row["correct_option"] in letters: prepared.append((row,opts,letters))
         if not prepared: await q.answer("No valid questions available for Telegram polls.",show_alert=True); return True
         expected_count=pending.get("count")
-        if pending.get("source_type")=="range" and expected_count is not None and len(prepared)!=int(expected_count):
+        if pending.get("source_type")!="range" or expected_count is None:
+            await q.answer("A fixed question range must be selected before launch. Choose a range first.",show_alert=True); return True
+        if len(prepared)!=int(expected_count):
             await q.answer(f"That fixed range contains {int(expected_count)-len(prepared)} question(s) that cannot be displayed as Telegram polls. Choose a different range so no question is silently omitted.",show_alert=True); return True
         random.shuffle(prepared)
         cur=await conn.execute("SELECT id FROM group_quiz_sessions WHERE chat_id=%s AND status='active' LIMIT 1",(chat_id,)); active=await cur.fetchone()
@@ -498,7 +569,8 @@ async def _launch_pending_quiz(q,context,pool,pending,user):
             await conn.execute("INSERT INTO group_quiz_session_questions(session_id,position,question_id,question_en,question_hi,options,option_letters,correct_option,explanation_en,explanation_hi) VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)",(sid,position,row["id"],row["question_en"],row["question_hi"],json.dumps(opts,ensure_ascii=False),json.dumps(letters),row["correct_option"],row["explanation_en"],row["explanation_hi"]))
     context.user_data.pop("group_quiz_pending",None)
     await q.answer("Quiz launched.")
-    await q.edit_message_text(f"✅ Group quiz #{sid} queued\n{quiz['title']}\n{len(prepared)} questions · {mode.title()} Mode · {interval}s/question\nScoring: +{positive:g} correct / −{negative:g} wrong")
+    range_text=f"\nQuestion range: {pending.get('range_start','?')}–{pending.get('range_end','?')}" if pending.get("range_start") is not None else ""
+    await q.edit_message_text(f"✅ Group quiz #{sid} queued\n{quiz['title']}{range_text}\nExactly {len(prepared)} questions · {mode.title()} Mode · {interval}s/question\nScoring: +{positive:g} correct / −{negative:g} wrong")
     return True
 
 
@@ -523,18 +595,11 @@ async def group_quiz_text_input(update: Update,context: ContextTypes.DEFAULT_TYP
         if value<startpos: await message.reply_text(f"End position must be {startpos} or higher."); return True
         count=value-startpos+1
         if count>500: await message.reply_text("Maximum is 500 questions per group quiz. Choose a smaller range."); return True
-        async with pool.connection() as conn:
-            if pending.get("subject"):
-                cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' AND subject=%s ORDER BY id OFFSET %s LIMIT %s",(pending["subject"],startpos-1,count))
-            else: cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' ORDER BY id OFFSET %s LIMIT %s",(startpos-1,count))
-            ids=[int(r["id"]) for r in await cur.fetchall()]
-            if len(ids)!=count: await message.reply_text(f"Only {len(ids)} eligible questions found. Please enter a valid range."); return True
-            random.shuffle(ids)
-            title=f"Group · {pending['subject_label']} · Q{startpos}-{value} · {datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}"
-            cur=await conn.execute("INSERT INTO bank_quizzes(title,description,subject,created_by_telegram_id,is_published,is_custom,custom_owner_telegram_id) VALUES(%s,%s,%s,%s,FALSE,TRUE,%s) RETURNING id",(title,f"Fixed question range {startpos}-{value}; shuffled",pending["subject_label"],user.id,user.id)); quiz_id=int((await cur.fetchone())["id"])
-            for pos,qid in enumerate(ids,1): await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)",(quiz_id,pos,qid))
-        pending.update({"quiz_id":quiz_id,"source_type":"range","generated_title":title,"count":count,"range_end":value,"stage":None}); context.user_data["group_quiz_pending"]=pending
-        await message.reply_text(f"✅ Fixed range {startpos}–{value} saved ({count} questions). Order is shuffled. Choose mode:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Learning Mode",callback_data="gq:mode:learning")],[InlineKeyboardButton("📝 Exam Mode",callback_data="gq:mode:exam")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+        created=await _create_range_quiz(pool,pending,user,startpos,value)
+        if not created:
+            await message.reply_text(f"Could not find all {count} eligible questions in that range. Please choose a valid range."); return True
+        pending.update(created); pending["stage"]=None; context.user_data["group_quiz_pending"]=pending
+        await message.reply_text(f"✅ Fixed range confirmed: questions {startpos}–{value} ({count} questions).\nOnly these questions will be used; order is shuffled within this range.\n\nChoose mode:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Learning Mode",callback_data="gq:mode:learning")],[InlineKeyboardButton("📝 Exam Mode",callback_data="gq:mode:exam")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
     try: value=float(raw)
     except ValueError: await message.reply_text("Enter a valid number."); return True
     if stage=="custom_timer":
@@ -631,7 +696,7 @@ async def _finish_session(application, pool, session):
             FROM group_quiz_answers a JOIN group_quiz_session_questions q USING(session_id,position)
             WHERE a.session_id=%s GROUP BY a.telegram_id ORDER BY
             (COUNT(*) FILTER (WHERE a.selected_letter=q.correct_option)*%s-COUNT(*) FILTER (WHERE a.selected_letter IS NOT NULL AND a.selected_letter<>q.correct_option)*%s) DESC,
-            correct DESC,incorrect ASC,MAX(a.answered_at)-MIN(a.answered_at) ASC,a.telegram_id ASC LIMIT 50""",(sid,positive,negative))
+            correct DESC,incorrect ASC,MAX(a.answered_at)-MIN(a.answered_at) ASC,a.telegram_id ASC""",(sid,positive,negative))
         scores=await conn.fetchall()
         cur=await conn.execute("""SELECT COUNT(DISTINCT telegram_id) AS participants,
             COUNT(*) FILTER (WHERE selected_letter IS NOT NULL) AS votes,
@@ -669,7 +734,10 @@ async def _finish_session(application, pool, session):
         lines.append(f"{rank}. {name} — {score:.2f} pts · {accuracy:.0f}% accuracy · {c}✓ {w}✗ {skipped} unanswered")
     lines += ["","Practice more with @BpscNexustestbot: https://t.me/BpscNexustestbot"]
     # Group summary stays concise; answer key appears in the group only after the Exam Mode has fully submitted.
-    try: await application.bot.send_message(chat_id=int(finished["chat_id"]),text="\n".join(lines)[:3900])
+    try: await application.bot.send_message(
+        chat_id=int(finished["chat_id"]), text="\n".join(lines)[:3900],
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Full Admin Analysis (admins only)",callback_data=f"gq:report:{sid}")]])
+    )
     except Exception: log.exception("Could not publish group quiz summary for %s",sid)
     if finished.get("mode")=="exam":
         key_lines=["📝 Exam answer key (quiz submitted)"]
@@ -715,6 +783,11 @@ async def _finish_session(application, pool, session):
     if buf: chunks.append(buf)
     if chunks:
         chunks[-1] += "\n\nContinue practising with @BpscNexustestbot: https://t.me/BpscNexustestbot"
+    # Persist every report chunk so an admin can retrieve it later from the group button.
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM group_quiz_admin_reports WHERE session_id=%s",(sid,))
+        for chunk_no,chunk in enumerate(chunks,1):
+            await conn.execute("INSERT INTO group_quiz_admin_reports(session_id,chunk_no,report_text) VALUES(%s,%s,%s)",(sid,chunk_no,chunk))
     for chunk in chunks:
         try: await application.bot.send_message(chat_id=int(finished["started_by"]),text=chunk)
         except Exception:
