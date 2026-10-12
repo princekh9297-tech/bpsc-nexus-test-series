@@ -477,8 +477,12 @@ async def _create_range_quiz(pool, pending, user, startpos: int, endpos: int):
             VALUES(%s,%s,%s,%s,FALSE,TRUE,%s) RETURNING id""",
             (title,f"Fixed question range {startpos}-{endpos}; shuffled within selected range",label,user.id,user.id))
         quiz_id=int((await cur.fetchone())["id"])
-        for pos,qid in enumerate(ids,1):
-            await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)",(quiz_id,pos,qid))
+        # Batch the fixed-range snapshot to avoid one DB round-trip per question.
+        async with conn.cursor() as insert_cur:
+            await insert_cur.executemany(
+                "INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)",
+                [(quiz_id, pos, qid) for pos, qid in enumerate(ids, 1)],
+            )
     return {"quiz_id":quiz_id,"source_type":"range","generated_title":title,"count":count,
             "range_start":startpos,"range_end":endpos,"range_label":f"{startpos}–{endpos}"}
 
@@ -687,13 +691,37 @@ async def _launch_pending_quiz(q,context,pool,pending,user):
         active_id = await _reconcile_chat_quizzes(conn, chat_id)
         if active_id is not None:
             await q.answer(f"This group already has live or scheduled quiz session #{active_id}. Finish it first.",show_alert=True); return True
-        cur=await conn.execute("INSERT INTO group_quiz_sessions(chat_id,chat_title,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at,positive_marks,negative_marks,started_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,0,'active',NOW()+INTERVAL '5 seconds',%s,%s,NOW()) RETURNING id",(chat_id,pending.get("chat_title","Telegram group"),quiz["id"],quiz["title"],user.id,interval,len(prepared),mode,positive,negative)); sid=int((await cur.fetchone())["id"])
-        for position,(row,opts,letters) in enumerate(prepared):
-            await conn.execute("INSERT INTO group_quiz_session_questions(session_id,position,question_id,question_en,question_hi,options,option_letters,correct_option,explanation_en,explanation_hi) VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)",(sid,position,row["id"],row["question_en"],row["question_hi"],json.dumps(opts,ensure_ascii=False),json.dumps(letters),row["correct_option"],row["explanation_en"],row["explanation_hi"]))
+        cur=await conn.execute("INSERT INTO group_quiz_sessions(chat_id,chat_title,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at,positive_marks,negative_marks,started_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,0,'active',NOW(),%s,%s,NOW()) RETURNING id",(chat_id,pending.get("chat_title","Telegram group"),quiz["id"],quiz["title"],user.id,interval,len(prepared),mode,positive,negative)); sid=int((await cur.fetchone())["id"])
+        # Batch snapshot all questions in one database operation; large quizzes no longer
+        # incur hundreds of serial insert round-trips before the first poll can appear.
+        async with conn.cursor() as insert_cur:
+            await insert_cur.executemany(
+                "INSERT INTO group_quiz_session_questions(session_id,position,question_id,question_en,question_hi,options,option_letters,correct_option,explanation_en,explanation_hi) VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)",
+                [
+                    (sid, position, row["id"], row["question_en"], row["question_hi"],
+                     json.dumps(opts, ensure_ascii=False), json.dumps(letters),
+                     row["correct_option"], row["explanation_en"], row["explanation_hi"])
+                    for position, (row, opts, letters) in enumerate(prepared)
+                ],
+            )
     context.user_data.pop("group_quiz_pending",None)
     await q.answer("Quiz launched.")
     range_text=f"\nQuestion range: {pending.get('range_start','?')}–{pending.get('range_end','?')}" if pending.get("range_start") is not None else ""
-    await q.edit_message_text(f"✅ Group quiz #{sid} queued\n{quiz['title']}{range_text}\nExactly {len(prepared)} questions · {mode.title()} Mode · {interval}s/question\nScoring: +{positive:g} correct / −{negative:g} wrong")
+    await q.edit_message_text(f"✅ Group quiz #{sid} started\n{quiz['title']}{range_text}\nExactly {len(prepared)} questions · {mode.title()} Mode · {interval}s/question\nScoring: +{positive:g} correct / −{negative:g} wrong")
+    # Publish Q1 immediately instead of waiting for the scheduler's next polling tick.
+    # _post_question atomically claims the pending row, so the scheduler cannot duplicate it.
+    try:
+        async with pool.connection() as conn:
+            cur = await conn.execute("SELECT * FROM group_quiz_sessions WHERE id=%s", (sid,))
+            live_session = await cur.fetchone()
+            cur = await conn.execute("SELECT * FROM group_quiz_session_questions WHERE session_id=%s AND position=0", (sid,))
+            first_question = await cur.fetchone()
+        if live_session and first_question:
+            await _post_question(context.application, pool, live_session, first_question)
+    except Exception:
+        # Persisted scheduler will retry; don't lose a valid session because immediate
+        # first-poll delivery failed transiently.
+        log.exception("Immediate first-question delivery failed for group quiz session %s", sid)
     return True
 
 
@@ -822,7 +850,7 @@ async def _finish_session(application, pool, session):
             WHERE a.session_id=%s GROUP BY a.telegram_id ORDER BY
             (COUNT(*) FILTER (WHERE a.selected_letter=q.correct_option)*%s-COUNT(*) FILTER (WHERE a.selected_letter IS NOT NULL AND a.selected_letter<>q.correct_option)*%s) DESC,
             correct DESC,incorrect ASC,MAX(a.answered_at)-MIN(a.answered_at) ASC,a.telegram_id ASC""",(sid,positive,negative))
-        scores=await conn.fetchall()
+        scores=await cur.fetchall()
         cur=await conn.execute("""SELECT COUNT(DISTINCT telegram_id) AS participants,
             COUNT(*) FILTER (WHERE selected_letter IS NOT NULL) AS votes,
             COUNT(*) FILTER (WHERE selected_letter=q.correct_option) AS correct,
@@ -830,7 +858,7 @@ async def _finish_session(application, pool, session):
             FROM group_quiz_answers a JOIN group_quiz_session_questions q USING(session_id,position) WHERE a.session_id=%s""",(sid,))
         agg=await cur.fetchone()
         cur=await conn.execute("SELECT position,question_en,question_hi,options,correct_option,explanation_en,explanation_hi FROM group_quiz_session_questions WHERE session_id=%s ORDER BY position",(sid,))
-        answer_key=await conn.fetchall()
+        answer_key=await cur.fetchall()
         cur=await conn.execute("""SELECT q.position,COUNT(a.telegram_id) FILTER (WHERE a.selected_letter IS NOT NULL) AS attempted,
             COUNT(a.telegram_id) FILTER (WHERE a.selected_letter=q.correct_option) AS correct,
             COUNT(a.telegram_id) FILTER (WHERE a.selected_letter IS NOT NULL AND a.selected_letter<>q.correct_option) AS incorrect,
@@ -838,7 +866,7 @@ async def _finish_session(application, pool, session):
             (SELECT a2.selected_letter FROM group_quiz_answers a2 WHERE a2.session_id=q.session_id AND a2.position=q.position AND a2.selected_letter IS NOT NULL AND a2.selected_letter<>q.correct_option GROUP BY a2.selected_letter ORDER BY COUNT(*) DESC,a2.selected_letter LIMIT 1) AS most_common_wrong
             FROM group_quiz_session_questions q LEFT JOIN group_quiz_answers a ON a.session_id=q.session_id AND a.position=q.position
             WHERE q.session_id=%s GROUP BY q.position,q.session_id,q.correct_option ORDER BY q.position""",(sid,))
-        question_stats=await conn.fetchall()
+        question_stats=await cur.fetchall()
     total=int(finished["questions_count"] or 0); participants=int(agg["participants"] or 0); votes=int(agg["votes"] or 0); correct=int(agg["correct"] or 0); wrong=int(agg["incorrect"] or 0)
     started=finished["started_at"]
     if started and started.tzinfo is None: started=started.replace(tzinfo=timezone.utc)
@@ -1023,7 +1051,7 @@ async def scheduler(application, pool):
             raise
         except Exception:
             log.exception("Group quiz scheduler iteration failed")
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.75)
 
 
 async def _poll_message_id(pool, poll_id):

@@ -1,15 +1,13 @@
-BPSC Nexus — Group Quiz Recovery Fix
+BPSC Nexus — Group Quiz Startup Speed Fix
 
-Replace the existing group_quiz.py with this file.
-Do not reset or delete the PostgreSQL database.
-Commit and push the replacement to GitHub, then redeploy the Telegram bot service on Render.
+Replace the existing group_quiz.py with the included file. No database reset is required.
+Commit/push to GitHub and redeploy the Telegram bot service on Render.
 
-What this patch does:
-- Uses a per-group PostgreSQL advisory transaction lock so two admins cannot create concurrent quiz sessions for the same group.
-- Reconciles legacy active/paused rows before starting or scheduling a quiz.
-- Finalizes exhausted sessions and advances past already-closed questions.
-- Cancels orphaned active sessions that have no current question, and prevents duplicate legacy active rows from blocking a fresh quiz.
-- Automatically retires due active/paused sessions older than 24 hours, while preserving future-dated scheduled sessions.
-- Keeps completed-session report retry behavior intact.
+Performance changes:
+- First question is published immediately after the launch confirmation; the scheduler remains as a recovery fallback.
+- Removed the artificial five-second delay before a session becomes due.
+- Batch-inserts question-range snapshots and session question snapshots to reduce serial database round-trips for large quizzes.
+- Reduced scheduler polling interval to 0.75 seconds for faster progression/recovery.
+- Preserves the one-active-quiz-per-group advisory-lock/reconciliation safeguards and completed-report recovery logic.
 
-Validation performed: Python syntax compilation and static checks only. No live Telegram or PostgreSQL integration test was run.
+Validation: Python syntax compilation and ZIP integrity checks only. Live Telegram/PostgreSQL performance was not tested.
