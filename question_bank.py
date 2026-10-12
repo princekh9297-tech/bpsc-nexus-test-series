@@ -28,6 +28,12 @@ LETTERS = "ABCDE"
 SUBJECTS = ["General Science", "Bihar Special", "Modern Indian History", "Indian Polity", "Geography", "Economy", "Ancient & Medieval History", "Art & Culture", "Other / Unclassified"]
 
 DDL = [
+    """CREATE TABLE IF NOT EXISTS question_bank_subjects (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        created_by_telegram_id BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
     """CREATE TABLE IF NOT EXISTS question_import_batches (
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         owner_telegram_id BIGINT NOT NULL,
@@ -240,6 +246,57 @@ class _TextExtractor(HTMLParser):
 
 
 def _html_to_records(raw: str) -> list[dict]:
+    # BPSCVEERS-style pages store the complete question bank in `const RAW = [...]`
+    # and transform compact fields (s/c/o/a/x etc.) into the UI at runtime.
+    # Parse the JavaScript array as JSON directly; never execute uploaded scripts.
+    raw_match = re.search(r"\b(?:const|let|var)\s+RAW\s*=\s*", raw, flags=re.I)
+    if raw_match:
+        start = raw.find("[", raw_match.end())
+        if start >= 0:
+            try:
+                payload, _end = json.JSONDecoder().raw_decode(raw[start:])
+                if isinstance(payload, list) and payload:
+                    converted = []
+                    for item in payload:
+                        if not isinstance(item, dict):
+                            continue
+                        # Source schema: s=subject, c=chapter, t=type, i=intro/question,
+                        # tl=question tail, o=options, a=zero-based answer index, x.w=explanation.
+                        qparts = item.get("i") or []
+                        if isinstance(qparts, str): qparts = [qparts]
+                        qtext = "\n".join(str(x) for x in qparts if x is not None)
+                        tail = item.get("tl") or []
+                        if isinstance(tail, str): tail = [tail]
+                        if tail: qtext += ("\n" if qtext else "") + "\n".join(str(x) for x in tail if x is not None)
+                        opts_raw = item.get("o") or []
+                        opts = {LETTERS[i]: str(v) for i, v in enumerate(opts_raw[:5]) if v is not None and _norm(v)} if isinstance(opts_raw, list) else opts_raw
+                        answer = item.get("a")
+                        correct = None
+                        if isinstance(answer, int) and 0 <= answer < len(LETTERS): correct = LETTERS[answer]
+                        elif isinstance(answer, str): correct = answer.strip().upper()
+                        exp = item.get("x") or {}
+                        exp_parts = exp.get("w", []) if isinstance(exp, dict) else exp
+                        if isinstance(exp_parts, str): exp_parts = [exp_parts]
+                        explanation = "\n".join(str(x) for x in exp_parts if x is not None)
+                        # Preserve special Match data in the prompt instead of dropping it.
+                        if str(item.get("t", "mcq")).lower() == "match":
+                            li, lii = item.get("li") or [], item.get("lii") or []
+                            if li or lii:
+                                qtext += "\n\nMatch the following:\nList I: " + " | ".join(map(str, li)) + "\nList II: " + " | ".join(map(str, lii))
+                        converted.append({
+                            "question": qtext or str(item.get("id") or "Question"),
+                            "options": opts,
+                            "correct_answer": correct,
+                            "explanation": explanation,
+                            "subject": item.get("s") or "Other / Unclassified",
+                            "topic": item.get("c") or item.get("s") or None,
+                            "source": "BPSCVEERS EPFO HTML import",
+                            "attribution": "Pushpankar Narayan",
+                        })
+                    if converted:
+                        return converted
+            except Exception as exc:
+                log.warning("Could not decode compact RAW question bank: %s", exc)
     # First accept embedded JSON commonly used by quiz pages.
     for pattern in (r"(?:const|let|var)\s+(?:questions|quizData|questionData)\s*=\s*(\[.*\])\s*;", r"<script[^>]*type=['\"]application/json['\"][^>]*>(.*?)</script>"):
         match = re.search(pattern, raw, flags=re.I | re.S)
@@ -328,6 +385,10 @@ def parse_file(filename: str, raw: bytes, subject: str, owner_id: int) -> tuple[
 async def ensure_schema(pool):
     async with pool.connection() as conn:
         for statement in DDL: await conn.execute(statement)
+        # Keep user-created subjects persistent and available in all admin selectors.
+        cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY name")
+        for row in await cur.fetchall():
+            if row["name"] not in SUBJECTS: SUBJECTS.append(row["name"])
     log.info("Question bank schema verified.")
 
 
@@ -353,9 +414,10 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
 def admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add One Question", callback_data="qb:addone"), InlineKeyboardButton("📥 Bulk Import File", callback_data="qb:import")],
+        [InlineKeyboardButton("➕ Create Subject", callback_data="qb:newsubject"), InlineKeyboardButton("🧪 Create Test Series", callback_data="qb:build")],
         [InlineKeyboardButton("🗃 Browse / Edit", callback_data="qb:browse"), InlineKeyboardButton("🗑 Delete Questions", callback_data="qb:deletehub")],
         [InlineKeyboardButton("🧹 Bulk Delete by IDs", callback_data="qb:bulkdelete"), InlineKeyboardButton("📦 Import History / Undo", callback_data="qb:history")],
-        [InlineKeyboardButton("🧩 Build Quiz", callback_data="qb:build"), InlineKeyboardButton("🛠 Manage Quizzes", callback_data="qb:manage")],
+        [InlineKeyboardButton("🗂 Manage Test Series", callback_data="qb:manage")],
         [InlineKeyboardButton("🕵️ Verify Pending", callback_data="qb:pending"), InlineKeyboardButton("🧪 Quality Audit", callback_data="qb:audit")],
         [InlineKeyboardButton("↩ Main Admin Panel", callback_data="adm:home")],
     ])
@@ -385,6 +447,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
     if data.startswith("qb:") and not is_authorized:
         await q.answer("Not authorized.",show_alert=True); return
     await q.answer()
+    if data == "qb:newsubject":
+        context.user_data["qb_flow"]={"step":"create_subject"}
+        await q.edit_message_text("➕ Create a new subject\n\nSend the exact subject name. It will be saved to the database and appear in future import and test-series selectors.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
     if data == "qb:addone":
         context.user_data["qb_flow"]={"step":"add_question_subject"}
         await q.edit_message_text("➕ Add a question\n\nChoose its subject first:",reply_markup=subject_keyboard("qb:addsubject")); return
@@ -796,6 +861,12 @@ async def confirm_import(q,context,pool,owner_id):
         # Count invalid parser rows from preview. It is retained separately from recognized records.
         invalid=int(preview.get("invalid",0))
         result=await import_records(pool,records,owner_id,preview["filename"],preview["filename"].rsplit(".",1)[-1].lower(),preview["subject"],invalid)
+        # Register all source-defined subjects so admins can immediately build new test series from them.
+        imported_subjects = sorted({str(item.get("subject") or preview["subject"]).strip() for item in records if str(item.get("subject") or preview["subject"]).strip()})
+        async with pool.connection() as conn:
+            for subject_name in imported_subjects:
+                await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id) VALUES(%s,%s) ON CONFLICT(name) DO NOTHING", (subject_name, owner_id))
+                if subject_name not in SUBJECTS: SUBJECTS.append(subject_name)
         context.user_data.pop("qb_import_preview",None); context.user_data.pop("qb_flow",None)
         await q.edit_message_text("✅ Import complete\n\n"+f"Batch: #{result['batch_id']}\nDetected: {result['detected']}\nAdded: {result['imported']}\nDuplicates skipped: {result['duplicates']}\nInvalid rows: {result['invalid']}\nPending verification: {result['pending']}\n\nQuestions are stored permanently. Pending questions are excluded from scored quizzes.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Verify pending answers",callback_data="qb:pending")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]]))
     except Exception as e:
@@ -808,6 +879,20 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not msg or not msg.text or not user or not is_authorized: return False
     flow=context.user_data.get("qb_flow",{})
     step=flow.get("step")
+    if step == "create_subject":
+        name = _norm(msg.text)[:100]
+        if len(name) < 2:
+            await msg.reply_text("Subject name must contain at least 2 characters. Send the name again."); return True
+        try:
+            async with pool.connection() as conn:
+                await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id) VALUES(%s,%s) ON CONFLICT(name) DO NOTHING", (name,user.id))
+            if name not in SUBJECTS: SUBJECTS.append(name)
+            context.user_data.pop("qb_flow",None)
+            await msg.reply_text(f"✅ Subject saved: {name}\n\nIt is now available for question imports and new test series.",reply_markup=admin_keyboard())
+        except Exception as exc:
+            log.exception("Subject creation failed")
+            await msg.reply_text(f"Could not save this subject. No question data was changed. {str(exc)[:250]}",reply_markup=admin_keyboard())
+        return True
     if step == "add_question_text":
         record=parse_forwarded_text(msg.text,user.id)
         if not record:

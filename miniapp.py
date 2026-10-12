@@ -354,6 +354,10 @@ async def arena_answer(request):
 
 
 ALL_ACCESS_PRICES = {60: 90, 90: 130, 120: 150, 180: 180, 249: 220, 365: 300}
+# Product codes are stable entitlement identifiers; retiring a product only hides new sales.
+INDIVIDUAL_PRODUCTS = {
+    "ghatnachakra_ecology": {"name": "Ghatnachakra Ecology — Lifetime Edition", "price": 39, "duration_days": 0, "entitlement_key": "ghatnachakra_ecology", "active": True},
+}
 
 async def payment_schema(conn):
     await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_payment_requests (
@@ -363,7 +367,15 @@ async def payment_schema(conn):
         status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
         submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ,
         reviewed_by BIGINT, review_note TEXT, activated_pass_id BIGINT, UNIQUE(transaction_ref))""")
+    await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS product_code TEXT NOT NULL DEFAULT 'all_access'")
     await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_payment_requests_status_idx ON bpsc_payment_requests(status, submitted_at DESC)")
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_individual_products (
+        product_code TEXT PRIMARY KEY, product_name TEXT NOT NULL, amount_inr INTEGER NOT NULL CHECK(amount_inr >= 0),
+        entitlement_key TEXT NOT NULL, duration_days INTEGER NOT NULL DEFAULT 0, is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), retired_at TIMESTAMPTZ NULL)""")
+    await conn.execute("""INSERT INTO bpsc_individual_products(product_code,product_name,amount_inr,entitlement_key,duration_days,is_active)
+        VALUES('ghatnachakra_ecology','Ghatnachakra Ecology — Lifetime Edition',39,'ghatnachakra_ecology',0,TRUE)
+        ON CONFLICT(product_code) DO NOTHING""")
 
 async def membership_page(request):
     page = ROOT / "static" / "membership.html"
@@ -373,29 +385,39 @@ async def membership_page(request):
 async def payment_options(request):
     uid=request["telegram_user"]["id"]
     async with request.app["pool"].connection() as conn:
-        cur=await conn.execute("SELECT id,product_name,duration_days,amount_inr,transaction_ref,status,submitted_at,reviewed_at FROM bpsc_payment_requests WHERE telegram_id=%s ORDER BY submitted_at DESC LIMIT 20",(uid,))
+        await payment_schema(conn)
+        cur=await conn.execute("SELECT id,product_name,duration_days,amount_inr,product_code,transaction_ref,status,submitted_at,reviewed_at FROM bpsc_payment_requests WHERE telegram_id=%s ORDER BY submitted_at DESC LIMIT 20",(uid,))
         history=await cur.fetchall()
-    return json_response({"prices":[{"days":d,"price":p} for d,p in ALL_ACCESS_PRICES.items()],"history":[dict(r) for r in history]})
+        cur=await conn.execute("SELECT product_code,product_name,amount_inr,entitlement_key,duration_days FROM bpsc_individual_products WHERE is_active=TRUE ORDER BY product_name")
+        products=await cur.fetchall()
+    return json_response({"prices":[{"days":d,"price":p} for d,p in ALL_ACCESS_PRICES.items()],"products":[dict(r) for r in products],"history":[dict(r) for r in history]})
 
 async def submit_payment(request):
     user=request["telegram_user"]
     try: body=await request.json()
     except Exception: return json_response({"error":"Invalid submission."},400)
-    try:
-        days=int(body.get("duration_days")); amount=ALL_ACCESS_PRICES[days]
-        ref=str(body.get("transaction_ref") or "").strip().upper()
-        screenshot=str(body.get("screenshot_data") or "")
-    except Exception: return json_response({"error":"Choose a valid membership duration."},400)
+    product_code=str(body.get("product_code") or "all_access").strip().lower()
+    ref=str(body.get("transaction_ref") or "").strip().upper()
+    screenshot=str(body.get("screenshot_data") or "")
     if not re.fullmatch(r"[A-Z0-9-]{6,40}",ref): return json_response({"error":"Enter a valid UPI transaction/reference ID (6–40 letters, digits or hyphens)."},400)
     if not screenshot.startswith("data:image/") or len(screenshot)>900000: return json_response({"error":"Upload a clear payment screenshot under 650 KB."},400)
     async with request.app["pool"].connection() as conn:
         await payment_schema(conn)
+        if product_code == "all_access":
+            try:
+                days=int(body.get("duration_days")); amount=ALL_ACCESS_PRICES[days]
+            except Exception: return json_response({"error":"Choose a valid All Access duration."},400)
+            product_name=f"All Access · {days} days"
+        else:
+            cur=await conn.execute("SELECT product_code,product_name,amount_inr,duration_days FROM bpsc_individual_products WHERE product_code=%s AND is_active=TRUE",(product_code,))
+            product=await cur.fetchone()
+            if not product: return json_response({"error":"This individual question bank is unavailable for new purchases."},404)
+            amount=int(product["amount_inr"]); days=int(product["duration_days"]); product_name=product["product_name"]
         cur=await conn.execute("SELECT status FROM bpsc_payment_requests WHERE transaction_ref=%s",(ref,))
-        old=await cur.fetchone()
-        if old: return json_response({"error":"This transaction/reference ID has already been submitted."},409)
-        cur=await conn.execute("INSERT INTO bpsc_payment_requests(telegram_id,product_code,product_name,duration_days,amount_inr,transaction_ref,screenshot_data) VALUES(%s,'all_access',%s,%s,%s,%s,%s) RETURNING id,submitted_at",(user["id"],f"All Access · {days} days",days,amount,ref,screenshot))
+        if await cur.fetchone(): return json_response({"error":"This transaction/reference ID has already been submitted."},409)
+        cur=await conn.execute("INSERT INTO bpsc_payment_requests(telegram_id,product_code,product_name,duration_days,amount_inr,transaction_ref,screenshot_data) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id,submitted_at",(user["id"],product_code,product_name,days,amount,ref,screenshot))
         r=await cur.fetchone()
-    return json_response({"request_id":int(r["id"]),"status":"pending","amount":amount,"submitted_at":r["submitted_at"].isoformat()},201)
+    return json_response({"request_id":int(r["id"]),"status":"pending","amount":amount,"product_code":product_code,"product_name":product_name,"submitted_at":r["submitted_at"].isoformat()},201)
 
 async def index(request):
     # Resolve frontend relative to this file, not the process working directory.

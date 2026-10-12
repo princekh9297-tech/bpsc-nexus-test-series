@@ -93,6 +93,7 @@ async def ensure_schema() -> None:
             ('upsc_pyq', 'UPSC PYQ Pass', 'Access to the UPSC PYQ vault', TRUE),
             ('dual_vault', 'Dual Vault Pass', 'Access to two selected vaults', TRUE),
             ('all_access', 'All-Access Pass', 'Access to all supported vaults', TRUE),
+            ('ghatnachakra_ecology', 'Ghatnachakra Ecology Lifetime', 'Lifetime access to Ghatnachakra Ecology edition only', TRUE),
             ('legacy', 'Legacy Premium Pass', 'Migrated legacy entitlement', TRUE)
             ON CONFLICT (pass_code) DO NOTHING""",
         """CREATE TABLE IF NOT EXISTS premium_passes (
@@ -167,7 +168,15 @@ async def ensure_schema() -> None:
             submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ,
             reviewed_by BIGINT, review_note TEXT, activated_pass_id BIGINT,
             UNIQUE (transaction_ref))""",
+        "ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS product_code TEXT NOT NULL DEFAULT 'all_access'",
         "CREATE INDEX IF NOT EXISTS bpsc_payment_requests_status_idx ON bpsc_payment_requests(status, submitted_at DESC)",
+        """CREATE TABLE IF NOT EXISTS bpsc_individual_products (
+            product_code TEXT PRIMARY KEY, product_name TEXT NOT NULL, amount_inr INTEGER NOT NULL CHECK(amount_inr >= 0),
+            entitlement_key TEXT NOT NULL, duration_days INTEGER NOT NULL DEFAULT 0, is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), retired_at TIMESTAMPTZ NULL)""",
+        """INSERT INTO bpsc_individual_products(product_code,product_name,amount_inr,entitlement_key,duration_days,is_active)
+            VALUES('ghatnachakra_ecology','Ghatnachakra Ecology — Lifetime Edition',39,'ghatnachakra_ecology',0,TRUE)
+            ON CONFLICT(product_code) DO NOTHING""",
     ]
     async with pool.connection() as conn:
         for statement in statements:
@@ -794,7 +803,7 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
                 cur=await conn.execute("SELECT * FROM bpsc_payment_requests WHERE id=%s",(rid,)); r=await cur.fetchone()
             if not r:
                 await query.edit_message_text("Payment request not found.", reply_markup=admin_home_keyboard()); return True
-            text=(f"💳 Payment request #{rid}\n\nUser: {r['telegram_id']}\nProduct: {r['product_name']}\nAmount: ₹{r['amount_inr']}\nDuration: {r['duration_days']} days\nUPI reference: {r['transaction_ref']}\nStatus: {r['status']}\nSubmitted: {r['submitted_at']}\n\nVerify the credit in your PhonePe/bank app before approving.")
+            text=(f"💳 Payment request #{rid}\n\nUser: {r['telegram_id']}\nProduct: {r['product_name']}\nAmount: ₹{r['amount_inr']}\nAccess: {'Lifetime' if int(r['duration_days'] or 0)==0 else str(r['duration_days'])+' days'}\nProduct code: {r['product_code']}\nUPI reference: {r['transaction_ref']}\nStatus: {r['status']}\nSubmitted: {r['submitted_at']}\n\nVerify the credit in your PhonePe/bank app before approving.")
             buttons=[]
             if r['status']=='pending': buttons=[[InlineKeyboardButton("✅ Approve & Activate",callback_data=f"pay:approve:{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"pay:reject:{rid}")]]
             buttons.append([InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")])
@@ -820,17 +829,36 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
                     cur=await conn.execute("SELECT id FROM app_users WHERE telegram_id=%s",(r['telegram_id'],)); u=await cur.fetchone()
                     if not u:
                         await query.edit_message_text("User is not registered in app_users. Ask them to press /start, then review again.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")]])); return True
-                    cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code='all_access' AND is_active=TRUE"); cat=await cur.fetchone()
+                    product_code=str(r.get('product_code') or 'all_access')
+                    if product_code == 'all_access':
+                        pass_code='all_access'; vault_keys=['*']; duration=int(r['duration_days'] or 0)
+                        cur=await conn.execute("SELECT MAX(expires_at) AS expiry FROM premium_passes WHERE user_id=%s AND pass_code='all_access' AND revoked_at IS NULL AND expires_at>NOW()",(u['id'],)); expiry=(await cur.fetchone())['expiry']
+                        granted_at=expiry
+                    else:
+                        # Individual products receive only their own vault key and lifetime expiry.
+                        cur=await conn.execute("SELECT entitlement_key,duration_days FROM bpsc_individual_products WHERE product_code=%s",(product_code,)); product=await cur.fetchone()
+                        if not product:
+                            await query.edit_message_text("The purchased product configuration is missing; no access was granted. Keep this request pending and repair the product catalogue.",reply_markup=admin_home_keyboard()); return True
+                        pass_code=product_code; vault_keys=[str(product['entitlement_key'])]; duration=int(product['duration_days'] or 0); expiry=None; granted_at=None
+                    cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code=%s AND is_active=TRUE",(pass_code,)); cat=await cur.fetchone()
                     if not cat:
-                        await query.edit_message_text("All-Access pass is missing/inactive in pass_catalogue; no access was granted.",reply_markup=admin_home_keyboard()); return True
-                    cur=await conn.execute("SELECT MAX(expires_at) AS expiry FROM premium_passes WHERE user_id=%s AND pass_code='all_access' AND revoked_at IS NULL AND expires_at>NOW()",(u['id'],)); expiry=(await cur.fetchone())['expiry']
-                    # Renewal begins after current expiry when one exists, otherwise now.
-                    cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys)
-                        VALUES(%s,%s,%s,COALESCE(%s,NOW()),COALESCE(%s,NOW()) + (%s * INTERVAL '1 day'),%s,'all_access',ARRAY['*']::TEXT[]) RETURNING id""",
-                        (u['id'],cat['id'],update.effective_user.id,expiry,expiry,int(r['duration_days']),f"Manual UPI payment request #{rid}; ₹{r['amount_inr']}") )
+                        await conn.execute("INSERT INTO pass_catalogue(pass_code,pass_name,description,is_active) VALUES(%s,%s,%s,TRUE) ON CONFLICT(pass_code) DO NOTHING",(pass_code,str(r['product_name']),f"Entitlement for {r['product_name']}"))
+                        cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code=%s AND is_active=TRUE",(pass_code,)); cat=await cur.fetchone()
+                    if not cat:
+                        await query.edit_message_text(f"Entitlement catalogue entry '{pass_code}' is missing/inactive; no access was granted.",reply_markup=admin_home_keyboard()); return True
+                    if product_code == 'all_access':
+                        cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys)
+                            VALUES(%s,%s,%s,COALESCE(%s,NOW()),COALESCE(%s,NOW()) + (%s * INTERVAL '1 day'),%s,%s,%s) RETURNING id""",
+                            (u['id'],cat['id'],update.effective_user.id,granted_at,expiry,duration,f"Manual UPI payment request #{rid}; ₹{r['amount_inr']}",pass_code,vault_keys))
+                        access_label=f"All Access for {duration} days"
+                    else:
+                        cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys)
+                            VALUES(%s,%s,%s,NOW(),NULL,%s,%s,%s) RETURNING id""",
+                            (u['id'],cat['id'],update.effective_user.id,f"Manual UPI payment request #{rid}; ₹{r['amount_inr']}",pass_code,vault_keys))
+                        access_label=f"lifetime access to {r['product_name']} only"
                     activated=(await cur.fetchone())['id']
                     await conn.execute("UPDATE bpsc_payment_requests SET status='approved',reviewed_at=NOW(),reviewed_by=%s,activated_pass_id=%s WHERE id=%s",(update.effective_user.id,activated,rid))
-                    user_msg=f"✅ Your BPSC Nexus payment is approved. All Access for {r['duration_days']} days has been activated. Use /mypremium to check your membership."
+                    user_msg=f"✅ Your BPSC Nexus payment is approved. Activated: {access_label}. Use /mypremium to check your membership."
         try: await context.bot.send_message(chat_id=int(r['telegram_id']),text=user_msg)
         except Exception: logger.warning("Could not notify user %s about payment request %s",r['telegram_id'],rid)
         await query.edit_message_text(f"Request #{rid} {parts[1]}d. {'Membership activated.' if parts[1]=='approve' else 'No membership was granted.'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")],[InlineKeyboardButton("Admin Panel",callback_data="adm:home")]]))
