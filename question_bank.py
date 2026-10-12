@@ -53,6 +53,9 @@ DDL = [
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         question_en TEXT NOT NULL,
         question_hi TEXT,
+        question_type TEXT NOT NULL DEFAULT 'unknown',
+        question_structure JSONB NOT NULL DEFAULT '{}'::jsonb,
+        question_flags JSONB NOT NULL DEFAULT '{}'::jsonb,
         options JSONB NOT NULL DEFAULT '{}'::jsonb,
         correct_option TEXT,
         explanation_en TEXT,
@@ -74,6 +77,9 @@ DDL = [
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_question_bank_hash ON question_bank(question_hash)",
     "CREATE INDEX IF NOT EXISTS idx_question_bank_subject_status ON question_bank(subject, status, id DESC)",
     "CREATE INDEX IF NOT EXISTS idx_question_bank_batch ON question_bank(import_batch_id)",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS question_type TEXT NOT NULL DEFAULT 'unknown'",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS question_structure JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS question_flags JSONB NOT NULL DEFAULT '{}'::jsonb",
     """CREATE TABLE IF NOT EXISTS bank_quizzes (
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         title TEXT NOT NULL,
@@ -131,6 +137,9 @@ DDL = [
         subject TEXT NOT NULL DEFAULT 'Other / Unclassified',
         question_en TEXT NOT NULL,
         question_hi TEXT,
+        question_type TEXT NOT NULL DEFAULT 'unknown',
+        question_structure JSONB NOT NULL DEFAULT '{}'::jsonb,
+        question_flags JSONB NOT NULL DEFAULT '{}'::jsonb,
         options JSONB NOT NULL,
         correct_option TEXT NOT NULL,
         explanation_en TEXT,
@@ -139,6 +148,9 @@ DDL = [
         UNIQUE(attempt_id, position)
     )""",
     "ALTER TABLE bank_quiz_attempt_question_snapshots ADD COLUMN IF NOT EXISTS subject TEXT NOT NULL DEFAULT 'Other / Unclassified'",
+    "ALTER TABLE bank_quiz_attempt_question_snapshots ADD COLUMN IF NOT EXISTS question_type TEXT NOT NULL DEFAULT 'unknown'",
+    "ALTER TABLE bank_quiz_attempt_question_snapshots ADD COLUMN IF NOT EXISTS question_structure JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE bank_quiz_attempt_question_snapshots ADD COLUMN IF NOT EXISTS question_flags JSONB NOT NULL DEFAULT '{}'::jsonb",
     """INSERT INTO bank_quiz_attempt_question_snapshots(attempt_id,position,question_id,subject,question_en,question_hi,options,correct_option,explanation_en,explanation_hi)
         SELECT a.id,qq.position,qb.id,qb.subject,qb.question_en,qb.question_hi,qb.options,qb.correct_option,qb.explanation_en,qb.explanation_hi
         FROM bank_quiz_attempts a JOIN bank_quiz_questions qq ON qq.quiz_id=a.quiz_id
@@ -150,6 +162,91 @@ DDL = [
 
 def _norm(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+LAYOUT_TYPES = {
+    "standard", "match_following", "statement_based", "assertion_reason", "chronology",
+    "pair_based", "passage_based", "table_based", "image_based", "numerical"
+}
+
+
+def _as_text_list(value):
+    if isinstance(value, list):
+        out=[]
+        for item in value:
+            if isinstance(item, dict):
+                text = _get(item, "text", "statement", "value", "description", "name", "en", "english", "hi", "hindi", default="")
+                if text and str(text).strip(): out.append(str(text).strip())
+            elif str(item or "").strip(): out.append(str(item).strip())
+        return out
+    if isinstance(value, dict):
+        return [str(v).strip() for _, v in sorted(value.items(), key=lambda x: str(x[0])) if str(v or "").strip()]
+    if isinstance(value, str):
+        return [x.strip(" •-\t") for x in re.split(r"\n+|\s*\|\s*", value) if x.strip(" •-\t")]
+    return []
+
+
+def detect_question_layout(question_en: str, question_hi: str = "", record: dict | None = None):
+    """Deterministic, non-AI classifier. Stores optional explicit structures without rewriting stems."""
+    record = record if isinstance(record, dict) else {}
+    en = str(question_en or "")
+    hi = str(question_hi or "")
+    text = f"{en}\n{hi}".lower()
+    raw_type = str(_get(record, "question_type", "layout_type", "question_layout", default="") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {"match": "match_following", "matching": "match_following", "match_the_following": "match_following",
+               "statements": "statement_based", "statement": "statement_based", "assertion_reasoning": "assertion_reason",
+               "chronological": "chronology", "sequence": "chronology", "pairs": "pair_based", "passage": "passage_based",
+               "table": "table_based", "image": "image_based", "mcq": "standard"}
+    raw_type = aliases.get(raw_type, raw_type)
+    supplied = _get(record, "question_structure", "structure", "layout_data", default={})
+    structure = dict(supplied) if isinstance(supplied, dict) else {}
+    # Normalize common explicit source fields into predictable arrays.
+    li = _as_text_list(_get(record, "list_i", "list1", "list_1", "match_list_1", "column_a", "left_list", default=structure.get("list_i")))
+    lj = _as_text_list(_get(record, "list_ii", "list2", "list_2", "match_list_2", "column_b", "right_list", default=structure.get("list_ii")))
+    statements = _as_text_list(_get(record, "statements", "statement_list", "assertions_list", default=structure.get("statements")))
+    pairs_raw = _get(record, "pairs", "pair_list", default=structure.get("pairs"))
+    pairs = list(pairs_raw) if isinstance(pairs_raw, list) else _as_text_list(pairs_raw)
+    assertion = _get(record, "assertion", "assertion_text", default=structure.get("assertion"))
+    reason = _get(record, "reason", "reason_text", default=structure.get("reason"))
+    passage = _get(record, "passage", "comprehension_passage", "common_passage", default=structure.get("passage"))
+    events = _as_text_list(_get(record, "events", "chronology_items", "sequence_items", default=structure.get("events")))
+    if li: structure["list_i"] = li
+    if lj: structure["list_ii"] = lj
+    if statements: structure["statements"] = statements
+    if pairs: structure["pairs"] = pairs
+    if assertion: structure["assertion"] = str(assertion).strip()
+    if reason: structure["reason"] = str(reason).strip()
+    if passage: structure["passage"] = str(passage).strip()
+    if events: structure["events"] = events
+
+    flags = {}
+    flags["negative_wording"] = bool(re.search(r"\b(not|incorrect|false|except|least likely|isn't|cannot)\b|नहीं|असत्य|गलत|अपवाद|निम्न में से कौन नहीं", text, re.I))
+    flags["bilingual"] = bool(hi.strip())
+    if raw_type in LAYOUT_TYPES:
+        qtype = raw_type
+    elif li and lj:
+        qtype = "match_following"
+    elif assertion or reason or re.search(r"assertion.{0,160}reason|अभिकथन.{0,120}कारण|कथन.{0,80}कारण", text, re.I | re.S):
+        qtype = "assertion_reason"
+    elif statements or re.search(r"following statements|statements? given below|consider the following statements|which of the statements|निम्नलिखित कथनों|कौन से कथन|कथन\s*(?:1|१|दो|तीन|चार)", text, re.I):
+        qtype = "statement_based"
+    elif pairs or re.search(r"which of the following pairs|correctly matched pair|following pairs|सही सुमेलित युग्म|निम्नलिखित युग्म", text, re.I):
+        qtype = "pair_based"
+    elif re.search(r"match\s+(?:the\s+)?following|match\s+list|correctly\s+matched|सुमेलित|मिलान\s+कीजिए|सूची\s*[i१२12].{0,80}सूची", text, re.I | re.S):
+        qtype = "match_following"
+    elif events or re.search(r"chronological order|correct sequence|arrange.{0,30}order|कालानुक्रम|सही क्रम में व्यवस्थित|घटनाओं का क्रम", text, re.I):
+        qtype = "chronology"
+    elif passage or re.search(r"read the following passage|passage given below|निम्नलिखित गद्यांश|निम्नलिखित अनुच्छेद", text, re.I):
+        qtype = "passage_based"
+    elif _get(record, "image", "image_url", "diagram", "figure", "map_url", default=None):
+        qtype = "image_based"
+    elif _get(record, "table", "data_table", "chart", "graph", default=None):
+        qtype = "table_based"
+    elif re.search(r"calculate|solve for|find the value|गणना कीजिए|मान ज्ञात कीजिए", text, re.I):
+        qtype = "numerical"
+    else:
+        qtype = "standard"
+    return qtype, structure, flags
 
 
 def _get(d: dict, *names: str, default=None):
@@ -222,10 +319,12 @@ def _normalize_record(record: Any, default_subject: str, source_name: str, owner
     canonical = _norm(q_en).casefold() + "|" + "|".join(_norm(options.get(k, "")).casefold() for k in LETTERS)
     qhash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     status = "ready" if len(options) >= 2 and correct in options else "pending"
+    qtype, qstructure, qflags = detect_question_layout(q_en, q_hi, record)
     return {"question_en": q_en, "question_hi": q_hi or None, "options": options, "correct_option": correct,
             "explanation_en": explanation_en or None, "explanation_hi": explanation_hi or None,
             "subject": subject, "topic": topic, "source": source, "source_url": source_url,
-            "attribution": attribution, "status": status, "question_hash": qhash, "created_by_telegram_id": owner_id}
+            "attribution": attribution, "status": status, "question_hash": qhash, "created_by_telegram_id": owner_id,
+            "question_type": qtype, "question_structure": qstructure, "question_flags": qflags}
 
 
 def _extract_json_records(obj: Any) -> list:
@@ -561,6 +660,28 @@ def parse_file(filename: str, raw: bytes, subject: str, owner_id: int) -> tuple[
 async def ensure_schema(pool):
     async with pool.connection() as conn:
         for statement in DDL: await conn.execute(statement)
+        # Retroactively classify existing bank questions without changing their content, answers or IDs.
+        await conn.execute("""UPDATE question_bank SET
+            question_type = CASE
+              WHEN COALESCE(question_structure,'{}'::jsonb) ? 'list_i' AND COALESCE(question_structure,'{}'::jsonb) ? 'list_ii' THEN 'match_following'
+              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(match[[:space:]]+(the[[:space:]]+)?following|match list|correctly matched|सुमेलित|मिलान[[:space:]]+कीजिए)' THEN 'match_following'
+              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(assertion.{0,80}reason|अभिकथन.{0,80}कारण)' THEN 'assertion_reason'
+              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(following statements|consider the following statements|which of the statements|कथनों? में से|निम्नलिखित कथनों|कौन से कथन)' THEN 'statement_based'
+              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(chronological order|correct sequence|arrange.{0,30}order|कालानुक्रम|सही क्रम में व्यवस्थित)' THEN 'chronology'
+              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(following pairs|correctly matched pair|सही सुमेलित युग्म|निम्नलिखित युग्म)' THEN 'pair_based'
+              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(read the following passage|passage given below|निम्नलिखित गद्यांश|निम्नलिखित अनुच्छेद)' THEN 'passage_based'
+              WHEN LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(calculate|solve for|find the value|गणना कीजिए|मान ज्ञात कीजिए)' THEN 'numerical'
+              ELSE 'standard' END,
+            question_flags = jsonb_build_object(
+              'negative_wording', LOWER(COALESCE(question_en,'') || ' ' || COALESCE(question_hi,'')) ~ '(not|incorrect|false|except|नहीं|असत्य|गलत|अपवाद)',
+              'bilingual', COALESCE(BTRIM(question_hi),'') <> ''),
+            updated_at = updated_at
+            WHERE question_type IS NULL OR question_type='unknown'""")
+        # Keep existing attempt snapshots aligned with the classifier; never change their text or answer key.
+        await conn.execute("""UPDATE bank_quiz_attempt_question_snapshots s SET
+            question_type=qb.question_type, question_structure=qb.question_structure, question_flags=qb.question_flags
+            FROM question_bank qb WHERE qb.id=s.question_id
+            AND (s.question_type IS DISTINCT FROM qb.question_type OR s.question_structure IS DISTINCT FROM qb.question_structure OR s.question_flags IS DISTINCT FROM qb.question_flags)""")
         # Keep user-created subjects persistent and available in all admin selectors.
         cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY name")
         for row in await cur.fetchall():
@@ -578,10 +699,10 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
             imported=duplicates=0
             for item in records:
                 # A source's subject overrides the batch default only when explicitly present.
-                cur=await conn.execute("""INSERT INTO question_bank(question_en,question_hi,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status,question_hash,import_batch_id,created_by_telegram_id)
-                    VALUES(%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                cur=await conn.execute("""INSERT INTO question_bank(question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status,question_hash,import_batch_id,created_by_telegram_id)
+                    VALUES(%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(question_hash) DO NOTHING RETURNING id""",
-                    (item["question_en"],item["question_hi"],json.dumps(item["options"],ensure_ascii=False),item["correct_option"],item["explanation_en"],item["explanation_hi"],item["subject"],item["topic"],item["source"],item["source_url"],item["attribution"],item["status"],item["question_hash"],batch_id,owner_id))
+                    (item["question_en"],item["question_hi"],item.get("question_type","standard"),json.dumps(item.get("question_structure",{}),ensure_ascii=False),json.dumps(item.get("question_flags",{}),ensure_ascii=False),json.dumps(item["options"],ensure_ascii=False),item["correct_option"],item["explanation_en"],item["explanation_hi"],item["subject"],item["topic"],item["source"],item["source_url"],item["attribution"],item["status"],item["question_hash"],batch_id,owner_id))
                 if await cur.fetchone(): imported+=1
                 else: duplicates+=1
             await conn.execute("UPDATE question_import_batches SET imported_count=%s,duplicate_count=%s WHERE id=%s",(imported,duplicates,batch_id))
