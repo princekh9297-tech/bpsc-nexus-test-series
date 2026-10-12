@@ -5,6 +5,8 @@ import asyncio
 import json
 import logging
 import random
+from html import escape as html_escape
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -38,6 +40,7 @@ DDL = [
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS report_sent BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS summary_sent BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS answer_key_sent BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS group_report_sent BOOLEAN NOT NULL DEFAULT FALSE",
 
     "CREATE INDEX IF NOT EXISTS idx_group_quiz_sessions_due ON group_quiz_sessions(status,next_at) WHERE status='active'",
     """CREATE TABLE IF NOT EXISTS group_quiz_session_questions (
@@ -595,22 +598,7 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
             [InlineKeyboardButton("Cancel",callback_data="gq:cancel")],
         ])); return True
     if data.startswith("gq:report:"):
-        try: sid=int(data.rsplit(":",1)[1])
-        except ValueError:
-            await q.answer("Invalid report reference.",show_alert=True); return True
-        async with pool.connection() as conn:
-            cur=await conn.execute("""SELECT r.chunk_no,r.report_text FROM group_quiz_admin_reports r
-                JOIN group_quiz_sessions s ON s.id=r.session_id
-                WHERE r.session_id=%s AND s.chat_id=%s AND s.status='completed' ORDER BY r.chunk_no""",(sid,chat.id))
-            reports=await cur.fetchall()
-        if not reports:
-            await q.answer("The report is still being prepared. Tap again in a few seconds.",show_alert=True); return True
-        try:
-            for report in reports:
-                await context.bot.send_message(chat_id=user.id,text=report["report_text"])
-            await q.answer("Detailed analysis sent privately.")
-        except Exception:
-            await q.answer("Open @BpscNexustestbot and press Start, then tap this report button again.",show_alert=True)
+        await q.answer("This report button has been replaced. Use the My Analysis button under the quiz leaderboard.", show_alert=True)
         return True
     if data == "gq:cancel":
         context.user_data.pop("group_quiz_pending", None)
@@ -830,12 +818,137 @@ async def _post_question(application, pool, session, question):
             pass
 
 
+def _html_page(title: str, body: str) -> str:
+    """Build a self-contained, mobile-friendly HTML report."""
+    return f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html_escape(title)}</title><style>
+:root{{--ink:#172033;--muted:#5c667a;--line:#dce2eb;--panel:#f4f7fb}}*{{box-sizing:border-box}}body{{margin:0;background:#f7f9fc;color:var(--ink);font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}main{{max-width:960px;margin:auto;padding:18px}}header{{background:#101b35;color:white;border-radius:16px;padding:22px;margin-bottom:16px}}header h1{{margin:0 0 6px;font-size:24px}}header p{{margin:0;color:#d5def0}}h2{{font-size:19px;margin:24px 0 10px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}}.card,.q{{background:white;border:1px solid var(--line);border-radius:12px;padding:14px}}.metric{{font-size:25px;font-weight:750}}.muted{{color:var(--muted)}}.q{{margin:10px 0;break-inside:avoid}}.q h3{{margin:0 0 8px;font-size:16px}}.options{{margin:8px 0;padding-left:22px}}.correct{{color:#137547;font-weight:700}}.wrong{{color:#b42318;font-weight:700}}.pill{{display:inline-block;padding:3px 8px;border-radius:99px;background:var(--panel);font-size:12px}}.bar{{height:9px;background:#e8edf5;border-radius:99px;overflow:hidden}}.bar span{{display:block;height:100%;background:#2463c5}}table{{width:100%;border-collapse:collapse;background:white}}th,td{{text-align:left;padding:9px;border-bottom:1px solid var(--line);font-size:13px}}footer{{color:var(--muted);font-size:12px;margin:24px 0}}@media(max-width:560px){{main{{padding:10px}}header{{padding:16px}}header h1{{font-size:21px}}th,td{{padding:7px}}}}
+</style></head><body><main>{body}<footer>BPSC Nexus · Group report excludes individual response data.</footer></main></body></html>'''
+
+
+def _options_dict(raw):
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+
+
+def _build_group_html(session_id, title, total, participants, votes, correct, wrong,
+                      unanswered, positive, negative, average_score, median_score,
+                      high_score, low_score, question_stats, answer_key):
+    body = [f'<header><h1>BPSC Nexus · Group Quiz #{int(session_id)}</h1><p>{html_escape(str(title))}</p><p>{int(total)} questions · {int(participants)} participants</p></header>']
+    metrics = [("Participants", participants), ("Questions", total), ("Submitted answers", votes), ("Correct responses", correct), ("Wrong responses", wrong), ("Unanswered", unanswered)]
+    body.append('<section class="grid">' + ''.join(f'<div class="card"><div class="muted">{html_escape(str(k))}</div><div class="metric">{int(v)}</div></div>' for k,v in metrics) + '</section>')
+    stat_cards = ''.join(f'<div class="card"><div class="muted">{label}</div><div class="metric">{value:.2f}</div></div>' for label,value in [("Average",average_score),("Median",median_score),("Highest",high_score),("Lowest",low_score)])
+    body.append(f'<h2>Score statistics</h2><section class="grid">{stat_cards}</section>')
+    body.append(f'<p class="muted">Scoring: +{positive:g} for correct answers · −{negative:g} for incorrect answers. Individual student scores and responses are not included.</p><h2>Question-wise group analysis</h2>')
+    for stat, answer in zip(question_stats, answer_key):
+        opts = _options_dict(answer.get('options')); qn = int(stat['position']) + 1
+        attempted_q = int(stat.get('attempted') or 0); correct_q = int(stat.get('correct') or 0); wrong_q = int(stat.get('incorrect') or 0)
+        skipped_q = max(0, int(participants) - attempted_q); acc = 100 * correct_q / attempted_q if attempted_q else 0
+        prompt = html_escape(str(answer.get('question_en') or '')); hi = html_escape(str(answer.get('question_hi') or ''))
+        opts_html = ''.join(f'<li class="{"correct" if str(k)==str(answer.get("correct_option")) else ""}">{html_escape(str(k))}. {html_escape(str(v))}{" ✓" if str(k)==str(answer.get("correct_option")) else ""}</li>' for k,v in opts.items())
+        explanation = '<p><b>Explanation:</b> ' + html_escape(str(answer.get('explanation_en') or '')) + (('<br>' + html_escape(str(answer.get('explanation_hi') or ''))) if answer.get('explanation_hi') else '') + '</p>' if (answer.get('explanation_en') or answer.get('explanation_hi')) else ''
+        body.append(f'<article class="q"><h3>Q{qn}. {prompt}</h3>{("<p>"+hi+"</p>") if hi else ""}<span class="pill">{acc:.1f}% correct among attempts</span><p class="muted">Attempted: {attempted_q} · Correct: {correct_q} · Wrong: {wrong_q} · Unanswered: {skipped_q} · Average response: {float(stat.get("avg_response_seconds") or 0):.1f}s</p><div class="bar"><span style="width:{min(100,max(0,acc)):.1f}%"></span></div><ol class="options">{opts_html}</ol>{explanation}</article>')
+    body.append('<h2>Most difficult questions</h2><table><thead><tr><th>Question</th><th>Correct</th><th>Wrong</th><th>Accuracy</th></tr></thead><tbody>')
+    ranked = sorted(question_stats, key=lambda x: ((int(x.get('correct') or 0) / int(x.get('attempted') or 1)) if int(x.get('attempted') or 0) else 0, int(x['position'])))[:10]
+    for st in ranked:
+        at=int(st.get('attempted') or 0); cq=int(st.get('correct') or 0); wq=int(st.get('incorrect') or 0); ac=100*cq/at if at else 0
+        body.append(f'<tr><td>Q{int(st["position"])+1}</td><td>{cq}</td><td>{wq}</td><td>{ac:.1f}%</td></tr>')
+    body.append('</tbody></table>')
+    return _html_page(f'BPSC Nexus Group Quiz {session_id}', ''.join(body))
+
+
+async def send_personal_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, pool, session_id: int) -> bool:
+    """Send only the requesting Telegram user's personal analysis in private chat."""
+    user = update.effective_user; message = update.effective_message
+    if user is None or message is None or message.chat.type != ChatType.PRIVATE:
+        return False
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT id,quiz_title,questions_count,positive_marks,negative_marks,status FROM group_quiz_sessions WHERE id=%s", (int(session_id),))
+        session = await cur.fetchone()
+        if not session or session['status'] != 'completed':
+            await message.reply_text("This quiz report is not ready yet, or the quiz reference is invalid.")
+            return True
+        cur = await conn.execute("""SELECT q.position,q.question_en,q.question_hi,q.options,q.correct_option,q.explanation_en,q.explanation_hi,q.opened_at,a.selected_letter,a.answered_at
+            FROM group_quiz_session_questions q LEFT JOIN group_quiz_answers a
+              ON a.session_id=q.session_id AND a.position=q.position AND a.telegram_id=%s
+            WHERE q.session_id=%s ORDER BY q.position""", (int(user.id), int(session_id)))
+        rows = await cur.fetchall()
+    answered_rows = [r for r in rows if r.get('selected_letter') is not None]
+    if not answered_rows:
+        await message.reply_text("No saved answers were found for your Telegram account in this quiz. Make sure you participated using this account.")
+        return True
+    total = int(session['questions_count'] or len(rows)); positive=float(session['positive_marks'] or 1); negative=float(session['negative_marks'] or 0)
+    correct = sum(1 for r in answered_rows if str(r['selected_letter']) == str(r['correct_option']))
+    wrong = sum(1 for r in answered_rows if str(r['selected_letter']) != str(r['correct_option']))
+    attempted=len(answered_rows); skipped=max(0,total-attempted); score=correct*positive-wrong*negative; accuracy=100*correct/attempted if attempted else 0
+    body=[f'<header><h1>My Personal Analysis</h1><p>{html_escape(str(session["quiz_title"]))}</p><p>Quiz #{int(session_id)} · {total} questions</p></header>']
+    metrics=[('My score',f'{score:.2f}'),('Accuracy',f'{accuracy:.1f}%'),('Correct',correct),('Wrong',wrong),('Attempted',attempted),('Skipped',skipped)]
+    body.append('<section class="grid">'+''.join(f'<div class="card"><div class="muted">{html_escape(str(k))}</div><div class="metric">{html_escape(str(v))}</div></div>' for k,v in metrics)+'</section><h2>My question-by-question review</h2>')
+    for r in rows:
+        qn=int(r['position'])+1; opts=_options_dict(r.get('options')); selected=r.get('selected_letter'); correct_letter=r.get('correct_option')
+        state='Skipped' if selected is None else ('Correct' if str(selected)==str(correct_letter) else 'Incorrect')
+        state_class='correct' if state=='Correct' else ('wrong' if state=='Incorrect' else 'muted')
+        body.append(f'<article class="q"><h3>Q{qn}. {html_escape(str(r.get("question_en") or ""))}</h3>')
+        if r.get('question_hi'): body.append(f'<p>{html_escape(str(r["question_hi"]))}</p>')
+        my_answer = str(selected) + '. ' + str(opts.get(selected, '')) if selected is not None else 'Not attempted'
+        correct_answer = str(correct_letter) + '. ' + str(opts.get(correct_letter, ''))
+        body.append(f'<p><span class="pill {state_class}">{state}</span></p><p><b>My answer:</b> {html_escape(my_answer)}</p><p class="correct"><b>Correct answer:</b> {html_escape(correct_answer)}</p><ol class="options">')
+        for key,val in opts.items():
+            cls='correct' if str(key)==str(correct_letter) else ('wrong' if selected is not None and str(key)==str(selected) else '')
+            body.append(f'<li class="{cls}">{html_escape(str(key))}. {html_escape(str(val))}</li>')
+        body.append('</ol>')
+        if r.get('explanation_en'): body.append(f'<p><b>Explanation:</b> {html_escape(str(r["explanation_en"]))}</p>')
+        if r.get('explanation_hi'): body.append(f'<p>{html_escape(str(r["explanation_hi"]))}</p>')
+        if selected is not None and r.get('answered_at') and r.get('opened_at'):
+            try:
+                secs=max(0,(r['answered_at']-r['opened_at']).total_seconds()); body.append(f'<p class="muted">Your response time: {secs:.1f}s</p>')
+            except Exception: pass
+        body.append('</article>')
+    html_doc=_html_page(f'My BPSC Nexus Analysis - Quiz {session_id}', ''.join(body))
+    bio=BytesIO(html_doc.encode('utf-8')); bio.name=f'bpsc_nexus_my_analysis_quiz_{int(session_id)}.html'
+    try:
+        await context.bot.send_document(chat_id=user.id, document=bio, filename=bio.name, caption=f'📊 Your personal analysis for "{session["quiz_title"]}". This report contains only your own responses.')
+    except Exception:
+        log.exception('Could not send personal quiz report to Telegram user %s', user.id)
+        await message.reply_text("I couldn't send the report. Please press Start in this private chat and try /myanalysis again.")
+    return True
+
+
+async def personal_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE, pool):
+    user=update.effective_user; message=update.effective_message
+    if not user or not message: return
+    if message.chat.type != ChatType.PRIVATE:
+        await message.reply_text("For privacy, open @BpscNexustestbot in a private chat to view your own analysis.")
+        return
+    session_id=None
+    if context.args:
+        try: session_id=int(context.args[0])
+        except ValueError:
+            await message.reply_text("Usage: /myanalysis or /myanalysis <quiz_id>"); return
+    else:
+        async with pool.connection() as conn:
+            cur=await conn.execute("""SELECT s.id FROM group_quiz_sessions s JOIN group_quiz_answers a ON a.session_id=s.id
+                WHERE s.status='completed' AND a.telegram_id=%s GROUP BY s.id,s.completed_at ORDER BY s.completed_at DESC LIMIT 1""",(int(user.id),))
+            latest=await cur.fetchone()
+        if not latest:
+            await message.reply_text("No completed group quiz with saved answers was found for your account yet.")
+            return
+        session_id=int(latest['id'])
+    await send_personal_analysis(update,context,pool,session_id)
+
+
+
 async def _finish_session(application, pool, session):
     sid=int(session["id"])
     async with pool.connection() as conn:
         cur=await conn.execute("""UPDATE group_quiz_sessions SET status='completed',completed_at=COALESCE(completed_at,NOW())
             WHERE id=%s AND (status='active' OR (status='completed' AND report_sent=FALSE))
-            RETURNING questions_count,quiz_title,positive_marks,negative_marks,started_by,chat_id,started_at,mode,summary_sent,answer_key_sent""",(sid,))
+            RETURNING questions_count,quiz_title,positive_marks,negative_marks,started_by,chat_id,started_at,mode,summary_sent,answer_key_sent,group_report_sent""",(sid,))
         finished=await cur.fetchone()
         if not finished: return
         positive=float(finished["positive_marks"] or 1); negative=float(finished["negative_marks"] or 0.333)
@@ -889,9 +1002,12 @@ async def _finish_session(application, pool, session):
     # Group summary stays concise; a persisted guard prevents duplicate announcements on retries.
     if not finished.get("summary_sent",False):
         try:
+            bot_username = application.bot_data.get("bot_username")
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "📊 My Analysis", url=f"https://t.me/{bot_username}?start=gqa_{sid}"
+            )]]) if bot_username else None
             await application.bot.send_message(
-                chat_id=int(finished["chat_id"]), text="\n".join(lines)[:3900],
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Full Admin Analysis (admins only)",callback_data=f"gq:report:{sid}")]])
+                chat_id=int(finished["chat_id"]), text="\n".join(lines)[:3900], reply_markup=keyboard
             )
             async with pool.connection() as conn:
                 await conn.execute("UPDATE group_quiz_sessions SET summary_sent=TRUE WHERE id=%s",(sid,))
@@ -918,46 +1034,28 @@ async def _finish_session(application, pool, session):
                 raise
         async with pool.connection() as conn:
             await conn.execute("UPDATE group_quiz_sessions SET answer_key_sent=TRUE WHERE id=%s",(sid,))
-    admin_lines=[f"📊 FULL ADMIN REPORT · Group Quiz #{sid}",str(finished["quiz_title"]),f"Participants: {participants} · Questions: {total}",f"Correct: {correct} · Wrong: {wrong} · Unanswered: {unanswered}",f"Scoring: +{positive:g} / −{negative:g}",f"Elapsed: {elapsed//60}m {elapsed%60}s",f"Score average/median/high/low: {average_score:.2f}/{median_score:.2f}/{high_score:.2f}/{low_score:.2f}","","INDIVIDUAL PERFORMANCE"]
-    for row in scores:
-        name=(row["first_name"] or row["username"] or f"Student {row['telegram_id']}").replace("\n"," ")[:32]
-        c=int(row["correct"] or 0); w=int(row["incorrect"] or 0); attempted=int(row["attempted"] or 0); score=c*positive-w*negative; acc=100*c/attempted if attempted else 0
-        span=0
-        if row["first_answer"] and row["last_answer"]: span=max(0,int((row["last_answer"]-row["first_answer"]).total_seconds()))
-        response_total=float(row["total_response_seconds"] or 0); response_avg=float(row["avg_response_seconds"] or 0)
-        admin_lines.append(f"{name}: {score:.2f} pts | {acc:.1f}% accuracy | {c} correct, {w} wrong, {max(0,total-attempted)} unanswered | active response time {response_total:.1f}s total, {response_avg:.1f}s avg/question | answer span {span}s")
-    admin_lines += ["","QUESTION ANALYSIS (attempted / correct / wrong / average response seconds)"]
-    for stat in question_stats:
-        attempted_q=int(stat["attempted"] or 0); correct_q=int(stat["correct"] or 0); wrong_q=int(stat["incorrect"] or 0)
-        accuracy_q=(100*correct_q/attempted_q) if attempted_q else 0
-        avg_seconds=float(stat["avg_response_seconds"] or 0)
-        common_wrong=stat["most_common_wrong"] or "—"
-        admin_lines.append(f"Q{int(stat['position'])+1}: {attempted_q} attempted, {correct_q} correct, {wrong_q} wrong, {accuracy_q:.1f}% accuracy, avg {avg_seconds:.1f}s, most common wrong option {common_wrong}")
-    for row in answer_key:
-        opts=row["options"] if isinstance(row["options"],dict) else json.loads(row["options"] or "{}")
-        item=f"Q{int(row['position'])+1}. {row['correct_option']}. {opts.get(row['correct_option'],'')}"
-        if row.get("explanation_en"): item += " — "+str(row["explanation_en"])[:220]
-        if row.get("explanation_hi"): item += " / "+str(row["explanation_hi"])[:220]
-        admin_lines.append(item)
-    chunks=[]; buf=""
-    for line in admin_lines:
-        if len(buf)+len(line)+1>3500: chunks.append(buf); buf=""
-        buf += ("\n" if buf else "")+line
-    if buf: chunks.append(buf)
-    if chunks:
-        chunks[-1] += "\n\nContinue practising with @BpscNexustestbot: https://t.me/BpscNexustestbot"
-    # Persist every report chunk so an admin can retrieve it later from the group button.
-    async with pool.connection() as conn:
-        await conn.execute("DELETE FROM group_quiz_admin_reports WHERE session_id=%s",(sid,))
-        for chunk_no,chunk in enumerate(chunks,1):
-            await conn.execute("INSERT INTO group_quiz_admin_reports(session_id,chunk_no,report_text) VALUES(%s,%s,%s)",(sid,chunk_no,chunk))
-    for chunk in chunks:
-        try: await application.bot.send_message(chat_id=int(finished["started_by"]),text=chunk)
+    # Public HTML report contains group aggregates and question analysis only.
+    # It deliberately excludes student names, individual scores and personal answers.
+    if not finished.get("group_report_sent", False):
+        group_html = _build_group_html(sid, finished["quiz_title"], total, participants, votes,
+            correct, wrong, unanswered, positive, negative, average_score, median_score,
+            high_score, low_score, question_stats, answer_key)
+        report_file = BytesIO(group_html.encode("utf-8"))
+        report_file.name = f"BPSC_Nexus_Group_Quiz_{sid}_Analysis.html"
+        try:
+            await application.bot.send_document(
+                chat_id=int(finished["chat_id"]), document=report_file, filename=report_file.name,
+                caption=f"📊 Detailed group analysis for quiz #{sid}. This report contains group-level question statistics and explanations, not students' individual responses."
+            )
+            async with pool.connection() as conn:
+                await conn.execute("UPDATE group_quiz_sessions SET group_report_sent=TRUE WHERE id=%s", (sid,))
         except Exception:
-            log.info("Could not DM full admin report for session %s; group report button remains available",sid,exc_info=True); break
+            log.exception("Could not publish group HTML report for quiz %s; it will be retried", sid)
+            raise
+    # Personal reports are generated only when each student requests their own report.
+    # No individual analysis is sent automatically to the quiz creator/admin.
     async with pool.connection() as conn:
-        await conn.execute("UPDATE group_quiz_sessions SET report_sent=TRUE WHERE id=%s",(sid,))
-
+        await conn.execute("UPDATE group_quiz_sessions SET report_sent=TRUE WHERE id=%s", (sid,))
 
 async def scheduler(application, pool):
     """Persisted scheduler. Poll state and due times survive service restarts."""

@@ -213,6 +213,8 @@ async def post_init(application: Application) -> None:
     await ensure_schema()
     await qb.ensure_schema(pool)
     await gq.ensure_schema(pool)
+    me = await application.bot.get_me()
+    application.bot_data["bot_username"] = me.username
     application.bot_data["db_pool"] = pool
     # Start the persistent group-poll scheduler once the shared database is ready.
     if application.bot_data.get("group_quiz_scheduler_task") is None:
@@ -223,6 +225,7 @@ async def post_init(application: Application) -> None:
             BotCommand("quiz", "Open available personal quizzes"),
             BotCommand("tests", "Browse published tests"),
             BotCommand("mypremium", "View membership status"),
+            BotCommand("myanalysis", "Get your private group quiz analysis"),
             BotCommand("tutorial", "How to use BPSC Nexus"),
             BotCommand("help", "Show commands and help"),
             BotCommand("groupgrant", "Activate group quiz membership (owner)"),
@@ -395,6 +398,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if user is None or message is None:
         return
     await save_user(update)
+    if context.args and context.args[0].startswith("gqa_"):
+        try:
+            session_id = int(context.args[0][4:])
+        except ValueError:
+            await message.reply_text("That personal analysis link is invalid. Use /myanalysis to get your latest report.")
+            return
+        await gq.send_personal_analysis(update, context, pool, session_id)
+        return
     if context.args and context.args[0].startswith("quiz_"):
         await message.reply_text("This quiz is available only inside the BPSC Nexus Mini App. Open the app below.", reply_markup=main_user_keyboard())
         return
@@ -417,6 +428,10 @@ def main_user_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📘 Tutorial", callback_data="user:tutorial")],
     ])
     return InlineKeyboardMarkup(keyboard)
+
+
+async def personal_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await gq.personal_analysis_command(update, context, pool)
 
 
 async def tutorial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1357,6 +1372,7 @@ def main() -> None:
     application.add_handler(CommandHandler("quiz", quiz_command))
     application.add_handler(CommandHandler("tests", tests_command))
     application.add_handler(CommandHandler("mypremium", mypremium_command))
+    application.add_handler(CommandHandler("myanalysis", personal_analysis_command))
     application.add_handler(CommandHandler("tutorial", tutorial_command))
     application.add_handler(CommandHandler("admin", admin_command))
     # New one-word group command names; old aliases remain registered for backwards compatibility.
