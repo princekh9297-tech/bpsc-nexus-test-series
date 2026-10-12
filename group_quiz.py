@@ -102,12 +102,42 @@ async def _require_group_membership(message, pool, chat) -> bool:
 
 
 async def _is_chat_admin(context, chat_id: int, user_id: int) -> bool:
+    """Verify group admin/owner status using both Telegram API methods."""
+    def normalize_status(member) -> str:
+        status = getattr(member, "status", "")
+        # Support plain strings and enum-like values across PTB versions.
+        status = getattr(status, "value", status)
+        return str(status or "").strip().lower().rsplit(".", 1)[-1]
+
+    admin_statuses = {"administrator", "creator", "owner", "admin"}
+    chat_id, user_id = int(chat_id), int(user_id)
+
     try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
+        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        if normalize_status(member) in admin_statuses:
+            return True
+        log.info("Admin check: get_chat_member returned status=%r for user=%s chat=%s",
+                 normalize_status(member), user_id, chat_id)
     except Exception:
-        log.exception("Could not verify group admin status")
-        return False
+        log.exception("get_chat_member failed for user=%s chat=%s", user_id, chat_id)
+
+    # Always check the administrator list as a second source, including when
+    # get_chat_member returns a status that doesn't look like an admin.
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id=chat_id)
+        for admin in admins:
+            admin_user = getattr(admin, "user", None)
+            if admin_user and int(admin_user.id) == user_id:
+                status = normalize_status(admin)
+                # Presence in Telegram's administrator list is authoritative.
+                if status in admin_statuses or not status:
+                    return True
+                log.warning("User %s appeared in admin list with unexpected status=%r in chat=%s",
+                            user_id, status, chat_id)
+    except Exception:
+        log.exception("get_chat_administrators failed for user=%s chat=%s", user_id, chat_id)
+
+    return False
 
 
 async def group_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
