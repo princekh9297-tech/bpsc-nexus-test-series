@@ -41,6 +41,8 @@ DDL = [
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS summary_sent BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS answer_key_sent BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS group_report_sent BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS launch_announcement_message_id BIGINT",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS launch_announcement_deleted BOOLEAN NOT NULL DEFAULT FALSE",
 
     "CREATE INDEX IF NOT EXISTS idx_group_quiz_sessions_due ON group_quiz_sessions(status,next_at) WHERE status='active'",
     """CREATE TABLE IF NOT EXISTS group_quiz_session_questions (
@@ -694,8 +696,17 @@ async def _launch_pending_quiz(q,context,pool,pending,user):
             )
     context.user_data.pop("group_quiz_pending",None)
     await q.answer("Quiz launched.")
-    range_text=f"\nQuestion range: {pending.get('range_start','?')}–{pending.get('range_end','?')}" if pending.get("range_start") is not None else ""
-    await q.edit_message_text(f"✅ Group quiz #{sid} started\n{quiz['title']}{range_text}\nExactly {len(prepared)} questions · {mode.title()} Mode · {interval}s/question\nScoring: +{positive:g} correct / −{negative:g} wrong")
+    range_text=f"\n𝗤𝗨𝗘𝗦𝗧𝗜𝗢𝗡 𝗥𝗔𝗡𝗚𝗘  {pending.get('range_start','?')}–{pending.get('range_end','?')}" if pending.get("range_start") is not None else ""
+    confirmation = (
+        f"✅ 𝗕𝗣𝗦𝗖 𝗡𝗘𝗫𝗨𝗦  ·  𝗤𝗨𝗜𝗭 #{sid}\n\n"
+        f"𝗤𝗨𝗜𝗭 𝗟𝗜𝗩𝗘\n{quiz['title']}{range_text}\n\n"
+        f"𝗤𝗨𝗘𝗦𝗧𝗜𝗢𝗡𝗦   {len(prepared)}\n"
+        f"𝗠𝗢𝗗𝗘   {mode.title()}\n"
+        f"𝗧𝗜𝗠𝗘   {interval}s / question\n"
+        f"𝗦𝗖𝗢𝗥𝗜𝗡𝗚   +{positive:g} correct  /  −{negative:g} wrong\n\n"
+        "Stay focused. Your first question is on its way."
+    )
+    await q.edit_message_text(confirmation)
     # Publish Q1 immediately instead of waiting for the scheduler's next polling tick.
     # _post_question atomically claims the pending row, so the scheduler cannot duplicate it.
     try:
@@ -770,19 +781,30 @@ async def _post_question(application, pool, session, question):
                 await application.bot.send_message(chat_id=session["chat_id"], text=f"⚠️ Group quiz #{sid} paused because a poll's send status could not be confirmed after a restart. Start a new session to avoid duplicate questions.")
             return
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT announcement_sent FROM group_quiz_sessions WHERE id=%s",(sid,))
-        promo_row=await cur.fetchone()
+        cur = await conn.execute("SELECT announcement_sent FROM group_quiz_sessions WHERE id=%s", (sid,))
+        promo_row = await cur.fetchone()
     if promo_row and not promo_row["announcement_sent"]:
         try:
-            await application.bot.send_message(chat_id=int(session["chat_id"]),text=f"🚀 BPSC NEXUS · GROUP QUIZ #{sid}\n{session.get('quiz_title','Group Quiz')}\n{int(session['questions_count'])} questions · {str(session.get('mode','learning')).title()} Mode · {int(session['interval_seconds'])}s/question\n\nPractice more with @BpscNexustestbot: https://t.me/BpscNexustestbot")
+            launch_text = (
+                f"🚀 𝗕𝗣𝗦𝗖 𝗡𝗘𝗫𝗨𝗦  ·  𝗚𝗥𝗢𝗨𝗣 𝗤𝗨𝗜𝗭 #{sid}\n\n"
+                f"𝗡𝗔𝗧𝗜𝗢𝗡𝗔𝗟 𝗘𝗩𝗘𝗡𝗧𝗦\n{session.get('quiz_title','Group Quiz')}\n\n"
+                f"𝗤𝗨𝗘𝗦𝗧𝗜𝗢𝗡𝗦   {int(session['questions_count'])}\n"
+                f"𝗠𝗢𝗗𝗘   {str(session.get('mode','learning')).title()}\n"
+                f"𝗧𝗜𝗠𝗘   {int(session['interval_seconds'])}s / question\n\n"
+                "Sharpen your preparation. Challenge your knowledge. Build your rank.\n\n"
+                "𝗣𝗥𝗔𝗖𝗧𝗜𝗦𝗘 𝗠𝗢𝗥𝗘\n@BpscNexustestbot"
+            )
+            announcement = await application.bot.send_message(chat_id=int(session["chat_id"]), text=launch_text)
+            async with pool.connection() as conn:
+                await conn.execute("UPDATE group_quiz_sessions SET announcement_sent=TRUE,launch_announcement_message_id=%s WHERE id=%s", (int(announcement.message_id), sid))
         except Exception:
-            log.warning("Promotional announcement failed; proceeding with quiz session %s",sid,exc_info=True)
-        finally:
+            log.warning("Promotional announcement failed; proceeding with quiz session %s", sid, exc_info=True)
+            # Optional promotion failure must never stop a quiz.
             try:
                 async with pool.connection() as conn:
-                    await conn.execute("UPDATE group_quiz_sessions SET announcement_sent=TRUE WHERE id=%s",(sid,))
+                    await conn.execute("UPDATE group_quiz_sessions SET announcement_sent=TRUE WHERE id=%s", (sid,))
             except Exception:
-                log.warning("Could not persist announcement guard for session %s",sid,exc_info=True)
+                log.warning("Could not persist announcement guard for session %s", sid, exc_info=True)
     opts = question["options"] if isinstance(question["options"], dict) else json.loads(question["options"] or "{}")
     letters = question["option_letters"] if isinstance(question["option_letters"], list) else json.loads(question["option_letters"] or "[]")
     question_text = str(question["question_en"] or "Question")
@@ -807,6 +829,20 @@ async def _post_question(application, pool, session, question):
         async with pool.connection() as conn:
             await conn.execute("UPDATE group_quiz_session_questions SET poll_id=%s,message_id=%s,status='open',opened_at=NOW(),updated_at=NOW() WHERE session_id=%s AND position=%s", (str(poll.poll.id), int(poll.message_id), sid, position))
             await conn.execute("UPDATE group_quiz_sessions SET next_at=NOW()+(%s * INTERVAL '1 second') WHERE id=%s", (int(session["interval_seconds"]), sid))
+        # Confirmation is sent before this function; delete the launch notice only
+        # after the first question was successfully published and persisted.
+        if position == 0:
+            async with pool.connection() as conn:
+                cur = await conn.execute("SELECT launch_announcement_message_id,launch_announcement_deleted FROM group_quiz_sessions WHERE id=%s", (sid,))
+                announcement_row = await cur.fetchone()
+            if announcement_row and announcement_row.get("launch_announcement_message_id") and not announcement_row.get("launch_announcement_deleted"):
+                try:
+                    await application.bot.delete_message(chat_id=int(session["chat_id"]), message_id=int(announcement_row["launch_announcement_message_id"]))
+                    async with pool.connection() as conn:
+                        await conn.execute("UPDATE group_quiz_sessions SET launch_announcement_deleted=TRUE WHERE id=%s", (sid,))
+                except Exception:
+                    # Telegram permission/deletion failures must not interrupt the live quiz.
+                    log.warning("Could not delete launch announcement for quiz session %s; check bot delete permissions", sid, exc_info=True)
     except Exception:
         log.exception("Failed to publish group poll for session %s position %s", sid, position)
         async with pool.connection() as conn:
@@ -993,12 +1029,31 @@ async def _finish_session(application, pool, session):
         high_score=max(score_values); low_score=min(score_values)
     else:
         average_score=median_score=high_score=low_score=0.0
-    lines=[f"🏁 BPSC Nexus Group Quiz Complete · #{sid}",str(finished["quiz_title"]),f"Questions: {total} · Participants: {participants}",f"Responses: {votes} · Correct: {correct} · Wrong: {wrong} · Unanswered: {unanswered}",f"Scoring: +{positive:g} correct / −{negative:g} wrong",f"Quiz elapsed: {elapsed//60}m {elapsed%60}s",f"Score average/median/high/low: {average_score:.2f}/{median_score:.2f}/{high_score:.2f}/{low_score:.2f}","","🏆 LEADERBOARD"]
+    # Executive Elite typography; fixed-width columns are rendered in Telegram HTML <pre>.
+    heading = f"🏁 𝗕𝗣𝗦𝗖 𝗡𝗘𝗫𝗨𝗦  ·  𝗤𝗨𝗜𝗭 #{sid}"
+    title_text = html_escape(str(finished["quiz_title"] or "Group Quiz"))
+    leaderboard_rows = [f"{'RANK':<4} {'STUDENT':<15} {'SCORE':>7} {'ACC':>5} {'C':>3} {'W':>3} {'SKIP':>4}", "─" * 49]
     for rank,row in enumerate(scores[:10],1):
-        name=(row["first_name"] or row["username"] or f"Student {row['telegram_id']}").replace("\n"," ")[:30]
+        raw_name = str(row["first_name"] or row["username"] or f"Student {row['telegram_id']}").replace("\n", " ").replace("\r", " ")
+        name = raw_name[:15]
         c=int(row["correct"] or 0); w=int(row["incorrect"] or 0); attempted=int(row["attempted"] or 0); skipped=max(0,total-attempted); score=c*positive-w*negative; accuracy=(100*c/attempted) if attempted else 0
-        lines.append(f"{rank}. {name} — {score:.2f} pts · {accuracy:.0f}% accuracy · {c}✓ {w}✗ {skipped} unanswered")
-    lines += ["","Practice more with @BpscNexustestbot: https://t.me/BpscNexustestbot"]
+        leaderboard_rows.append(f"{rank:02d}   {name:<15} {score:>7.2f} {accuracy:>4.0f}% {c:>3} {w:>3} {skipped:>4}")
+    leaderboard = "\n".join(leaderboard_rows)
+    lines = (
+        f"<b>{heading}</b>\n\n"
+        f"<b>{title_text}</b>\n"
+        f"<i>𝗙𝗜𝗡𝗔𝗟 𝗥𝗘𝗦𝗨𝗟𝗧𝗦 · COMPLETED</i>\n\n"
+        f"𝗤𝗨𝗘𝗦𝗧𝗜𝗢𝗡𝗦   {total}     𝗣𝗔𝗥𝗧𝗜𝗖𝗜𝗣𝗔𝗡𝗧𝗦   {participants}\n"
+        f"𝗥𝗘𝗦𝗣𝗢𝗡𝗦𝗘𝗦   {votes}     𝗖𝗢𝗥𝗥𝗘𝗖𝗧   {correct}     𝗪𝗥𝗢𝗡𝗚   {wrong}\n"
+        f"𝗨𝗡𝗔𝗡𝗦𝗪𝗘𝗥𝗘𝗗   {unanswered}     𝗗𝗨𝗥𝗔𝗧𝗜𝗢𝗡   {elapsed//60}m {elapsed%60}s\n"
+        f"𝗦𝗖𝗢𝗥𝗜𝗡𝗚   +{positive:g} correct  /  −{negative:g} wrong\n"
+        f"𝗦𝗖𝗢𝗥𝗘 𝗦𝗧𝗔𝗧𝗦   Avg {average_score:.2f}  ·  Median {median_score:.2f}  ·  High {high_score:.2f}  ·  Low {low_score:.2f}\n\n"
+        f"<b>🏆 𝗙𝗜𝗡𝗔𝗟 𝗟𝗘𝗔𝗗𝗘𝗥𝗕𝗢𝗔𝗥𝗗</b>\n"
+        f"<pre>{html_escape(leaderboard)}</pre>\n"
+        "𝗬𝗢𝗨𝗥 𝗣𝗘𝗥𝗙𝗢𝗥𝗠𝗔𝗡𝗖𝗘. 𝗬𝗢𝗨𝗥 𝗣𝗥𝗢𝗚𝗥𝗘𝗦𝗦.\n"
+        "Tap <b>📊 MY ANALYSIS</b> below for your private scorecard, answers and revision list.\n\n"
+        "Practice more · @BpscNexustestbot"
+    )
     # Group summary stays concise; a persisted guard prevents duplicate announcements on retries.
     if not finished.get("summary_sent",False):
         try:
@@ -1007,7 +1062,7 @@ async def _finish_session(application, pool, session):
                 "📊 My Analysis", url=f"https://t.me/{bot_username}?start=gqa_{sid}"
             )]]) if bot_username else None
             await application.bot.send_message(
-                chat_id=int(finished["chat_id"]), text="\n".join(lines)[:3900], reply_markup=keyboard
+                chat_id=int(finished["chat_id"]), text=lines[:3900], parse_mode="HTML", reply_markup=keyboard
             )
             async with pool.connection() as conn:
                 await conn.execute("UPDATE group_quiz_sessions SET summary_sent=TRUE WHERE id=%s",(sid,))
