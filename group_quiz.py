@@ -345,7 +345,9 @@ async def group_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         log.exception("Early stop finalization failed for session %s", row["id"])
         await message.reply_text(f"⚠️ Quiz #{row['id']} has been stopped. Its final report is being retried; run /quizstatus in a moment.")
         return
-    await message.reply_text(f"🏁 Quiz #{row['id']} stopped early and marked COMPLETED. The summary, leaderboard and detailed admin analysis are being finalized.")
+    # Successful manual stop is finalized through the normal completion flow.
+    # Do not post a second status message in the group; the single final notice
+    # and attached group report are the only completion output.
 
 
 async def group_pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -602,7 +604,7 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
             [InlineKeyboardButton("Cancel",callback_data="gq:cancel")],
         ])); return True
     if data.startswith("gq:report:"):
-        await q.answer("This report button has been replaced. Use the My Analysis button under the quiz leaderboard.", show_alert=True)
+        await q.answer("This report button has been replaced. Use the My Analysis button under the quiz completion message.", show_alert=True)
         return True
     if data == "gq:cancel":
         context.user_data.pop("group_quiz_pending", None)
@@ -978,7 +980,18 @@ async def send_personal_analysis(update: Update, context: ContextTypes.DEFAULT_T
     html_doc=_html_page(f'My BPSC Nexus Analysis - Quiz {session_id}', ''.join(body), 'Personal edition · private report')
     bio=BytesIO(html_doc.encode('utf-8')); bio.name=f'bpsc_nexus_my_analysis_quiz_{int(session_id)}.html'
     try:
-        await context.bot.send_document(chat_id=user.id, document=bio, filename=bio.name, caption=f'📊 Your personal analysis for "{session["quiz_title"]}". This report contains only your own responses.')
+        await context.bot.send_document(
+            chat_id=user.id,
+            document=bio,
+            filename=bio.name,
+            caption=(
+                "📊 <b>Your Personal Quiz Report Is Ready</b>\n\n"
+                "Your performance summary, answer review and explanations are included in the attached report.\n\n"
+                "🎯 Review your mistakes, strengthen weak areas, and make every attempt count.\n"
+                "<b>Keep improving. Keep progressing.</b>"
+            ),
+            parse_mode="HTML",
+        )
     except Exception:
         log.exception('Could not send personal quiz report to Telegram user %s', user.id)
         await message.reply_text("I couldn't send the report. Please press Start in this private chat and try /myanalysis again.")
@@ -1059,21 +1072,15 @@ async def _finish_session(application, pool, session):
         high_score=max(score_values); low_score=min(score_values)
     else:
         average_score=median_score=high_score=low_score=0.0
-    # Nexus Magazine: a concise completion notice; the attached HTML carries the full leaderboard and analysis.
-    heading = f"🏁 𝗕𝗣𝗦𝗖 𝗡𝗘𝗫𝗨𝗦 · 𝗤𝗨𝗜𝗭 #{sid}"
-    title_text = html_escape(str(finished["quiz_title"] or "Group Quiz"))
+    # Nexus Magazine: one concise group completion notice. Detailed statistics
+    # live in the attached HTML report, not in a second text leaderboard message.
+    heading = f"🏁 BPSC NEXUS · QUIZ #{sid}"
     lines = (
-        f"<b>{heading}</b>\n"
-        f"<i>FINAL RESULTS · COMPLETED</i>\n\n"
-        f"<b>{title_text}</b>\n"
-        f"<code>QUESTIONS      {total:>3}   PARTICIPANTS {participants:>3}\n"
-        f"RESPONSES    {votes:>3}   CORRECT      {correct:>3}\n"
-        f"WRONG        {wrong:>3}   UNANSWERED   {unanswered:>3}\n"
-        f"DURATION {elapsed//60}m {elapsed%60:02d}s</code>\n"
-        f"Scoring: <b>+{positive:g}</b> correct · <b>−{negative:g}</b> incorrect\n\n"
-        f"📖 Full leaderboard, question-wise statistics, answer key and explanations are in the attached <b>Nexus Magazine report</b>.\n\n"
-        f"<b>📊 MY ANALYSIS</b> · Open the button below for your private scorecard.\n"
-        f"Practice more · @BpscNexustestbot"
+        f"<b>{heading}</b>\n\n"
+        "✅ Quiz concluded successfully.\n\n"
+        "📑 The complete results and detailed performance report are attached.\n\n"
+        "📊 <b>MY ANALYSIS</b> · Access your personal performance report using the button below.\n\n"
+        "@BpscNexustestbot"
     )
 
     # Claim each Telegram delivery atomically. This prevents concurrent scheduler
