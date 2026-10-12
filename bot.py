@@ -12,6 +12,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppI
 from telegram.ext import PollAnswerHandler
 import question_bank as qb
 import group_quiz as gq
+import leaderboard as lb
 
 from telegram.ext import (
     Application,
@@ -257,6 +258,8 @@ async def post_init(application: Application) -> None:
     await ensure_schema()
     await qb.ensure_schema(pool)
     await gq.ensure_schema(pool)
+    await lb.backfill_bank_attempts(pool)
+    await lb.backfill_group_sessions(pool)
     application.bot_data["db_pool"] = pool
     try:
         await application.bot.set_my_commands([

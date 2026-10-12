@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any
 
+import leaderboard as lb
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes
@@ -563,6 +565,7 @@ async def ensure_schema(pool):
         cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY name")
         for row in await cur.fetchall():
             if row["name"] not in SUBJECTS: SUBJECTS.append(row["name"])
+    await lb.ensure_schema(pool)
     log.info("Question bank schema verified.")
 
 
@@ -1335,7 +1338,8 @@ async def _exam_timeout(application, user_id, chat_id, attempt_id, pool, duratio
         elif ans==r["correct_option"]: correct+=1; score+=pos
         else: incorrect+=1; score-=neg
     async with pool.connection() as conn:
-        await conn.execute("UPDATE bank_quiz_attempts SET submitted_at=NOW(),correct_count=%s,incorrect_count=%s,skipped_count=%s,score=%s WHERE id=%s AND submitted_at IS NULL",(correct,incorrect,skipped,round(score,2),attempt_id))
+        cur=await conn.execute("UPDATE bank_quiz_attempts SET submitted_at=NOW(),correct_count=%s,incorrect_count=%s,skipped_count=%s,score=%s WHERE id=%s AND submitted_at IS NULL RETURNING id",(correct,incorrect,skipped,round(score,2),attempt_id))
+        if await cur.fetchone(): await lb.record_bank_attempt(conn,attempt_id,user_id,"Student")
     user_data.pop("qb_attempt",None)
     accuracy=(correct/(correct+incorrect)*100) if correct+incorrect else 0
     text=f"⏱ Time is up — {quiz['title']}\n\nTotal: {len(qs)}\nCorrect: {correct}\nIncorrect: {incorrect}\nNot attempted: {skipped}\nAccuracy (attempted): {accuracy:.1f}%\nScore: {score:.2f} / {len(qs)*pos:.2f}\n\nAnswer review:"
@@ -1357,7 +1361,8 @@ async def submit_attempt(q,context,pool):
         elif ans==r["correct_option"]: correct+=1; score+=pos
         else: incorrect+=1; score-=neg
     async with pool.connection() as conn:
-        await conn.execute("UPDATE bank_quiz_attempts SET submitted_at=NOW(),correct_count=%s,incorrect_count=%s,skipped_count=%s,score=%s WHERE id=%s",(correct,incorrect,skipped,round(score,2),a["attempt_id"]))
+        cur=await conn.execute("UPDATE bank_quiz_attempts SET submitted_at=NOW(),correct_count=%s,incorrect_count=%s,skipped_count=%s,score=%s WHERE id=%s AND submitted_at IS NULL RETURNING id",(correct,incorrect,skipped,round(score,2),a["attempt_id"]))
+        if await cur.fetchone(): await lb.record_bank_attempt(conn,a["attempt_id"],q.from_user.id,q.from_user.first_name or "Student")
     accuracy=(correct/(correct+incorrect)*100) if correct+incorrect else 0
     text=(f"📊 Quiz Result — {quiz['title']}\n\nTotal: {len(qs)}\nCorrect: {correct}\nIncorrect: {incorrect}\nNot attempted: {skipped}\nAccuracy (attempted): {accuracy:.1f}%\nScore: {score:.2f} / {len(qs)*pos:.2f}\nNegative marking: −{neg:g} per wrong answer")
     if a["mode"]=="exam":

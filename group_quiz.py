@@ -6,6 +6,8 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
+import leaderboard as lb
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus, ChatType
 from telegram.ext import ContextTypes
@@ -70,6 +72,7 @@ async def ensure_schema(pool):
     async with pool.connection() as conn:
         for stmt in DDL:
             await conn.execute(stmt)
+    await lb.ensure_schema(pool)
 
 
 async def _is_chat_admin(context, chat_id: int, user_id: int) -> bool:
@@ -415,6 +418,7 @@ async def _finish_session(application, pool, session):
             FROM group_quiz_answers a JOIN group_quiz_session_questions q USING(session_id,position)
             WHERE a.session_id=%s""", (sid,))
         agg = await cur.fetchone()
+        await lb.record_group_session(conn, sid)
     lines = [f"🏁 Group Quiz Complete · #{sid}", str(finished["quiz_title"]), "", f"Questions: {finished['questions_count']}", f"Participants: {agg['participants']}", f"Votes recorded: {agg['votes']}", f"Correct votes: {agg['correct']}", f"Incorrect votes: {agg['incorrect']}", "", "🏆 Leaderboard (1 mark correct, −⅓ incorrect)"]
     if not scores:
         lines.append("No participant answers were recorded.")

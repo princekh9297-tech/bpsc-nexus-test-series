@@ -19,12 +19,14 @@ from aiohttp import web
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 import question_bank as qb
+import leaderboard as lb
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("bpsc_nexus_miniapp")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PORT = int(os.environ.get("PORT", "10000"))
+ADMIN_TELEGRAM_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip().isdigit()}
 ROOT = Path(__file__).parent
 
 
@@ -80,7 +82,7 @@ async def _attempt_row(pool, attempt_id: int, telegram_id: int):
         return await cur.fetchone()
 
 
-async def _grade_attempt(pool, attempt_id: int, telegram_id: int):
+async def _grade_attempt(pool, attempt_id: int, telegram_id: int, display_name: str = "Student"):
     async with pool.connection() as conn:
         cur = await conn.execute("""SELECT a.id,a.quiz_id,a.mode,a.total_questions,a.submitted_at,q.positive_marks,q.negative_marks
             FROM bank_quiz_attempts a JOIN bank_quizzes q ON q.id=a.quiz_id
@@ -101,6 +103,7 @@ async def _grade_attempt(pool, attempt_id: int, telegram_id: int):
         score = correct * float(attempt["positive_marks"]) - incorrect * float(attempt["negative_marks"])
         await conn.execute("""UPDATE bank_quiz_attempts SET submitted_at=NOW(),correct_count=%s,incorrect_count=%s,skipped_count=%s,score=%s
             WHERE id=%s AND telegram_id=%s AND submitted_at IS NULL""", (correct, incorrect, skipped, round(score, 2), attempt_id, telegram_id))
+        await lb.record_bank_attempt(conn, attempt_id, telegram_id, display_name)
         # Persist this student's wrong/skipped questions in their private revision box.
         await ensure_revision_schema(conn)
         for row in rows:
@@ -153,6 +156,126 @@ async def _result_payload(conn, attempt_id: int, telegram_id: int):
             "negative_marks": float(attempt["negative_marks"]), "subject_breakdown": subject_breakdown, "review": review}
 
 
+
+def _utc_period(category: str, period: str | None):
+    now=datetime.now(timezone.utc)
+    if category=="weekly":
+        iso=now.isocalendar(); value=period or f"{iso.year}-W{iso.week:02d}"
+        if not re.fullmatch(r"\d{4}-W\d{2}",value): raise ValueError("Use an ISO week such as 2026-W41.")
+        try: datetime.fromisocalendar(int(value[:4]),int(value[-2:]),1)
+        except ValueError: raise ValueError("Invalid ISO week.")
+        return value
+    if category=="monthly":
+        value=period or now.strftime("%Y-%m")
+        if not re.fullmatch(r"\d{4}-\d{2}",value) or not 1<=int(value[-2:])<=12: raise ValueError("Use a month such as 2026-10.")
+        return value
+    return "all"
+
+def _leaderboard_row(r):
+    return {"rank":int(r["rank"]),"display_name":r["display_name"] or "Student","points":round(float(r["normalized_points"] or 0),2),
+      "correct":int(r["correct_count"] or 0),"incorrect":int(r["incorrect_count"] or 0),"skipped":int(r["skipped_count"] or 0),
+      "accuracy":round(float(r["accuracy"] or 0),1),"time_seconds":int(r.get("total_time_seconds",r.get("time_taken_seconds",0)) or 0),"attempts":int(r.get("attempts_count",1) or 1)}
+
+async def leaderboard_data(request):
+    user_id=request["telegram_user"]["id"]; category=request.query.get("category","weekly").lower(); subject=request.query.get("subject","").strip()[:120]
+    if category not in {"weekly","monthly","daily","subject","lifetime"}: return json_response({"error":"Unknown leaderboard category."},400)
+    try: limit=max(1,min(100,int(request.query.get("limit","100"))))
+    except ValueError: return json_response({"error":"Invalid page size."},400)
+    pool=request.app["pool"]
+    async with pool.connection() as conn:
+        cur=await conn.execute("SELECT DISTINCT subject FROM bpsc_leaderboard_period_totals WHERE period_type='lifetime' AND period_key='all' AND subject<>'All subjects' ORDER BY subject")
+        subjects=[r["subject"] for r in await cur.fetchall()]
+        if category=="daily":
+            raw_date=request.query.get("period") or datetime.now(timezone.utc).date().isoformat()
+            try: datetime.strptime(raw_date,"%Y-%m-%d")
+            except ValueError: return json_response({"error":"Use a date such as 2026-10-12."},400)
+            cur=await conn.execute("SELECT id,quiz_id,title FROM bpsc_leaderboard_daily_challenges WHERE challenge_date=%s AND active=TRUE",(raw_date,)); challenge=await cur.fetchone()
+            if not challenge: return json_response({"category":category,"period":raw_date,"challenge":None,"subjects":subjects,"entries":[],"my_rank":None,"is_admin":user_id in ADMIN_TELEGRAM_IDS,"message":"No official daily challenge is configured for this date yet."})
+            cur=await conn.execute("""WITH best AS (
+              SELECT DISTINCT ON(a.telegram_id) a.telegram_id,a.display_name,a.normalized_points,a.correct_count,a.incorrect_count,a.skipped_count,a.accuracy,a.time_taken_seconds,a.submitted_at,a.quiz_title
+              FROM bpsc_global_leaderboard_attempts a WHERE a.quiz_id=%s AND a.eligible=TRUE AND a.validation_status='verified'
+              AND a.submitted_at >= (%s::date::timestamp AT TIME ZONE 'UTC') AND a.submitted_at < ((%s::date+1)::timestamp AT TIME ZONE 'UTC')
+              ORDER BY a.telegram_id,a.normalized_points DESC,a.accuracy DESC,a.time_taken_seconds ASC,a.submitted_at ASC
+            ), ranked AS (SELECT ROW_NUMBER() OVER(ORDER BY normalized_points DESC,accuracy DESC,time_taken_seconds ASC,submitted_at ASC,telegram_id ASC) rank,* FROM best)
+            SELECT * FROM ranked WHERE rank<=%s OR telegram_id=%s ORDER BY rank""",(challenge["quiz_id"],raw_date,raw_date,limit,user_id)); rows=await cur.fetchall()
+            return json_response({"category":category,"period":raw_date,"challenge":{"id":int(challenge["id"]),"title":challenge["title"]},"subjects":subjects,"entries":[_leaderboard_row(r) for r in rows if int(r["rank"])<=limit],"my_rank":next((_leaderboard_row(r) for r in rows if int(r["telegram_id"])==user_id),None),"is_admin":user_id in ADMIN_TELEGRAM_IDS})
+        if category=="subject":
+            if not subject and subjects: subject=subjects[0]
+            if subject not in subjects: return json_response({"category":category,"period":"all","subjects":subjects,"entries":[],"my_rank":None,"is_admin":user_id in ADMIN_TELEGRAM_IDS,"message":"Choose a subject with verified submissions."})
+            period_type,period_key="lifetime","all"
+        elif category=="lifetime": period_type,period_key="lifetime","all"
+        else:
+            try: period_key=_utc_period(category,request.query.get("period"))
+            except ValueError as exc: return json_response({"error":str(exc)},400)
+            period_type=category
+        chosen_subject=subject if category=="subject" else "All subjects"
+        cur=await conn.execute("""WITH scored AS (
+          SELECT telegram_id,display_name,normalized_points,correct_count,incorrect_count,skipped_count,total_time_seconds,total_questions_count,attempts_count,first_submitted_at,
+            CASE WHEN correct_count+incorrect_count>0 THEN correct_count::numeric/(correct_count+incorrect_count)*100 ELSE 0 END accuracy
+          FROM bpsc_leaderboard_period_totals WHERE period_type=%s AND period_key=%s AND subject=%s
+        ), ranked AS (SELECT ROW_NUMBER() OVER(ORDER BY normalized_points DESC,accuracy DESC,(total_time_seconds::numeric/NULLIF(total_questions_count,0)) ASC,first_submitted_at ASC,telegram_id ASC) rank,* FROM scored)
+        SELECT * FROM ranked WHERE rank<=%s OR telegram_id=%s ORDER BY rank""",(period_type,period_key,chosen_subject,limit,user_id)); rows=await cur.fetchall()
+    return json_response({"category":category,"period":period_key,"subject":subject if category=="subject" else None,"subjects":subjects,"entries":[_leaderboard_row(r) for r in rows if int(r["rank"])<=limit],"my_rank":next((_leaderboard_row(r) for r in rows if int(r["telegram_id"])==user_id),None),"is_admin":user_id in ADMIN_TELEGRAM_IDS})
+
+async def leaderboard_admin_challenges(request):
+    user_id=request["telegram_user"]["id"]
+    if user_id not in ADMIN_TELEGRAM_IDS: return json_response({"error":"Administrator access required."},403)
+    pool=request.app["pool"]
+    if request.method=="GET":
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT c.id,c.quiz_id,c.challenge_date,c.title,c.active,q.subject FROM bpsc_leaderboard_daily_challenges c JOIN bank_quizzes q ON q.id=c.quiz_id ORDER BY c.challenge_date DESC LIMIT 60")
+            challenges=[{**dict(r),"id":int(r["id"]),"quiz_id":int(r["quiz_id"]),"challenge_date":r["challenge_date"].isoformat()} for r in await cur.fetchall()]
+            cur=await conn.execute("SELECT id,title,subject FROM bank_quizzes WHERE is_published=TRUE AND is_custom=FALSE ORDER BY id DESC LIMIT 200")
+            quizzes=[{"id":int(r["id"]),"title":r["title"],"subject":r["subject"]} for r in await cur.fetchall()]
+        return json_response({"challenges":challenges,"quizzes":quizzes})
+    try:
+        body=await request.json(); quiz_id=int(body["quiz_id"]); day=str(body.get("challenge_date") or datetime.now(timezone.utc).date().isoformat()); title=str(body.get("title") or "Daily Challenge").strip()[:180]
+        datetime.strptime(day,"%Y-%m-%d")
+        if not title: raise ValueError
+    except (ValueError,TypeError,KeyError): return json_response({"error":"Provide a published quiz, date (YYYY-MM-DD), and title."},400)
+    async with pool.connection() as conn:
+        cur=await conn.execute("SELECT id FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND is_custom=FALSE",(quiz_id,))
+        if not await cur.fetchone(): return json_response({"error":"Choose a published non-personal quiz."},400)
+        cur=await conn.execute("""INSERT INTO bpsc_leaderboard_daily_challenges(quiz_id,challenge_date,title,created_by_telegram_id) VALUES(%s,%s,%s,%s)
+          ON CONFLICT(challenge_date) DO UPDATE SET quiz_id=EXCLUDED.quiz_id,title=EXCLUDED.title,active=TRUE,created_by_telegram_id=EXCLUDED.created_by_telegram_id RETURNING id""",(quiz_id,day,title,user_id)); row=await cur.fetchone()
+    return json_response({"saved":True,"challenge_id":int(row["id"]),"challenge_date":day},201)
+
+async def leaderboard_admin_attempts(request):
+    user_id=request["telegram_user"]["id"]
+    if user_id not in ADMIN_TELEGRAM_IDS: return json_response({"error":"Administrator access required."},403)
+    async with request.app["pool"].connection() as conn:
+        cur=await conn.execute("""SELECT id,source_key,source_type,telegram_id,display_name,quiz_title,subject,score,max_score,normalized_points,validation_status,eligible,exclusion_reason,submitted_at FROM bpsc_global_leaderboard_attempts WHERE validation_status<>'verified' OR eligible=FALSE OR score>max_score OR submitted_at<started_at ORDER BY submitted_at DESC LIMIT 100"""); rows=await cur.fetchall()
+    return json_response({"attempts":[{**dict(r),"id":int(r["id"]),"telegram_id":int(r["telegram_id"]),"score":float(r["score"]),"max_score":float(r["max_score"]),"normalized_points":float(r["normalized_points"])} for r in rows]})
+
+async def leaderboard_admin_stats(request):
+    user_id=request["telegram_user"]["id"]
+    if user_id not in ADMIN_TELEGRAM_IDS: return json_response({"error":"Administrator access required."},403)
+    async with request.app["pool"].connection() as conn:
+        cur=await conn.execute("""SELECT
+          COUNT(*) FILTER (WHERE submitted_at >= date_trunc('day',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS attempts_today,
+          COUNT(DISTINCT telegram_id) FILTER (WHERE submitted_at >= date_trunc('day',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS users_today,
+          COUNT(*) FILTER (WHERE submitted_at >= date_trunc('week',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS attempts_week,
+          COUNT(DISTINCT telegram_id) FILTER (WHERE submitted_at >= date_trunc('week',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS users_week,
+          COUNT(*) FILTER (WHERE submitted_at >= date_trunc('month',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS attempts_month,
+          COUNT(DISTINCT telegram_id) FILTER (WHERE submitted_at >= date_trunc('month',NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') AS users_month,
+          COUNT(*) AS all_time_attempts,COUNT(DISTINCT telegram_id) AS all_time_users
+          FROM bpsc_global_leaderboard_attempts WHERE eligible=TRUE AND validation_status='verified'""")
+        row=await cur.fetchone()
+    return json_response({k:int(v or 0) for k,v in dict(row).items()})
+
+async def leaderboard_admin_exclude(request):
+    user_id=request["telegram_user"]["id"]
+    if user_id not in ADMIN_TELEGRAM_IDS: return json_response({"error":"Administrator access required."},403)
+    try: body=await request.json(); attempt_id=int(body["attempt_id"]); reason=str(body.get("reason","")).strip()[:500]
+    except (ValueError,TypeError,KeyError): return json_response({"error":"Invalid attempt ID or reason."},400)
+    if len(reason)<8: return json_response({"error":"Provide a specific reason of at least 8 characters."},400)
+    async with request.app["pool"].connection() as conn:
+        async with conn.transaction():
+            cur=await conn.execute("UPDATE bpsc_global_leaderboard_attempts SET eligible=FALSE,validation_status='invalid',exclusion_reason=%s WHERE id=%s AND (eligible=TRUE OR validation_status='review') RETURNING id",(reason,attempt_id))
+            if not await cur.fetchone(): return json_response({"error":"Attempt not found or already excluded."},404)
+            await conn.execute("INSERT INTO bpsc_leaderboard_audit(attempt_id,admin_telegram_id,action,reason) VALUES(%s,%s,'exclude',%s)",(attempt_id,user_id,reason))
+            await lb.rebuild_summaries(conn)
+    return json_response({"excluded":True,"attempt_id":attempt_id})
 
 VALID_THEMES = {"obsidian", "emerald", "cobalt", "amethyst", "ivory", "graphite"}
 
@@ -709,7 +832,7 @@ async def get_attempt(request):
         return json_response(result)
     deadline = None if attempt["is_custom"] else attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60
     if attempt["mode"] == "exam" and deadline is not None and time.time() >= deadline:
-        result = await _grade_attempt(pool, attempt_id, user["id"])
+        result = await _grade_attempt(pool, attempt_id, user["id"], user.get("first_name", "Student"))
         return json_response(result)
     async with pool.connection() as conn:
         cur = await conn.execute("""SELECT s.question_id AS id,s.question_en,s.question_hi,s.options,aa.selected_option,aa.is_correct,aa.is_marked_review,
@@ -750,7 +873,7 @@ async def save_answer(request):
     if attempt["submitted_at"]:
         return json_response({"error": "This attempt is already submitted."}, 409)
     if attempt["mode"] == "exam" and not attempt["is_custom"] and time.time() >= attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60:
-        result = await _grade_attempt(pool, attempt_id, user["id"])
+        result = await _grade_attempt(pool, attempt_id, user["id"], user.get("first_name", "Student"))
         return json_response({"error": "Time is up.", "result": result}, 409)
     async with pool.connection() as conn:
         cur = await conn.execute("SELECT correct_option FROM bank_quiz_attempt_question_snapshots WHERE attempt_id=%s AND question_id=%s", (attempt_id, question_id))
@@ -786,7 +909,7 @@ async def save_review(request):
     if attempt["submitted_at"]:
         return json_response({"error": "This attempt is already submitted."}, 409)
     if attempt["mode"] == "exam" and not attempt["is_custom"] and time.time() >= attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60:
-        result = await _grade_attempt(pool, attempt_id, user["id"])
+        result = await _grade_attempt(pool, attempt_id, user["id"], user.get("first_name", "Student"))
         return json_response({"error": "Time is up.", "result": result}, 409)
     async with pool.connection() as conn:
         cur = await conn.execute("SELECT 1 FROM bank_quiz_attempt_question_snapshots WHERE attempt_id=%s AND question_id=%s", (attempt_id, question_id))
@@ -804,7 +927,7 @@ async def submit_attempt(request):
         attempt_id = int(request.match_info["attempt_id"])
     except ValueError:
         return json_response({"error": "Invalid attempt ID."}, 400)
-    result = await _grade_attempt(request.app["pool"], attempt_id, user["id"])
+    result = await _grade_attempt(request.app["pool"], attempt_id, user["id"], user.get("first_name", "Student"))
     if result is None:
         return json_response({"error": "Attempt not found."}, 404)
     return json_response(result)
@@ -816,6 +939,8 @@ async def startup(app):
     pool = AsyncConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, open=False, kwargs={"row_factory": dict_row, "connect_timeout": 10})
     await pool.open(); await pool.wait()
     await qb.ensure_schema(pool)
+    await lb.ensure_schema(pool)
+    await lb.backfill_bank_attempts(pool)
     async with pool.connection() as conn:
         await payment_schema(conn)
         await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_user_preferences (
@@ -872,6 +997,12 @@ def make_app():
     app.router.add_post("/api/arena/matches/{match_id}/answers", arena_answer)
     app.router.add_get("/api/preferences/theme", get_theme_preference)
     app.router.add_put("/api/preferences/theme", save_theme_preference)
+    app.router.add_get("/api/leaderboard", leaderboard_data)
+    app.router.add_get("/api/leaderboard/admin/challenges", leaderboard_admin_challenges)
+    app.router.add_post("/api/leaderboard/admin/challenges", leaderboard_admin_challenges)
+    app.router.add_get("/api/leaderboard/admin/attempts", leaderboard_admin_attempts)
+    app.router.add_get("/api/leaderboard/admin/stats", leaderboard_admin_stats)
+    app.router.add_post("/api/leaderboard/admin/exclude", leaderboard_admin_exclude)
     app.router.add_get("/api/quizzes", list_quizzes)
     app.router.add_get("/api/history", attempt_history)
     app.router.add_get("/api/revision", list_revision)
