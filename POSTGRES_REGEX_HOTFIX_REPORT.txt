@@ -1,0 +1,20 @@
+BPSC Nexus PostgreSQL regex hotfix
+=================================
+
+Root cause:
+PostgreSQL's regular-expression engine rejects repetition upper bounds above 255.
+The question classifier contained two patterns using .{0,500}, causing:
+psycopg.errors.InvalidRegularExpression: invalid regular expression: invalid repetition count(s)
+
+Fix:
+Replaced each .{0,500} with .{0,255}.{0,245}. This keeps each repetition count within PostgreSQL's supported bound while retaining an approximately 500-character scan.
+
+Validation:
+- Fixed occurrences of the invalid .{0,500} pattern: 2
+- Python syntax compilation passed for bot.py, group_quiz.py, question_bank.py.
+- Frontend JavaScript syntax check passed for 1 inline script block(s).
+- Remaining repetition bounds above 255: 0.
+- Live PostgreSQL/Render deployment test not run here.
+
+Deployment:
+Replace question_bank.py in the existing repository and redeploy the bot service. No database reset or schema drop is required. The startup failure occurs during the question-classifier SQL; this patch fixes the invalid regex bounds.
