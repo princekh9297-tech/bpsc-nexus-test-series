@@ -41,6 +41,8 @@ DDL = [
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS summary_sent BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS answer_key_sent BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS group_report_sent BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS summary_claimed_at TIMESTAMPTZ",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS group_report_claimed_at TIMESTAMPTZ",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS launch_announcement_message_id BIGINT",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS launch_announcement_deleted BOOLEAN NOT NULL DEFAULT FALSE",
 
@@ -1029,33 +1031,57 @@ async def _finish_session(application, pool, session):
         high_score=max(score_values); low_score=min(score_values)
     else:
         average_score=median_score=high_score=low_score=0.0
-    # Executive Elite typography; fixed-width columns are rendered in Telegram HTML <pre>.
-    heading = f"🏁 𝗕𝗣𝗦𝗖 𝗡𝗘𝗫𝗨𝗦  ·  𝗤𝗨𝗜𝗭 #{sid}"
+    # Executive Elite final summary: compact, scannable and posted once.
+    heading = f"🏁 𝗕𝗣𝗦𝗖 𝗡𝗘𝗫𝗨𝗦 · 𝗤𝗨𝗜𝗭 #{sid}"
     title_text = html_escape(str(finished["quiz_title"] or "Group Quiz"))
-    leaderboard_rows = [f"{'RANK':<4} {'STUDENT':<15} {'SCORE':>7} {'ACC':>5} {'C':>3} {'W':>3} {'SKIP':>4}", "─" * 49]
-    for rank,row in enumerate(scores[:10],1):
+    leaderboard_rows = [
+        f"{'RANK':<4} {'STUDENT':<15} {'SCORE':>7} {'ACC':>5} {'C':>3} {'W':>3} {'SKIP':>4}",
+        "─" * 49,
+    ]
+    for rank, row in enumerate(scores[:10], 1):
         raw_name = str(row["first_name"] or row["username"] or f"Student {row['telegram_id']}").replace("\n", " ").replace("\r", " ")
         name = raw_name[:15]
-        c=int(row["correct"] or 0); w=int(row["incorrect"] or 0); attempted=int(row["attempted"] or 0); skipped=max(0,total-attempted); score=c*positive-w*negative; accuracy=(100*c/attempted) if attempted else 0
+        c = int(row["correct"] or 0)
+        w = int(row["incorrect"] or 0)
+        attempted = int(row["attempted"] or 0)
+        skipped = max(0, total - attempted)
+        score = c * positive - w * negative
+        accuracy = (100 * c / attempted) if attempted else 0
         leaderboard_rows.append(f"{rank:02d}   {name:<15} {score:>7.2f} {accuracy:>4.0f}% {c:>3} {w:>3} {skipped:>4}")
     leaderboard = "\n".join(leaderboard_rows)
     lines = (
-        f"<b>{heading}</b>\n\n"
+        f"<b>{heading}</b>\n"
+        f"<i>FINAL RESULTS · COMPLETED</i>\n\n"
         f"<b>{title_text}</b>\n"
-        f"<i>𝗙𝗜𝗡𝗔𝗟 𝗥𝗘𝗦𝗨𝗟𝗧𝗦 · COMPLETED</i>\n\n"
-        f"𝗤𝗨𝗘𝗦𝗧𝗜𝗢𝗡𝗦   {total}     𝗣𝗔𝗥𝗧𝗜𝗖𝗜𝗣𝗔𝗡𝗧𝗦   {participants}\n"
-        f"𝗥𝗘𝗦𝗣𝗢𝗡𝗦𝗘𝗦   {votes}     𝗖𝗢𝗥𝗥𝗘𝗖𝗧   {correct}     𝗪𝗥𝗢𝗡𝗚   {wrong}\n"
-        f"𝗨𝗡𝗔𝗡𝗦𝗪𝗘𝗥𝗘𝗗   {unanswered}     𝗗𝗨𝗥𝗔𝗧𝗜𝗢𝗡   {elapsed//60}m {elapsed%60}s\n"
-        f"𝗦𝗖𝗢𝗥𝗜𝗡𝗚   +{positive:g} correct  /  −{negative:g} wrong\n"
-        f"𝗦𝗖𝗢𝗥𝗘 𝗦𝗧𝗔𝗧𝗦   Avg {average_score:.2f}  ·  Median {median_score:.2f}  ·  High {high_score:.2f}  ·  Low {low_score:.2f}\n\n"
-        f"<b>🏆 𝗙𝗜𝗡𝗔𝗟 𝗟𝗘𝗔𝗗𝗘𝗥𝗕𝗢𝗔𝗥𝗗</b>\n"
+        f"<code>QUESTIONS     {total:>3}   PARTICIPANTS  {participants:>3}\n"
+        f"ATTEMPTED   {votes:>3}/{total:<3}   DURATION      {elapsed//60}m {elapsed%60:02d}s\n"
+        f"CORRECT       {correct:>3}   WRONG         {wrong:>3}\n"
+        f"UNANSWERED    {unanswered:>3}</code>\n"
+        f"Scoring: <b>+{positive:g}</b> correct · <b>−{negative:g}</b> incorrect\n\n"
+        f"<b>🏆 FINAL LEADERBOARD</b>\n"
         f"<pre>{html_escape(leaderboard)}</pre>\n"
-        "𝗬𝗢𝗨𝗥 𝗣𝗘𝗥𝗙𝗢𝗥𝗠𝗔𝗡𝗖𝗘. 𝗬𝗢𝗨𝗥 𝗣𝗥𝗢𝗚𝗥𝗘𝗦𝗦.\n"
-        "Tap <b>📊 MY ANALYSIS</b> below for your private scorecard, answers and revision list.\n\n"
-        "Practice more · @BpscNexustestbot"
+        f"<b>YOUR PERFORMANCE. YOUR PROGRESS.</b>\n"
+        f"Open <b>📊 MY ANALYSIS</b> below for your private scorecard and revision list.\n\n"
+        f"Practice more · @BpscNexustestbot"
     )
-    # Group summary stays concise; a persisted guard prevents duplicate announcements on retries.
-    if not finished.get("summary_sent",False):
+
+    # Claim each Telegram delivery atomically. This prevents concurrent scheduler
+    # iterations/finalization calls from sending duplicate summaries or HTML files.
+    # A stale claim is reclaimed after 15 minutes if a worker dies mid-delivery.
+    async def claim_delivery(claim_column: str, sent_column: str) -> bool:
+        allowed = {("summary_claimed_at", "summary_sent"), ("group_report_claimed_at", "group_report_sent")}
+        if (claim_column, sent_column) not in allowed:
+            raise ValueError("Invalid report delivery claim")
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                f"UPDATE group_quiz_sessions SET {claim_column}=NOW() "
+                f"WHERE id=%s AND {sent_column}=FALSE "
+                f"AND ({claim_column} IS NULL OR {claim_column}<NOW()-INTERVAL '15 minutes') RETURNING id",
+                (sid,),
+            )
+            return await cur.fetchone() is not None
+
+    if not finished.get("summary_sent", False) and await claim_delivery("summary_claimed_at", "summary_sent"):
         try:
             bot_username = application.bot_data.get("bot_username")
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
@@ -1065,52 +1091,42 @@ async def _finish_session(application, pool, session):
                 chat_id=int(finished["chat_id"]), text=lines[:3900], parse_mode="HTML", reply_markup=keyboard
             )
             async with pool.connection() as conn:
-                await conn.execute("UPDATE group_quiz_sessions SET summary_sent=TRUE WHERE id=%s",(sid,))
+                await conn.execute("UPDATE group_quiz_sessions SET summary_sent=TRUE,summary_claimed_at=NULL WHERE id=%s", (sid,))
         except Exception:
-            log.exception("Could not publish group quiz summary for %s",sid)
+            async with pool.connection() as conn:
+                await conn.execute("UPDATE group_quiz_sessions SET summary_claimed_at=NULL WHERE id=%s AND summary_sent=FALSE", (sid,))
+            log.exception("Could not publish group quiz summary for %s; it will be retried", sid)
             raise
-    if finished.get("mode")=="exam" and not finished.get("answer_key_sent",False):
-        key_lines=["📝 Exam answer key (quiz submitted)"]
-        for row in answer_key:
-            opts=row["options"] if isinstance(row["options"],dict) else json.loads(row["options"] or "{}")
-            item=f"Q{int(row['position'])+1}. {row['correct_option']}. {opts.get(row['correct_option'],'')}"
-            if row.get("explanation_en"): item += "\n"+str(row["explanation_en"])[:180]
-            if row.get("explanation_hi"): item += "\n"+str(row["explanation_hi"])[:180]
-            key_lines.append(item)
-        chunks=[]; buf=""
-        for line in key_lines:
-            if len(buf)+len(line)+1>3500: chunks.append(buf); buf=""
-            buf += ("\n" if buf else "")+line
-        if buf: chunks.append(buf)
-        for chunk in chunks:
-            try: await application.bot.send_message(chat_id=int(finished["chat_id"]),text=chunk)
-            except Exception:
-                log.exception("Could not post final exam answer key for %s",sid)
-                raise
-        async with pool.connection() as conn:
-            await conn.execute("UPDATE group_quiz_sessions SET answer_key_sent=TRUE WHERE id=%s",(sid,))
-    # Public HTML report contains group aggregates and question analysis only.
-    # It deliberately excludes student names, individual scores and personal answers.
-    if not finished.get("group_report_sent", False):
-        group_html = _build_group_html(sid, finished["quiz_title"], total, participants, votes,
-            correct, wrong, unanswered, positive, negative, average_score, median_score,
-            high_score, low_score, question_stats, answer_key)
-        report_file = BytesIO(group_html.encode("utf-8"))
-        report_file.name = f"BPSC_Nexus_Group_Quiz_{sid}_Analysis.html"
+
+    # The group HTML contains the answer key and explanations. Do not send a second,
+    # redundant Exam Mode answer-key message to the group.
+    if not finished.get("group_report_sent", False) and await claim_delivery("group_report_claimed_at", "group_report_sent"):
         try:
+            group_html = _build_group_html(sid, finished["quiz_title"], total, participants, votes,
+                correct, wrong, unanswered, positive, negative, average_score, median_score,
+                high_score, low_score, question_stats, answer_key)
+            report_file = BytesIO(group_html.encode("utf-8"))
+            report_file.name = f"BPSC_Nexus_Quiz_{sid}_Group_Analysis.html"
             await application.bot.send_document(
                 chat_id=int(finished["chat_id"]), document=report_file, filename=report_file.name,
-                caption=f"📊 Detailed group analysis for quiz #{sid}. This report contains group-level question statistics and explanations, not students' individual responses."
+                caption=(f"📊 𝗕𝗣𝗦𝗖 𝗡𝗘𝗫𝗨𝗦 · GROUP ANALYSIS\n"
+                         f"Quiz #{sid} · {html_escape(str(finished['quiz_title'] or 'Group Quiz'))}\n"
+                         "Question-wise statistics, answer key and explanations. Personal student data is excluded."),
+                parse_mode="HTML",
             )
             async with pool.connection() as conn:
-                await conn.execute("UPDATE group_quiz_sessions SET group_report_sent=TRUE WHERE id=%s", (sid,))
+                await conn.execute("UPDATE group_quiz_sessions SET group_report_sent=TRUE,group_report_claimed_at=NULL WHERE id=%s", (sid,))
         except Exception:
+            async with pool.connection() as conn:
+                await conn.execute("UPDATE group_quiz_sessions SET group_report_claimed_at=NULL WHERE id=%s AND group_report_sent=FALSE", (sid,))
             log.exception("Could not publish group HTML report for quiz %s; it will be retried", sid)
             raise
+
     # Personal reports are generated only when each student requests their own report.
     # No individual analysis is sent automatically to the quiz creator/admin.
     async with pool.connection() as conn:
-        await conn.execute("UPDATE group_quiz_sessions SET report_sent=TRUE WHERE id=%s", (sid,))
+        await conn.execute("""UPDATE group_quiz_sessions SET report_sent=(summary_sent AND group_report_sent)
+            WHERE id=%s""", (sid,))
 
 async def scheduler(application, pool):
     """Persisted scheduler. Poll state and due times survive service restarts."""
