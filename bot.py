@@ -353,15 +353,7 @@ async def has_vault_access(telegram_id: int, vault_key: str) -> bool:
 
 
 async def reply_with_uluk(message, caption: str, reply_markup=None) -> None:
-    """Send a compact mascot emote for branded bot messages; fall back safely."""
-    mascot_path = Path(__file__).resolve().parent / "static" / "emotes" / "hello.webp"
-    if mascot_path.is_file():
-        try:
-            with mascot_path.open("rb") as mascot:
-                await message.reply_photo(photo=mascot, caption=caption, reply_markup=reply_markup)
-            return
-        except Exception:
-            logger.exception("Could not send mascot emote; falling back to text")
+    """Send clean text until individually art-directed transparent sticker assets are approved."""
     await message.reply_text(caption, reply_markup=reply_markup)
 
 
