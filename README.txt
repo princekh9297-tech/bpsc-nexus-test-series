@@ -24,3 +24,14 @@ Validation performed in this environment:
 
 Not performed:
 - No live Telegram, Render, or PostgreSQL integration test was possible here. Please verify report delivery and privacy using a test group before relying on production results.
+
+
+New in this update — Group-specific branding + live quiz progress
+- Every poll question is prefixed with the configured group brand, question number (Qx/N), and timer duration.
+- One persistent live-progress message is created and edited throughout the quiz; it shows progress percentage, unique participants, responses on the current question, and seconds per question. It is not reposted for every question.
+- Progress edits are coalesced to reduce Telegram flood-limit risk. Poll answer storage and scoring remain unchanged.
+- Each authorized group can configure its own label with /quizbrand Your Academy Name. Only that group’s Telegram admins can change it.
+- Use /quizbrand with no arguments to view the current label; /quizbrand reset restores the Telegram group title. Branding is snapshotted at quiz launch so a running quiz remains consistent.
+- Existing groups get the new columns through additive CREATE/ALTER IF NOT EXISTS migrations; no database reset is required.
+
+Validation: Python syntax compilation and ZIP integrity checked. Live Telegram/Render/PostgreSQL integration has not been run in this environment. Test /quizbrand, progress edits, both Learning and Exam modes, and the final report flow in a test group before production use.

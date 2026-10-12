@@ -264,6 +264,7 @@ async def post_init(application: Application) -> None:
             BotCommand("schedulequiz", "Schedule a group quiz (admins)"),
             BotCommand("leaderboard", "Show group leaderboard"),
             BotCommand("quizstatus", "Show current group quiz status"),
+            BotCommand("quizbrand", "Set this group’s quiz branding (admins)"),
             BotCommand("help", "Show group commands"),
         ], scope=BotCommandScopeAllGroupChats())
     except Exception:
@@ -412,7 +413,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "🧩 BPSC Nexus Group Quiz\n\n"
                 "Group admins/owners: /startquiz to create a quiz, /pausequiz to pause, "
                 "/resumequiz to continue, /stopquiz to complete early and publish results, "
-                "/schedulequiz to schedule, /leaderboard for rankings, and /quizstatus for status.\n\n"
+                "/schedulequiz to schedule, /leaderboard for rankings, /quizstatus for status, and /quizbrand to customise this group’s branding.\n\n"
                 "Use /help to see all group commands. Personal Mini App features open in private chat."
             )
         return
@@ -529,6 +530,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "/schedulequiz <quiz_id> <YYYY-MM-DDTHH:MMZ> [15|30|60|120|300] [learning|exam] — schedule in UTC\n"
                 "/leaderboard — cumulative leaderboard for this group\n"
                 "/quizstatus — active/paused/scheduled quiz status\n"
+                "/quizbrand <name> — customise branding on this group’s quiz polls; /quizbrand reset restores the group title\n"
                 "Legacy aliases still work: /groupquiz, /groupquiz_schedule, /grouprank, /groupstatus, /groupstop\n"
                 "/start — show this group guide\n\n"
                 "Make the bot an administrator with permission to send messages and create polls."
@@ -1406,6 +1408,7 @@ def main() -> None:
     application.add_handler(CommandHandler("schedulequiz", gq.group_quiz_schedule_command))
     application.add_handler(CommandHandler("leaderboard", gq.group_leaderboard_command))
     application.add_handler(CommandHandler("quizstatus", gq.group_status_command))
+    application.add_handler(CommandHandler("quizbrand", gq.group_brand_command))
     application.add_handler(CommandHandler("groupquiz", gq.group_quiz_command))
     application.add_handler(CommandHandler("groupquiz_schedule", gq.group_quiz_schedule_command))
     application.add_handler(CommandHandler("grouprank", gq.group_leaderboard_command))

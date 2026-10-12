@@ -45,6 +45,8 @@ DDL = [
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS group_report_claimed_at TIMESTAMPTZ",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS launch_announcement_message_id BIGINT",
     "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS launch_announcement_deleted BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS brand_name TEXT",
+    "ALTER TABLE group_quiz_sessions ADD COLUMN IF NOT EXISTS progress_message_id BIGINT",
 
     "CREATE INDEX IF NOT EXISTS idx_group_quiz_sessions_due ON group_quiz_sessions(status,next_at) WHERE status='active'",
     """CREATE TABLE IF NOT EXISTS group_quiz_session_questions (
@@ -88,6 +90,7 @@ DDL = [
         granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         revoked_at TIMESTAMPTZ
     )""",
+    "ALTER TABLE group_quiz_memberships ADD COLUMN IF NOT EXISTS brand_name TEXT",
     "CREATE INDEX IF NOT EXISTS idx_group_quiz_memberships_active ON group_quiz_memberships(is_active,chat_id)",
     """CREATE TABLE IF NOT EXISTS group_quiz_admin_reports (
         session_id BIGINT NOT NULL REFERENCES group_quiz_sessions(id) ON DELETE CASCADE,
@@ -214,6 +217,47 @@ async def _reconcile_chat_quizzes(conn, chat_id: int) -> int | None:
             # Legacy duplicate active rows: preserve the newest live session and retire older ones.
             await conn.execute("UPDATE group_quiz_sessions SET status='cancelled',completed_at=COALESCE(completed_at,NOW()) WHERE id=%s AND status='active'", (sid,))
     return live_id
+
+
+async def group_brand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set a per-group quiz brand shown on every poll and the live progress card."""
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.effective_message
+    pool = context.application.bot_data.get("db_pool")
+    if not chat or not user or not message or pool is None:
+        return
+    if chat.type == ChatType.PRIVATE:
+        await message.reply_text("Use /quizbrand inside the group whose quiz branding you want to customise.")
+        return
+    if not await _require_group_membership(message, pool, chat):
+        return
+    if not await _is_chat_admin(context, chat.id, user.id):
+        await message.reply_text("Only this group's administrators can change its quiz branding.")
+        return
+
+    value = " ".join(context.args).strip()
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT brand_name FROM group_quiz_memberships WHERE chat_id=%s AND is_active=TRUE", (int(chat.id),))
+        row = await cur.fetchone()
+        current = (row or {}).get("brand_name") or (chat.title or "Telegram Group")
+        if not value:
+            await message.reply_text(
+                f"🏷 Current quiz branding: {current}\n\n"
+                "Set a custom label with /quizbrand Your Academy Name\n"
+                "Reset to the Telegram group name with /quizbrand reset"
+            )
+            return
+        if value.lower() == "reset":
+            await conn.execute("UPDATE group_quiz_memberships SET brand_name=NULL,chat_title=%s WHERE chat_id=%s AND is_active=TRUE", (chat.title or "Telegram Group", int(chat.id)))
+            new_brand = chat.title or "Telegram Group"
+        else:
+            new_brand = value[:48].strip()
+            await conn.execute("UPDATE group_quiz_memberships SET brand_name=%s,chat_title=%s WHERE chat_id=%s AND is_active=TRUE", (new_brand, chat.title or "Telegram Group", int(chat.id)))
+    await message.reply_text(
+        f"✅ Quiz branding updated: {new_brand}\n\n"
+        "This group's name will appear on each quiz poll and its live progress card."
+    )
 
 
 async def group_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -449,8 +493,11 @@ async def group_quiz_schedule_command(update: Update, context: ContextTypes.DEFA
             if len(letters)>=2 and row["correct_option"] in letters: prepared.append((row,opts,letters))
         if not prepared:
             await message.reply_text("This quiz has no questions valid for Telegram polls."); return
-        cur=await conn.execute("""INSERT INTO group_quiz_sessions(chat_id,chat_title,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,0,'active',%s) RETURNING id""",(chat.id,chat.title or "Telegram group",quiz_id,quiz["title"],user.id,interval,len(prepared),mode,when))
+        cur=await conn.execute("SELECT brand_name FROM group_quiz_memberships WHERE chat_id=%s", (int(chat.id),))
+        brand_row=await cur.fetchone()
+        brand_name=(brand_row or {}).get("brand_name") or (chat.title or "Telegram Group")
+        cur=await conn.execute("""INSERT INTO group_quiz_sessions(chat_id,chat_title,brand_name,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,0,'active',%s) RETURNING id""",(chat.id,chat.title or "Telegram group",brand_name,quiz_id,quiz["title"],user.id,interval,len(prepared),mode,when))
         session_id=int((await cur.fetchone())["id"])
         for position,(row,opts,letters) in enumerate(prepared):
             await conn.execute("""INSERT INTO group_quiz_session_questions(session_id,position,question_id,question_en,question_hi,options,option_letters,correct_option,explanation_en,explanation_hi)
@@ -685,7 +732,10 @@ async def _launch_pending_quiz(q,context,pool,pending,user):
         active_id = await _reconcile_chat_quizzes(conn, chat_id)
         if active_id is not None:
             await q.answer(f"This group already has live or scheduled quiz session #{active_id}. Finish it first.",show_alert=True); return True
-        cur=await conn.execute("INSERT INTO group_quiz_sessions(chat_id,chat_title,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at,positive_marks,negative_marks,started_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,0,'active',NOW(),%s,%s,NOW()) RETURNING id",(chat_id,pending.get("chat_title","Telegram group"),quiz["id"],quiz["title"],user.id,interval,len(prepared),mode,positive,negative)); sid=int((await cur.fetchone())["id"])
+        cur=await conn.execute("SELECT brand_name FROM group_quiz_memberships WHERE chat_id=%s", (chat_id,))
+        brand_row=await cur.fetchone()
+        brand_name=(brand_row or {}).get("brand_name") or pending.get("chat_title") or "Telegram Group"
+        cur=await conn.execute("INSERT INTO group_quiz_sessions(chat_id,chat_title,brand_name,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at,positive_marks,negative_marks,started_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,0,'active',NOW(),%s,%s,NOW()) RETURNING id",(chat_id,pending.get("chat_title","Telegram group"),brand_name,quiz["id"],quiz["title"],user.id,interval,len(prepared),mode,positive,negative)); sid=int((await cur.fetchone())["id"])
         # Batch snapshot all questions in one database operation; large quizzes no longer
         # incur hundreds of serial insert round-trips before the first poll can appear.
         async with conn.cursor() as insert_cur:
@@ -771,6 +821,70 @@ async def group_quiz_text_input(update: Update,context: ContextTypes.DEFAULT_TYP
     return True
 
 
+async def _update_live_progress(application, pool, session_id: int, position: int, *, create_if_missing: bool = False, force: bool = False, completed: bool = False):
+    """Create/edit one persistent progress card; never send a new card per question."""
+    sid = int(session_id)
+    try:
+        async with pool.connection() as conn:
+            cur = await conn.execute("SELECT chat_id,chat_title,brand_name,questions_count,interval_seconds,progress_message_id,status FROM group_quiz_sessions WHERE id=%s", (sid,))
+            session = await cur.fetchone()
+            if not session:
+                return
+            cur = await conn.execute("SELECT COUNT(DISTINCT telegram_id) AS participants FROM group_quiz_answers WHERE session_id=%s", (sid,))
+            participants_row = await cur.fetchone()
+            cur = await conn.execute("SELECT COUNT(DISTINCT telegram_id) AS responses FROM group_quiz_answers WHERE session_id=%s AND position=%s AND selected_letter IS NOT NULL", (sid, int(position)))
+            responses_row = await cur.fetchone()
+        total = max(1, int(session["questions_count"] or 1))
+        done = total if completed else min(total, max(0, int(position)) + 1)
+        pct = 100 if completed else int((done / total) * 100)
+        brand = str(session.get("brand_name") or session.get("chat_title") or "Telegram Group").strip()[:48]
+        participants = int((participants_row or {}).get("participants") or 0)
+        responses = int((responses_row or {}).get("responses") or 0)
+        if completed:
+            text = f"🏁 {brand} · QUIZ CLOSED\n\n✅ The quiz session has ended.\n📊 Final results and the detailed report are available in the report attachment."
+        else:
+            text = (
+                f"📊 {brand} · LIVE QUIZ\n"
+                f"Q{done}/{total} · {pct}% complete\n"
+                f"👥 Participants: {participants} · Responses this question: {responses}\n"
+                f"⏳ {int(session['interval_seconds'])} seconds per question"
+            )
+        message_id = session.get("progress_message_id")
+        if not message_id and not create_if_missing:
+            return
+        # Poll answers can arrive in bursts. Coalesce progress edits to avoid Telegram flood limits.
+        last_edits = application.bot_data.setdefault("gq_progress_last_edit", {})
+        now = asyncio.get_running_loop().time()
+        if not force and sid in last_edits and now - last_edits[sid] < 2.0:
+            return
+        if message_id:
+            try:
+                await application.bot.edit_message_text(chat_id=int(session["chat_id"]), message_id=int(message_id), text=text)
+                last_edits[sid] = now
+                return
+            except Exception as exc:
+                if "message is not modified" in str(exc).lower():
+                    last_edits[sid] = now
+                    return
+                log.debug("Progress message edit failed for session %s; will attempt recovery", sid, exc_info=True)
+                if not create_if_missing:
+                    return
+        sent = await application.bot.send_message(chat_id=int(session["chat_id"]), text=text)
+        async with pool.connection() as conn:
+            await conn.execute("UPDATE group_quiz_sessions SET progress_message_id=COALESCE(progress_message_id,%s) WHERE id=%s", (int(sent.message_id), sid))
+            cur = await conn.execute("SELECT progress_message_id FROM group_quiz_sessions WHERE id=%s", (sid,))
+            actual = await cur.fetchone()
+        if actual and int(actual["progress_message_id"]) != int(sent.message_id):
+            try:
+                await application.bot.delete_message(chat_id=int(session["chat_id"]), message_id=int(sent.message_id))
+            except Exception:
+                pass
+        last_edits[sid] = now
+    except Exception:
+        # Progress is a convenience feature; it must never interrupt question delivery/scoring.
+        log.warning("Live progress update failed for quiz session %s", sid, exc_info=True)
+
+
 async def _post_question(application, pool, session, question):
     sid = int(session["id"])
     position = int(session["current_index"])
@@ -809,11 +923,18 @@ async def _post_question(application, pool, session, question):
                     await conn.execute("UPDATE group_quiz_sessions SET announcement_sent=TRUE WHERE id=%s", (sid,))
             except Exception:
                 log.warning("Could not persist announcement guard for session %s", sid, exc_info=True)
+    # Group-branded identity and a single editable progress card are shown for every question.
+    await _update_live_progress(application, pool, sid, position, create_if_missing=True, force=True)
     opts = question["options"] if isinstance(question["options"], dict) else json.loads(question["options"] or "{}")
     letters = question["option_letters"] if isinstance(question["option_letters"], list) else json.loads(question["option_letters"] or "[]")
-    question_text = str(question["question_en"] or "Question")
+    base_question_text = str(question["question_en"] or "Question")
     if question.get("question_hi"):
-        question_text += "\n" + str(question["question_hi"])
+        base_question_text += "\n" + str(question["question_hi"])
+    brand = str(session.get("brand_name") or session.get("chat_title") or "Telegram Group").strip()[:48]
+    identity = f"🏷 {brand} · Q{position + 1}/{int(session['questions_count'])} · ⏱ {int(session['interval_seconds'])}s\n\n"
+    question_text = identity + base_question_text
+    # Telegram limits poll questions to 300 characters; preserve the branding header first.
+    question_text = question_text[:300]
     poll_options = [str(opts.get(letter, letter))[:100] for letter in letters]
     explanation = "\n".join(x for x in (question.get("explanation_en"), question.get("explanation_hi")) if x)
     try:
@@ -1145,6 +1266,7 @@ async def _finish_session(application, pool, session):
     async with pool.connection() as conn:
         await conn.execute("""UPDATE group_quiz_sessions SET report_sent=(summary_sent AND group_report_sent)
             WHERE id=%s""", (sid,))
+    await _update_live_progress(application, pool, sid, max(0, total - 1), force=True, completed=True)
 
 async def scheduler(application, pool):
     """Persisted scheduler. Poll state and due times survive service restarts."""
@@ -1267,3 +1389,4 @@ async def group_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(session_id,position,telegram_id) DO UPDATE
             SET first_name=EXCLUDED.first_name,username=EXCLUDED.username,selected_letter=EXCLUDED.selected_letter,answered_at=NOW()""",
             (row["session_id"], row["position"], pa.user.id, pa.user.first_name, pa.user.username, selected))
+    await _update_live_progress(context.application, pool, int(row["session_id"]), int(row["position"]), force=False)
