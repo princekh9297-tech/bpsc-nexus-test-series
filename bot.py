@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from psycopg.rows import dict_row
@@ -351,6 +352,19 @@ async def has_vault_access(telegram_id: int, vault_key: str) -> bool:
     return bool(row and row["allowed"])
 
 
+async def reply_with_uluk(message, caption: str, reply_markup=None) -> None:
+    """Send ULUK mascot branding where the bundled asset is available; fall back safely."""
+    mascot_path = Path(__file__).resolve().parent / "static" / "uluk.png"
+    if mascot_path.is_file():
+        try:
+            with mascot_path.open("rb") as mascot:
+                await message.reply_photo(photo=mascot, caption=caption, reply_markup=reply_markup)
+            return
+        except Exception:
+            logger.exception("Could not send ULUK mascot image; falling back to text")
+    await message.reply_text(caption, reply_markup=reply_markup)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_private(update):
         if update.effective_message:
@@ -364,8 +378,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.args and context.args[0].startswith("quiz_"):
         await message.reply_text("This quiz is available only inside the BPSC Nexus Mini App. Open the app below.", reply_markup=main_user_keyboard())
         return
-    await message.reply_text(
-        f"Welcome to BPSC Nexus, {user.first_name or 'Aspirant'}!\n\nYour quizzes, planner, results and study tools are available in the Mini App.",
+    await reply_with_uluk(
+        message,
+        f"Welcome to BPSC Nexus, {user.first_name or 'Aspirant'}! 🦉\n\nMeet ULUK, your BPSC Nexus mascot. Your quizzes, planner, results and study tools are available in the Mini App.",
         reply_markup=main_user_keyboard(),
     )
 
@@ -390,8 +405,9 @@ async def tutorial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not is_private(update):
         await message.reply_text("Please open a private chat with BPSC Nexus to launch the Mini App and view the tutorial.")
         return
-    await message.reply_text(
-        "📘 BPSC Nexus — Quick Tutorial\n\n"
+    await reply_with_uluk(
+        message,
+        "📘 BPSC Nexus — Quick Tutorial · ULUK\n\n"
         "1. Tap Open Mini App to enter your study workspace.\n"
         "2. Use Test Series to attempt published quizzes.\n"
         "3. Use Create to build a quiz from the available question bank.\n"
