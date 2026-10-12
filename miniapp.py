@@ -780,7 +780,12 @@ async def create_custom_quiz(request):
             VALUES(%s,%s,%s,%s,TRUE,%s,%s,%s,TRUE,%s,%s,%s,NOW()) RETURNING id""",
             (title, f"Custom {mode} quiz · {count} questions · no full-test timer", display_subject, user["id"], 360, positive, negative, user["id"], question_time, shuffle_options))
         quiz_id = int((await cur.fetchone())["id"])
-        await conn.executemany("INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)", [(quiz_id, position, question_id) for position, question_id in enumerate(ids)])
+        # psycopg 3 AsyncConnection has no executemany(); use an async cursor.
+        async with conn.cursor() as insert_cur:
+            await insert_cur.executemany(
+                "INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)",
+                [(quiz_id, position, question_id) for position, question_id in enumerate(ids)],
+            )
     return json_response({"quiz_id": quiz_id, "title": title, "count": len(ids), "eligible_count": eligible, "mode": mode,
         "message": "Custom quiz created from verified question-bank records."}, 201)
 
