@@ -856,13 +856,33 @@ async def _post_question(application, pool, session, question):
             pass
 
 
-def _html_page(title: str, body: str) -> str:
-    """Build a self-contained, mobile-friendly HTML report."""
+def _html_page(title: str, body: str, report_type: str = "report") -> str:
+    """Build a self-contained Nexus Magazine style HTML report."""
     return f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html_escape(title)}</title><style>
-:root{{--ink:#172033;--muted:#5c667a;--line:#dce2eb;--panel:#f4f7fb}}*{{box-sizing:border-box}}body{{margin:0;background:#f7f9fc;color:var(--ink);font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}main{{max-width:960px;margin:auto;padding:18px}}header{{background:#101b35;color:white;border-radius:16px;padding:22px;margin-bottom:16px}}header h1{{margin:0 0 6px;font-size:24px}}header p{{margin:0;color:#d5def0}}h2{{font-size:19px;margin:24px 0 10px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}}.card,.q{{background:white;border:1px solid var(--line);border-radius:12px;padding:14px}}.metric{{font-size:25px;font-weight:750}}.muted{{color:var(--muted)}}.q{{margin:10px 0;break-inside:avoid}}.q h3{{margin:0 0 8px;font-size:16px}}.options{{margin:8px 0;padding-left:22px}}.correct{{color:#137547;font-weight:700}}.wrong{{color:#b42318;font-weight:700}}.pill{{display:inline-block;padding:3px 8px;border-radius:99px;background:var(--panel);font-size:12px}}.bar{{height:9px;background:#e8edf5;border-radius:99px;overflow:hidden}}.bar span{{display:block;height:100%;background:#2463c5}}table{{width:100%;border-collapse:collapse;background:white}}th,td{{text-align:left;padding:9px;border-bottom:1px solid var(--line);font-size:13px}}footer{{color:var(--muted);font-size:12px;margin:24px 0}}@media(max-width:560px){{main{{padding:10px}}header{{padding:16px}}header h1{{font-size:21px}}th,td{{padding:7px}}}}
-</style></head><body><main>{body}<footer>BPSC Nexus · Group report excludes individual response data.</footer></main></body></html>'''
+:root{{--ink:#252a31;--muted:#68717c;--accent:#b24d3e;--line:#e2ded8;--panel:#f8f5f1;--paper:#fff}}
+*{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;background:#ece8e2;color:var(--ink);font:15px/1.65 Arial,Helvetica,sans-serif}}
+main{{max-width:1000px;margin:0 auto;padding:22px 16px 36px}}
+header{{background:var(--paper);color:var(--ink);border:1px solid #d7d0c7;border-top:8px solid var(--accent);padding:30px 28px;margin-bottom:18px;position:relative}}
+.eyebrow{{font:700 10px/1.4 Arial,sans-serif;letter-spacing:.22em;text-transform:uppercase;color:var(--accent);margin-bottom:12px}}
+header h1{{font:normal clamp(28px,5vw,42px)/1.12 Georgia,'Times New Roman',serif;margin:0 0 10px;max-width:800px}}
+header p{{margin:5px 0;color:#64676b}}.cover-meta{{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}}
+.cover-meta span,.pill{{display:inline-block;padding:4px 9px;border:1px solid #e2ded8;background:#f7e9e5;color:#8b392f;border-radius:2px;font-size:11px;font-weight:700;letter-spacing:.04em}}
+.section-head{{display:flex;align-items:baseline;gap:12px;border-bottom:1px solid #cfc7bd;padding:0 0 8px;margin:26px 0 12px}}
+.section-no{{font:700 11px Arial,sans-serif;color:var(--accent);letter-spacing:.12em}}
+h2{{font:normal 25px/1.2 Georgia,'Times New Roman',serif;margin:0}}h3{{font:normal 19px/1.3 Georgia,'Times New Roman',serif;margin:0 0 10px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:10px;margin:14px 0}}
+.card,.q,.panel{{background:white;border:1px solid var(--line);border-radius:2px;padding:16px;break-inside:avoid}}
+.metric{{font:normal 27px/1.15 Georgia,'Times New Roman',serif;color:var(--ink);margin-top:6px}}.muted{{color:var(--muted);font-size:12px}}
+.q{{margin:12px 0;padding:18px 20px;border-left:3px solid #d6c6b9}}.q h3{{font-size:18px}}.options{{margin:9px 0;padding-left:22px}}.options li{{padding:3px 0}}.correct{{color:#276344;font-weight:700}}.wrong{{color:#a33b31;font-weight:700}}
+.pill{{border:0;background:#f1eee8;color:#66503b;letter-spacing:0}}.bar{{height:7px;background:#f0ede8;overflow:hidden;margin:10px 0 14px}}.bar span{{display:block;height:100%;background:var(--accent)}}
+.table-wrap{{overflow-x:auto;border:1px solid var(--line);background:white}}table{{width:100%;border-collapse:collapse;min-width:540px}}th,td{{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);font-size:13px}}th{{background:#f6eeea;color:#65352e;text-transform:uppercase;letter-spacing:.06em;font:700 10px Arial,sans-serif}}tbody tr:nth-child(even){{background:#fcfbf9}}
+.note{{padding:12px 14px;background:#f8f5f1;border-left:3px solid var(--accent);color:#62666b;font-size:12px;margin:14px 0}}
+footer{{border-top:1px solid #d7d0c7;padding-top:14px;color:var(--muted);font-size:11px;margin:30px 0 0;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}}
+@media(max-width:600px){{main{{padding:10px 8px 24px}}header{{padding:22px 18px}}.grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}}.card{{padding:12px}}.metric{{font-size:23px}}.q{{padding:14px}}th,td{{padding:8px}}}}
+@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}header,.card,.q,.panel{{box-shadow:none;break-inside:avoid}}.q{{break-inside:auto}}}}
+</style></head><body><main>{body}<footer><span>BPSC NEXUS · {html_escape(report_type)}</span><span>Practice with purpose. Progress with precision.</span></footer></main></body></html>''' 
 
 
 def _options_dict(raw):
@@ -876,13 +896,21 @@ def _options_dict(raw):
 
 def _build_group_html(session_id, title, total, participants, votes, correct, wrong,
                       unanswered, positive, negative, average_score, median_score,
-                      high_score, low_score, question_stats, answer_key):
-    body = [f'<header><h1>BPSC Nexus · Group Quiz #{int(session_id)}</h1><p>{html_escape(str(title))}</p><p>{int(total)} questions · {int(participants)} participants</p></header>']
+                      high_score, low_score, question_stats, answer_key, scores):
+    body = [f'<header><div class="eyebrow">BPSC NEXUS · QUIZ REPORT</div><h1>Group Performance Report</h1><p>{html_escape(str(title))}</p><div class="cover-meta"><span>GROUP EDITION</span><span>QUIZ #{int(session_id)}</span><span>{int(total)} QUESTIONS</span><span>{int(participants)} PARTICIPANTS</span></div></header>']
     metrics = [("Participants", participants), ("Questions", total), ("Submitted answers", votes), ("Correct responses", correct), ("Wrong responses", wrong), ("Unanswered", unanswered)]
-    body.append('<section class="grid">' + ''.join(f'<div class="card"><div class="muted">{html_escape(str(k))}</div><div class="metric">{int(v)}</div></div>' for k,v in metrics) + '</section>')
+    body.append('<div class="section-head"><span class="section-no">01</span><h2>At a glance</h2></div><section class="grid">' + ''.join(f'<div class="card"><div class="muted">{html_escape(str(k))}</div><div class="metric">{int(v)}</div></div>' for k,v in metrics) + '</section>')
     stat_cards = ''.join(f'<div class="card"><div class="muted">{label}</div><div class="metric">{value:.2f}</div></div>' for label,value in [("Average",average_score),("Median",median_score),("Highest",high_score),("Lowest",low_score)])
-    body.append(f'<h2>Score statistics</h2><section class="grid">{stat_cards}</section>')
-    body.append(f'<p class="muted">Scoring: +{positive:g} for correct answers · −{negative:g} for incorrect answers. Individual student scores and responses are not included.</p><h2>Question-wise group analysis</h2>')
+    body.append(f'<div class="section-head"><span class="section-no">02</span><h2>Score statistics</h2></div><section class="grid">{stat_cards}</section>')
+    body.append(f'<p class="note">Scoring: +{positive:g} for correct answers · −{negative:g} for incorrect answers. The report contains group-level question analysis; student-by-student answers are kept private.</p>')
+    body.append('<div class="section-head"><span class="section-no">03</span><h2>Leaderboard</h2></div><div class="table-wrap"><table><thead><tr><th>Rank</th><th>Participant</th><th>Score</th><th>Accuracy</th><th>Correct</th><th>Wrong</th><th>Skipped</th></tr></thead><tbody>')
+    for rank, row in enumerate(scores, 1):
+        name = html_escape(str(row.get('first_name') or row.get('username') or 'Student').replace('\n', ' ').replace('\r', ' ')[:50])
+        c = int(row.get('correct') or 0); w = int(row.get('incorrect') or 0); attempted = int(row.get('attempted') or 0)
+        skipped = max(0, int(total) - attempted); score = c * float(positive) - w * float(negative)
+        accuracy = (100 * c / attempted) if attempted else 0
+        body.append(f'<tr><td>{rank:02d}</td><td>{name}</td><td>{score:.2f}</td><td>{accuracy:.1f}%</td><td>{c}</td><td>{w}</td><td>{skipped}</td></tr>')
+    body.append('</tbody></table></div><div class="section-head"><span class="section-no">04</span><h2>Question-wise analysis & answer key</h2></div>')
     for stat, answer in zip(question_stats, answer_key):
         opts = _options_dict(answer.get('options')); qn = int(stat['position']) + 1
         attempted_q = int(stat.get('attempted') or 0); correct_q = int(stat.get('correct') or 0); wrong_q = int(stat.get('incorrect') or 0)
@@ -897,7 +925,7 @@ def _build_group_html(session_id, title, total, participants, votes, correct, wr
         at=int(st.get('attempted') or 0); cq=int(st.get('correct') or 0); wq=int(st.get('incorrect') or 0); ac=100*cq/at if at else 0
         body.append(f'<tr><td>Q{int(st["position"])+1}</td><td>{cq}</td><td>{wq}</td><td>{ac:.1f}%</td></tr>')
     body.append('</tbody></table>')
-    return _html_page(f'BPSC Nexus Group Quiz {session_id}', ''.join(body))
+    return _html_page(f'BPSC Nexus Group Quiz {session_id}', ''.join(body), 'Group edition · shared report')
 
 
 async def send_personal_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, pool, session_id: int) -> bool:
@@ -924,9 +952,9 @@ async def send_personal_analysis(update: Update, context: ContextTypes.DEFAULT_T
     correct = sum(1 for r in answered_rows if str(r['selected_letter']) == str(r['correct_option']))
     wrong = sum(1 for r in answered_rows if str(r['selected_letter']) != str(r['correct_option']))
     attempted=len(answered_rows); skipped=max(0,total-attempted); score=correct*positive-wrong*negative; accuracy=100*correct/attempted if attempted else 0
-    body=[f'<header><h1>My Personal Analysis</h1><p>{html_escape(str(session["quiz_title"]))}</p><p>Quiz #{int(session_id)} · {total} questions</p></header>']
+    body=[f'<header><div class="eyebrow">BPSC NEXUS · PRIVATE SCORECARD</div><h1>My Performance Report</h1><p>{html_escape(str(session["quiz_title"]))}</p><div class="cover-meta"><span>PERSONAL EDITION</span><span>QUIZ #{int(session_id)}</span><span>{total} QUESTIONS</span></div></header>']
     metrics=[('My score',f'{score:.2f}'),('Accuracy',f'{accuracy:.1f}%'),('Correct',correct),('Wrong',wrong),('Attempted',attempted),('Skipped',skipped)]
-    body.append('<section class="grid">'+''.join(f'<div class="card"><div class="muted">{html_escape(str(k))}</div><div class="metric">{html_escape(str(v))}</div></div>' for k,v in metrics)+'</section><h2>My question-by-question review</h2>')
+    body.append('<div class="section-head"><span class="section-no">01</span><h2>Your scorecard</h2></div><section class="grid">'+''.join(f'<div class="card"><div class="muted">{html_escape(str(k))}</div><div class="metric">{html_escape(str(v))}</div></div>' for k,v in metrics)+'</section><div class="section-head"><span class="section-no">02</span><h2>Question-by-question review</h2></div>')
     for r in rows:
         qn=int(r['position'])+1; opts=_options_dict(r.get('options')); selected=r.get('selected_letter'); correct_letter=r.get('correct_option')
         state='Skipped' if selected is None else ('Correct' if str(selected)==str(correct_letter) else 'Incorrect')
@@ -947,7 +975,7 @@ async def send_personal_analysis(update: Update, context: ContextTypes.DEFAULT_T
                 secs=max(0,(r['answered_at']-r['opened_at']).total_seconds()); body.append(f'<p class="muted">Your response time: {secs:.1f}s</p>')
             except Exception: pass
         body.append('</article>')
-    html_doc=_html_page(f'My BPSC Nexus Analysis - Quiz {session_id}', ''.join(body))
+    html_doc=_html_page(f'My BPSC Nexus Analysis - Quiz {session_id}', ''.join(body), 'Personal edition · private report')
     bio=BytesIO(html_doc.encode('utf-8')); bio.name=f'bpsc_nexus_my_analysis_quiz_{int(session_id)}.html'
     try:
         await context.bot.send_document(chat_id=user.id, document=bio, filename=bio.name, caption=f'📊 Your personal analysis for "{session["quiz_title"]}". This report contains only your own responses.')
@@ -1031,37 +1059,20 @@ async def _finish_session(application, pool, session):
         high_score=max(score_values); low_score=min(score_values)
     else:
         average_score=median_score=high_score=low_score=0.0
-    # Executive Elite final summary: compact, scannable and posted once.
+    # Nexus Magazine: a concise completion notice; the attached HTML carries the full leaderboard and analysis.
     heading = f"🏁 𝗕𝗣𝗦𝗖 𝗡𝗘𝗫𝗨𝗦 · 𝗤𝗨𝗜𝗭 #{sid}"
     title_text = html_escape(str(finished["quiz_title"] or "Group Quiz"))
-    leaderboard_rows = [
-        f"{'RANK':<4} {'STUDENT':<15} {'SCORE':>7} {'ACC':>5} {'C':>3} {'W':>3} {'SKIP':>4}",
-        "─" * 49,
-    ]
-    for rank, row in enumerate(scores[:10], 1):
-        raw_name = str(row["first_name"] or row["username"] or f"Student {row['telegram_id']}").replace("\n", " ").replace("\r", " ")
-        name = raw_name[:15]
-        c = int(row["correct"] or 0)
-        w = int(row["incorrect"] or 0)
-        attempted = int(row["attempted"] or 0)
-        skipped = max(0, total - attempted)
-        score = c * positive - w * negative
-        accuracy = (100 * c / attempted) if attempted else 0
-        leaderboard_rows.append(f"{rank:02d}   {name:<15} {score:>7.2f} {accuracy:>4.0f}% {c:>3} {w:>3} {skipped:>4}")
-    leaderboard = "\n".join(leaderboard_rows)
     lines = (
         f"<b>{heading}</b>\n"
         f"<i>FINAL RESULTS · COMPLETED</i>\n\n"
         f"<b>{title_text}</b>\n"
-        f"<code>QUESTIONS     {total:>3}   PARTICIPANTS  {participants:>3}\n"
-        f"ATTEMPTED   {votes:>3}/{total:<3}   DURATION      {elapsed//60}m {elapsed%60:02d}s\n"
-        f"CORRECT       {correct:>3}   WRONG         {wrong:>3}\n"
-        f"UNANSWERED    {unanswered:>3}</code>\n"
+        f"<code>QUESTIONS      {total:>3}   PARTICIPANTS {participants:>3}\n"
+        f"RESPONSES    {votes:>3}   CORRECT      {correct:>3}\n"
+        f"WRONG        {wrong:>3}   UNANSWERED   {unanswered:>3}\n"
+        f"DURATION {elapsed//60}m {elapsed%60:02d}s</code>\n"
         f"Scoring: <b>+{positive:g}</b> correct · <b>−{negative:g}</b> incorrect\n\n"
-        f"<b>🏆 FINAL LEADERBOARD</b>\n"
-        f"<pre>{html_escape(leaderboard)}</pre>\n"
-        f"<b>YOUR PERFORMANCE. YOUR PROGRESS.</b>\n"
-        f"Open <b>📊 MY ANALYSIS</b> below for your private scorecard and revision list.\n\n"
+        f"📖 Full leaderboard, question-wise statistics, answer key and explanations are in the attached <b>Nexus Magazine report</b>.\n\n"
+        f"<b>📊 MY ANALYSIS</b> · Open the button below for your private scorecard.\n"
         f"Practice more · @BpscNexustestbot"
     )
 
@@ -1104,7 +1115,7 @@ async def _finish_session(application, pool, session):
         try:
             group_html = _build_group_html(sid, finished["quiz_title"], total, participants, votes,
                 correct, wrong, unanswered, positive, negative, average_score, median_score,
-                high_score, low_score, question_stats, answer_key)
+                high_score, low_score, question_stats, answer_key, scores)
             report_file = BytesIO(group_html.encode("utf-8"))
             report_file.name = f"BPSC_Nexus_Quiz_{sid}_Group_Analysis.html"
             await application.bot.send_document(

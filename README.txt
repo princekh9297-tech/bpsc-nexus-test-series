@@ -1,23 +1,26 @@
-BPSC Nexus — Premium Group Results Cleanup
+BPSC Nexus — Nexus Magazine Report Design (Design 6)
 
 Files:
 - bot.py
 - group_quiz.py
 
-Changes:
-- Executive Elite final summary is shorter and easier to scan on Telegram.
-- Leaderboard remains a fixed-width, monospaced table.
-- Summary and group HTML report delivery use atomic PostgreSQL claims, preventing concurrent scheduler/finalization calls from sending duplicate messages.
-- Stale delivery claims are eligible for retry after 15 minutes if a worker dies mid-delivery; failed sends release their claim for retry.
-- Only one group HTML analysis document is sent per quiz under normal successful delivery. It includes aggregate group statistics, question-wise analysis, correct answers and explanations, and excludes individual student data.
-- Removed the separate Exam Mode answer-key message because the HTML report already contains answers/explanations, avoiding redundant post-quiz messages.
-- `report_sent` becomes true only when both the group summary and group HTML report have been delivered.
-- Existing personal /myanalysis flow, quiz completion/recovery, advisory locks, and other quiz features are preserved.
+Implemented:
+- Nexus Magazine visual system for both Group and Personal HTML reports: white editorial pages, red accent, serif headlines, numbered section headings, clean tables, mobile-responsive layout, and print/save-to-PDF support.
+- Group HTML report includes group-wide metrics, score statistics, the full participant leaderboard, per-question answer key and explanations, response/accuracy statistics, and the hardest-question table.
+- Telegram completion message is now a concise summary; leaderboard and detailed analysis are in the single attached Group HTML report.
+- Personal HTML report uses the matching Nexus Magazine style and includes only the authenticated Telegram user's scorecard, their selected answers, correct answers, explanations, and response-time data where available.
+- Existing atomic report-delivery claims, retry handling, and private /myanalysis flow are retained from the supplied baseline.
 
 Deploy:
-1. Replace both bot.py and group_quiz.py in the existing GitHub repository.
-2. Commit/push and redeploy the existing Render bot service.
-3. Do not reset the database. Startup migration adds the two delivery-claim timestamps.
-4. Test a short quiz in both Learning and Exam modes; expect one summary and one HTML report in the group, with no extra standalone answer-key message.
+1. Back up the current bot.py and group_quiz.py.
+2. Replace both files in the existing GitHub repository with these versions.
+3. Commit/push and redeploy the existing Render bot service.
+4. Do NOT reset or delete the PostgreSQL database.
+5. Run a short test quiz in Learning and Exam modes. Verify the group receives one concise completion summary and one HTML report, and use two Telegram accounts to confirm each private report contains only that account's own responses.
 
-Validation performed: Python syntax compilation, ZIP integrity, and static checks for claim guards/report delivery. Live Telegram/PostgreSQL integration has not been run in this environment.
+Validation performed in this environment:
+- Python syntax compilation passed for bot.py and group_quiz.py.
+- ZIP integrity check performed after packaging.
+
+Not performed:
+- No live Telegram, Render, or PostgreSQL integration test was possible here. Please verify report delivery and privacy using a test group before relying on production results.
