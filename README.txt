@@ -35,3 +35,14 @@ New in this update — Group-specific branding + live quiz progress
 - Existing groups get the new columns through additive CREATE/ALTER IF NOT EXISTS migrations; no database reset is required.
 
 Validation: Python syntax compilation and ZIP integrity checked. Live Telegram/Render/PostgreSQL integration has not been run in this environment. Test /quizbrand, progress edits, both Learning and Exam modes, and the final report flow in a test group before production use.
+
+
+New in this update — branded HTML report identity
+- Group and Personal HTML report covers use the group's explicitly saved /quizbrand name as the primary identity.
+- If no custom brand is saved, the HTML report identity falls back to “BPSC Nexus” (not the Telegram group title).
+- Both reports retain “Powered by BPSC Nexus” in the footer, with the group brand shown separately.
+- Group report caption and downloaded HTML filenames also use the configured brand where available.
+- Branding is snapshotted per quiz session; new quizzes created after this update correctly store NULL when no custom brand has been configured, so report fallback works as specified. Poll/progress display can still use the Telegram group title when custom branding is not configured.
+- No new database migration or reset is required; the existing brand_name column is reused.
+
+Validation for this update: Python syntax compilation passed. Live Telegram/Render/PostgreSQL integration has not been run.

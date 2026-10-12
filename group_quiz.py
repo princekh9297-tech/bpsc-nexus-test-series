@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 from html import escape as html_escape
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
@@ -495,7 +496,7 @@ async def group_quiz_schedule_command(update: Update, context: ContextTypes.DEFA
             await message.reply_text("This quiz has no questions valid for Telegram polls."); return
         cur=await conn.execute("SELECT brand_name FROM group_quiz_memberships WHERE chat_id=%s", (int(chat.id),))
         brand_row=await cur.fetchone()
-        brand_name=(brand_row or {}).get("brand_name") or (chat.title or "Telegram Group")
+        brand_name=(brand_row or {}).get("brand_name")
         cur=await conn.execute("""INSERT INTO group_quiz_sessions(chat_id,chat_title,brand_name,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at)
             VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,0,'active',%s) RETURNING id""",(chat.id,chat.title or "Telegram group",brand_name,quiz_id,quiz["title"],user.id,interval,len(prepared),mode,when))
         session_id=int((await cur.fetchone())["id"])
@@ -734,7 +735,7 @@ async def _launch_pending_quiz(q,context,pool,pending,user):
             await q.answer(f"This group already has live or scheduled quiz session #{active_id}. Finish it first.",show_alert=True); return True
         cur=await conn.execute("SELECT brand_name FROM group_quiz_memberships WHERE chat_id=%s", (chat_id,))
         brand_row=await cur.fetchone()
-        brand_name=(brand_row or {}).get("brand_name") or pending.get("chat_title") or "Telegram Group"
+        brand_name=(brand_row or {}).get("brand_name")
         cur=await conn.execute("INSERT INTO group_quiz_sessions(chat_id,chat_title,brand_name,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at,positive_marks,negative_marks,started_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,0,'active',NOW(),%s,%s,NOW()) RETURNING id",(chat_id,pending.get("chat_title","Telegram group"),brand_name,quiz["id"],quiz["title"],user.id,interval,len(prepared),mode,positive,negative)); sid=int((await cur.fetchone())["id"])
         # Batch snapshot all questions in one database operation; large quizzes no longer
         # incur hundreds of serial insert round-trips before the first poll can appear.
@@ -979,8 +980,9 @@ async def _post_question(application, pool, session, question):
             pass
 
 
-def _html_page(title: str, body: str, report_type: str = "report") -> str:
-    """Build a self-contained Nexus Magazine style HTML report."""
+def _html_page(title: str, body: str, report_type: str = "report", brand_name: str = "BPSC Nexus") -> str:
+    """Build a self-contained Nexus Magazine report with group-specific branding."""
+    safe_brand = html_escape(str(brand_name or "BPSC Nexus").strip() or "BPSC Nexus")
     return f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html_escape(title)}</title><style>
@@ -1005,7 +1007,7 @@ h2{{font:normal 25px/1.2 Georgia,'Times New Roman',serif;margin:0}}h3{{font:norm
 footer{{border-top:1px solid #d7d0c7;padding-top:14px;color:var(--muted);font-size:11px;margin:30px 0 0;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}}
 @media(max-width:600px){{main{{padding:10px 8px 24px}}header{{padding:22px 18px}}.grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}}.card{{padding:12px}}.metric{{font-size:23px}}.q{{padding:14px}}th,td{{padding:8px}}}}
 @media print{{body{{background:#fff}}main{{max-width:none;padding:0}}header,.card,.q,.panel{{box-shadow:none;break-inside:avoid}}.q{{break-inside:auto}}}}
-</style></head><body><main>{body}<footer><span>BPSC NEXUS · {html_escape(report_type)}</span><span>Practice with purpose. Progress with precision.</span></footer></main></body></html>''' 
+</style></head><body><main>{body}<footer><span>Powered by BPSC Nexus · {html_escape(report_type)}</span><span>{safe_brand}</span></footer></main></body></html>''' 
 
 
 def _options_dict(raw):
@@ -1019,8 +1021,9 @@ def _options_dict(raw):
 
 def _build_group_html(session_id, title, total, participants, votes, correct, wrong,
                       unanswered, positive, negative, average_score, median_score,
-                      high_score, low_score, question_stats, answer_key, scores):
-    body = [f'<header><div class="eyebrow">BPSC NEXUS · QUIZ REPORT</div><h1>Group Performance Report</h1><p>{html_escape(str(title))}</p><div class="cover-meta"><span>GROUP EDITION</span><span>QUIZ #{int(session_id)}</span><span>{int(total)} QUESTIONS</span><span>{int(participants)} PARTICIPANTS</span></div></header>']
+                      high_score, low_score, question_stats, answer_key, scores, brand_name="BPSC Nexus"):
+    brand = html_escape(str(brand_name or "BPSC Nexus").strip() or "BPSC Nexus")
+    body = [f'<header><div class="eyebrow">{brand} · QUIZ REPORT</div><h1>Group Performance Report</h1><p>{html_escape(str(title))}</p><div class="cover-meta"><span>GROUP EDITION</span><span>QUIZ #{int(session_id)}</span><span>{int(total)} QUESTIONS</span><span>{int(participants)} PARTICIPANTS</span></div></header>']
     metrics = [("Participants", participants), ("Questions", total), ("Submitted answers", votes), ("Correct responses", correct), ("Wrong responses", wrong), ("Unanswered", unanswered)]
     body.append('<div class="section-head"><span class="section-no">01</span><h2>At a glance</h2></div><section class="grid">' + ''.join(f'<div class="card"><div class="muted">{html_escape(str(k))}</div><div class="metric">{int(v)}</div></div>' for k,v in metrics) + '</section>')
     stat_cards = ''.join(f'<div class="card"><div class="muted">{label}</div><div class="metric">{value:.2f}</div></div>' for label,value in [("Average",average_score),("Median",median_score),("Highest",high_score),("Lowest",low_score)])
@@ -1048,7 +1051,7 @@ def _build_group_html(session_id, title, total, participants, votes, correct, wr
         at=int(st.get('attempted') or 0); cq=int(st.get('correct') or 0); wq=int(st.get('incorrect') or 0); ac=100*cq/at if at else 0
         body.append(f'<tr><td>Q{int(st["position"])+1}</td><td>{cq}</td><td>{wq}</td><td>{ac:.1f}%</td></tr>')
     body.append('</tbody></table>')
-    return _html_page(f'BPSC Nexus Group Quiz {session_id}', ''.join(body), 'Group edition · shared report')
+    return _html_page(f'{str(brand_name or "BPSC Nexus").strip() or "BPSC Nexus"} · Group Quiz {session_id}', ''.join(body), 'Group edition · shared report', brand_name)
 
 
 async def send_personal_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, pool, session_id: int) -> bool:
@@ -1057,7 +1060,7 @@ async def send_personal_analysis(update: Update, context: ContextTypes.DEFAULT_T
     if user is None or message is None or message.chat.type != ChatType.PRIVATE:
         return False
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT id,quiz_title,questions_count,positive_marks,negative_marks,status FROM group_quiz_sessions WHERE id=%s", (int(session_id),))
+        cur = await conn.execute("SELECT id,quiz_title,questions_count,positive_marks,negative_marks,status,brand_name FROM group_quiz_sessions WHERE id=%s", (int(session_id),))
         session = await cur.fetchone()
         if not session or session['status'] != 'completed':
             await message.reply_text("This quiz report is not ready yet, or the quiz reference is invalid.")
@@ -1075,7 +1078,9 @@ async def send_personal_analysis(update: Update, context: ContextTypes.DEFAULT_T
     correct = sum(1 for r in answered_rows if str(r['selected_letter']) == str(r['correct_option']))
     wrong = sum(1 for r in answered_rows if str(r['selected_letter']) != str(r['correct_option']))
     attempted=len(answered_rows); skipped=max(0,total-attempted); score=correct*positive-wrong*negative; accuracy=100*correct/attempted if attempted else 0
-    body=[f'<header><div class="eyebrow">BPSC NEXUS · PRIVATE SCORECARD</div><h1>My Performance Report</h1><p>{html_escape(str(session["quiz_title"]))}</p><div class="cover-meta"><span>PERSONAL EDITION</span><span>QUIZ #{int(session_id)}</span><span>{total} QUESTIONS</span></div></header>']
+    brand_name = str(session.get('brand_name') or 'BPSC Nexus').strip() or 'BPSC Nexus'
+    safe_brand = html_escape(brand_name)
+    body=[f'<header><div class="eyebrow">{safe_brand} · PRIVATE SCORECARD</div><h1>My Performance Report</h1><p>{html_escape(str(session["quiz_title"]))}</p><div class="cover-meta"><span>PERSONAL EDITION</span><span>QUIZ #{int(session_id)}</span><span>{total} QUESTIONS</span></div></header>']
     metrics=[('My score',f'{score:.2f}'),('Accuracy',f'{accuracy:.1f}%'),('Correct',correct),('Wrong',wrong),('Attempted',attempted),('Skipped',skipped)]
     body.append('<div class="section-head"><span class="section-no">01</span><h2>Your scorecard</h2></div><section class="grid">'+''.join(f'<div class="card"><div class="muted">{html_escape(str(k))}</div><div class="metric">{html_escape(str(v))}</div></div>' for k,v in metrics)+'</section><div class="section-head"><span class="section-no">02</span><h2>Question-by-question review</h2></div>')
     for r in rows:
@@ -1098,8 +1103,9 @@ async def send_personal_analysis(update: Update, context: ContextTypes.DEFAULT_T
                 secs=max(0,(r['answered_at']-r['opened_at']).total_seconds()); body.append(f'<p class="muted">Your response time: {secs:.1f}s</p>')
             except Exception: pass
         body.append('</article>')
-    html_doc=_html_page(f'My BPSC Nexus Analysis - Quiz {session_id}', ''.join(body), 'Personal edition · private report')
-    bio=BytesIO(html_doc.encode('utf-8')); bio.name=f'bpsc_nexus_my_analysis_quiz_{int(session_id)}.html'
+    html_doc=_html_page(f'{brand_name} · Personal Quiz Analysis {session_id}', ''.join(body), 'Personal edition · private report', brand_name)
+    brand_slug = re.sub(r'[^A-Za-z0-9_-]+', '_', brand_name).strip('_')[:40] or 'BPSC_Nexus'
+    bio=BytesIO(html_doc.encode('utf-8')); bio.name=f'{brand_slug}_Personal_Quiz_Report_{int(session_id)}.html'
     try:
         await context.bot.send_document(
             chat_id=user.id,
@@ -1148,7 +1154,7 @@ async def _finish_session(application, pool, session):
     async with pool.connection() as conn:
         cur=await conn.execute("""UPDATE group_quiz_sessions SET status='completed',completed_at=COALESCE(completed_at,NOW())
             WHERE id=%s AND (status='active' OR (status='completed' AND report_sent=FALSE))
-            RETURNING questions_count,quiz_title,positive_marks,negative_marks,started_by,chat_id,started_at,mode,summary_sent,answer_key_sent,group_report_sent""",(sid,))
+            RETURNING questions_count,quiz_title,positive_marks,negative_marks,started_by,chat_id,started_at,mode,summary_sent,answer_key_sent,group_report_sent,brand_name,chat_title""",(sid,))
         finished=await cur.fetchone()
         if not finished: return
         positive=float(finished["positive_marks"] or 1); negative=float(finished["negative_marks"] or 0.333)
@@ -1243,12 +1249,13 @@ async def _finish_session(application, pool, session):
         try:
             group_html = _build_group_html(sid, finished["quiz_title"], total, participants, votes,
                 correct, wrong, unanswered, positive, negative, average_score, median_score,
-                high_score, low_score, question_stats, answer_key, scores)
+                high_score, low_score, question_stats, answer_key, scores, finished.get("brand_name") or "BPSC Nexus")
             report_file = BytesIO(group_html.encode("utf-8"))
-            report_file.name = f"BPSC_Nexus_Quiz_{sid}_Group_Analysis.html"
+            brand_slug = re.sub(r'[^A-Za-z0-9_-]+', '_', str(finished.get("brand_name") or "BPSC Nexus")).strip('_')[:40] or "BPSC_Nexus"
+            report_file.name = f"{brand_slug}_Quiz_{sid}_Group_Report.html"
             await application.bot.send_document(
                 chat_id=int(finished["chat_id"]), document=report_file, filename=report_file.name,
-                caption=(f"📊 𝗕𝗣𝗦𝗖 𝗡𝗘𝗫𝗨𝗦 · GROUP ANALYSIS\n"
+                caption=(f"📊 <b>{html_escape(str(finished.get('brand_name') or 'BPSC Nexus'))} · GROUP ANALYSIS</b>\n"
                          f"Quiz #{sid} · {html_escape(str(finished['quiz_title'] or 'Group Quiz'))}\n"
                          "Question-wise statistics, answer key and explanations. Personal student data is excluded."),
                 parse_mode="HTML",
