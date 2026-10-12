@@ -19,3 +19,12 @@
 - Python syntax compilation passed for `bot.py`, `question_bank.py`, `group_quiz.py`, and `miniapp.py`.
 - Frontend JavaScript syntax check passed with Node.js.
 - Live Telegram and PostgreSQL integration tests were not run in this environment; deploy to a staging service and verify using a test group first.
+
+
+## Premium Mini App redesign (2026-10-12)
+- Added a five-tab mobile-first shell: Home, Test Series, Create, Analytics, Profile.
+- Added four user-selectable palettes: Graphite Blue, Midnight Violet, Emerald Pro, and Ivory Cobalt. Theme selection persists in localStorage.
+- Added home shortcuts and a profile theme selector.
+- Preserved existing API routes, CBT flows, question-bank imports, group quiz engine, and database schema.
+- PDF-to-quiz remains excluded.
+- Validation is syntax/static only; live Telegram and PostgreSQL integration testing remains required.
