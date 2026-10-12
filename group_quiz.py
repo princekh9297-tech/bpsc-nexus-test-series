@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus, ChatType
 from telegram.ext import ContextTypes
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 
 log = logging.getLogger("bpsc_nexus_group_quiz")
 
@@ -435,6 +436,21 @@ async def group_resume_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not await _require_group_membership(message,pool,chat): return
     if not await _is_chat_admin(context,chat.id,user.id):
         await message.reply_text("Only this group's administrators or owner can resume its quiz."); return
+    # Do not resume a session whose current poll has an unknown send outcome. Telegram
+    # provides no API to list a group's messages and recover that poll's ID after a timeout.
+    async with pool.connection() as conn:
+        cur=await conn.execute("""SELECT s.id,s.current_index,q.status AS question_status,q.poll_id
+            FROM group_quiz_sessions s LEFT JOIN group_quiz_session_questions q
+              ON q.session_id=s.id AND q.position=s.current_index
+            WHERE s.chat_id=%s AND s.status='paused' ORDER BY s.id DESC LIMIT 1""",(chat.id,))
+        paused=await cur.fetchone()
+    if paused and paused.get("question_status")=="posting" and not paused.get("poll_id"):
+        await message.reply_text(
+            f"⚠️ Quiz #{paused['id']} cannot safely resume because Telegram's poll-send result was not confirmed. "
+            "Please check the group for that question. To avoid duplicate polls, start a new quiz session; "
+            "the new launch will retire this paused session."
+        )
+        return
     async with pool.connection() as conn:
         cur=await conn.execute("""UPDATE group_quiz_sessions SET status='active',next_at=NOW()
             WHERE id=(SELECT id FROM group_quiz_sessions WHERE chat_id=%s AND status='paused' ORDER BY id DESC LIMIT 1)
@@ -886,6 +902,65 @@ async def _update_live_progress(application, pool, session_id: int, position: in
         log.warning("Live progress update failed for quiz session %s", sid, exc_info=True)
 
 
+async def _send_poll_with_rate_limit_retry(bot, **kwargs):
+    """Retry only explicit Telegram rate-limit responses, which are safe to retry.
+
+    A timeout/network failure is intentionally NOT retried here: Telegram may have
+    accepted the poll even if the response never reached this process.
+    """
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            return await bot.send_poll(**kwargs)
+        except RetryAfter as exc:
+            if attempt >= max_retries:
+                raise
+            delay = getattr(exc, "retry_after", 1)
+            try:
+                delay = float(delay.total_seconds()) if hasattr(delay, "total_seconds") else float(delay)
+            except (TypeError, ValueError):
+                delay = 1.0
+            # Retry only when Telegram's requested wait is short enough to avoid
+            # blocking the sequential scheduler for an excessive period.
+            if delay > 10:
+                raise
+            await asyncio.sleep(max(1.0, delay))
+
+
+async def _pause_uncertain_poll_delivery(application, pool, session, sid: int, position: int, exc):
+    """Pause safely when Telegram's poll-send outcome is unknown; never blindly duplicate."""
+    chat_id = int(session["chat_id"])
+    async with pool.connection() as conn:
+        # Keep status='posting' as a durable uncertain-delivery marker. The scheduler
+        # must not treat it as pending and resend the same question automatically.
+        await conn.execute(
+            "UPDATE group_quiz_session_questions SET status='posting',updated_at=NOW() "
+            "WHERE session_id=%s AND position=%s AND status IN ('posting','pending')",
+            (sid, position),
+        )
+        await conn.execute(
+            "UPDATE group_quiz_sessions SET status='paused',next_at=NOW() "
+            "WHERE id=%s AND status='active'",
+            (sid,),
+        )
+    log.error(
+        "Poll delivery outcome uncertain; paused session=%s position=%s error=%s",
+        sid, position, type(exc).__name__, exc_info=True,
+    )
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ Group quiz #{sid} has been paused because Telegram's response timed out "
+                f"while publishing question {position + 1}. The poll may or may not have appeared. "
+                "To prevent duplicate polls, it will not be resent automatically. Check the group "
+                "messages; if the question did not appear, start a new quiz session."
+            ),
+        )
+    except Exception:
+        log.warning("Could not notify group about uncertain poll delivery for session %s", sid, exc_info=True)
+
+
 async def _post_question(application, pool, session, question):
     sid = int(session["id"])
     position = int(session["current_index"])
@@ -938,15 +1013,16 @@ async def _post_question(application, pool, session, question):
     question_text = question_text[:300]
     poll_options = [str(opts.get(letter, letter))[:100] for letter in letters]
     explanation = "\n".join(x for x in (question.get("explanation_en"), question.get("explanation_hi")) if x)
+    poll = None
     try:
         if session.get("mode","learning")=="exam":
-            poll = await application.bot.send_poll(
+            poll = await _send_poll_with_rate_limit_retry(application.bot,
                 chat_id=session["chat_id"], question=question_text[:300], options=poll_options,
                 type="regular", is_anonymous=False, allows_multiple_answers=False,
                 open_period=int(session["interval_seconds"]),
             )
         else:
-            poll = await application.bot.send_poll(
+            poll = await _send_poll_with_rate_limit_retry(application.bot,
                 chat_id=session["chat_id"], question=question_text[:300], options=poll_options,
                 type="quiz", correct_option_id=letters.index(question["correct_option"]),
                 is_anonymous=False, explanation=explanation[:200] if explanation else None,
@@ -969,15 +1045,64 @@ async def _post_question(application, pool, session, question):
                 except Exception:
                     # Telegram permission/deletion failures must not interrupt the live quiz.
                     log.warning("Could not delete launch announcement for quiz session %s; check bot delete permissions", sid, exc_info=True)
-    except Exception:
-        log.exception("Failed to publish group poll for session %s position %s", sid, position)
+    except RetryAfter as exc:
+        # Telegram explicitly rejected this request due to rate limiting, so it is safe
+        # to retry later. Leave the question pending and pause for an admin-controlled resume.
+        log.warning("Telegram rate-limited poll for session %s position %s: %s", sid, position, exc)
+        async with pool.connection() as conn:
+            await conn.execute("UPDATE group_quiz_session_questions SET status='pending',updated_at=NOW() WHERE session_id=%s AND position=%s AND status='posting'", (sid, position))
+            await conn.execute("UPDATE group_quiz_sessions SET status='paused',next_at=NOW() WHERE id=%s AND status='active'", (sid,))
+        try:
+            await application.bot.send_message(chat_id=session["chat_id"], text=f"⏳ Group quiz #{sid} is paused because Telegram rate-limited poll delivery. No poll was accepted for this attempt. An admin can use /resumequiz to retry question {position + 1}.")
+        except Exception:
+            log.warning("Could not notify group about rate limit for session %s", sid, exc_info=True)
+    except (TimedOut, NetworkError) as exc:
+        # This is an ambiguous delivery: Telegram may have created the poll even though
+        # the client did not receive its response. Pause rather than marking the quiz failed
+        # or blindly retrying and potentially creating duplicate polls.
+        await _pause_uncertain_poll_delivery(application, pool, session, sid, position, exc)
+    except (Forbidden, BadRequest) as exc:
+        # Definitive API rejection: report the actual category instead of claiming every
+        # failure is a permission issue. These errors are not safe to retry unchanged.
+        log.exception("Telegram rejected poll for session %s position %s", sid, position)
         async with pool.connection() as conn:
             await conn.execute("UPDATE group_quiz_session_questions SET status='failed',updated_at=NOW() WHERE session_id=%s AND position=%s", (sid, position))
-            await conn.execute("UPDATE group_quiz_sessions SET status='failed' WHERE id=%s", (sid,))
+            await conn.execute("UPDATE group_quiz_sessions SET status='failed',completed_at=COALESCE(completed_at,NOW()) WHERE id=%s", (sid,))
+        if isinstance(exc, Forbidden):
+            reason = "Telegram denied the request. Check that the bot is still in the group and has permission to send polls."
+        else:
+            reason = f"Telegram rejected this poll: {str(exc)[:250]}"
         try:
-            await application.bot.send_message(chat_id=session["chat_id"], text=f"❌ Group quiz #{sid} stopped because Telegram could not publish a poll. Check bot permissions and start a new session after fixing the issue.")
+            await application.bot.send_message(chat_id=session["chat_id"], text=f"❌ Group quiz #{sid} could not publish question {position + 1}. {reason}")
         except Exception:
-            pass
+            log.warning("Could not send poll rejection notice for session %s", sid, exc_info=True)
+    except Exception as exc:
+        # If Telegram returned a poll object, its ID is known. Retry persistence before
+        # falling back to an uncertain-delivery pause, so a transient DB error does not
+        # lose the poll ID and cause the next deployment to misclassify the question.
+        if poll is not None:
+            for attempt in range(3):
+                try:
+                    async with pool.connection() as conn:
+                        await conn.execute(
+                            "UPDATE group_quiz_session_questions SET poll_id=%s,message_id=%s,status='open',opened_at=COALESCE(opened_at,NOW()),updated_at=NOW() WHERE session_id=%s AND position=%s",
+                            (str(poll.poll.id), int(poll.message_id), sid, position),
+                        )
+                        await conn.execute(
+                            "UPDATE group_quiz_sessions SET next_at=NOW()+(%s * INTERVAL '1 second') WHERE id=%s",
+                            (int(session["interval_seconds"]), sid),
+                        )
+                    log.warning("Recovered poll persistence after error for session %s position %s", sid, position)
+                    return
+                except Exception:
+                    if attempt == 2:
+                        log.exception("Could not persist known Telegram poll for session %s position %s", sid, position)
+                    else:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+        # Unexpected errors may occur before Telegram confirms delivery or after the
+        # request outcome becomes ambiguous. Never mark the entire session failed solely
+        # because the client did not get a reliable confirmation.
+        await _pause_uncertain_poll_delivery(application, pool, session, sid, position, exc)
 
 
 def _html_page(title: str, body: str, report_type: str = "report", brand_name: str = "BPSC Nexus") -> str:
