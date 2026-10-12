@@ -101,6 +101,109 @@ button:active{transform:translateY(1px)}button:focus-visible,input:focus-visible
 .series-eyebrow{font:800 10px Manrope,sans-serif;letter-spacing:.2em;color:var(--blue)}.series-hero h1{font:800 27px/1.12 Manrope,sans-serif;letter-spacing:-.04em;margin:10px 0}.series-hero p{font-size:13px;color:var(--muted);max-width:370px;margin:0}.series-hero-meta{display:flex;flex-wrap:wrap;gap:7px;margin-top:18px;position:relative;z-index:1}.series-hero-meta span{font-size:10px;border:1px solid var(--line);background:color-mix(in srgb,var(--paper) 75%,transparent);padding:6px 8px;border-radius:8px;color:var(--ink)}
 .series-filter-row{display:flex;gap:7px;overflow-x:auto;padding:2px 0 7px;margin:0 0 5px}.series-filter{flex:0 0 auto;padding:9px 12px;border-radius:10px;border:1px solid var(--line);background:var(--paper);color:var(--muted);font-size:11px;font-weight:800}.series-filter.active{border-color:var(--blue);background:var(--soft);color:var(--blue)}.series-note{font-size:12px;color:var(--muted);line-height:1.55;margin:8px 2px 12px}.series-card{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:15px;display:flex;flex-direction:column;gap:9px}.series-card-top{display:flex;align-items:center;justify-content:space-between;gap:8px}.series-chip{font:800 9px Manrope,sans-serif;letter-spacing:.1em;text-transform:uppercase;border:1px solid var(--line);padding:5px 7px;border-radius:7px;color:var(--blue)}.series-lock{font-size:10px;font-weight:800;color:var(--amber)}.series-card h3{font:800 16px Manrope,sans-serif;margin:0}.series-card p{font-size:12px;color:var(--muted);margin:0}.series-card-meta{display:flex;gap:7px;flex-wrap:wrap}.series-card-meta span{font-size:10px;color:var(--muted);background:var(--bg);padding:5px 7px;border-radius:7px}.series-tests{border-top:1px solid var(--line);padding-top:8px;margin-top:2px;display:grid;gap:7px}.series-test-row{display:flex;align-items:center;gap:9px;padding:10px;background:var(--bg);border:1px solid var(--line);border-radius:10px}.series-test-copy{flex:1;min-width:0}.series-test-copy strong{display:block;font-size:12px}.series-test-copy small{display:block;font-size:10px;color:var(--muted);margin-top:2px}.series-test-row button{font-size:10px;padding:8px 10px;min-height:34px}.series-admin-form{display:grid;gap:9px;margin:12px 0}.series-admin-form label{display:grid;gap:5px;font-size:11px;font-weight:750;color:var(--muted)}.series-admin-form input,.series-admin-form select,.series-admin-form textarea{width:100%;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px;color:var(--ink);font:inherit;font-size:12px}.series-admin-form textarea{resize:vertical}
 
+
+/* ThreeUI-inspired hybrid glass + restrained sci-fi layer.
+   CSS-only visual overrides: no new runtime, DOM, API or quiz logic. */
+:root{
+  --glass-bg:color-mix(in srgb,var(--paper) 78%,transparent);
+  --glass-line:color-mix(in srgb,var(--blue) 23%,var(--line));
+  --glass-glow:color-mix(in srgb,var(--blue) 16%,transparent);
+  --glass-radius:18px;
+}
+html{background:var(--bg);scrollbar-color:var(--line) var(--bg)}
+body{
+  background:
+    radial-gradient(ellipse at 4% 0%,color-mix(in srgb,#4f7cff 13%,transparent),transparent 34rem),
+    radial-gradient(ellipse at 100% 28%,color-mix(in srgb,#9b70ff 9%,transparent),transparent 32rem),
+    var(--bg);
+  background-attachment:fixed;
+}
+.topbar{
+  background:color-mix(in srgb,var(--bg) 80%,transparent);
+  border:1px solid color-mix(in srgb,var(--line) 72%,transparent);
+  border-top:0;border-radius:0 0 18px 18px;
+  padding-left:12px;padding-right:10px;
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+}
+.brand{letter-spacing:.07em}
+.brand-logo{box-shadow:0 0 0 1px color-mix(in srgb,var(--blue) 30%,transparent),0 0 22px color-mix(in srgb,var(--blue) 13%,transparent)}
+.hero,.series-hero,.result-head{
+  position:relative;isolation:isolate;overflow:hidden;
+  background:
+    radial-gradient(ellipse at 92% 4%,color-mix(in srgb,#7c8cff 24%,transparent),transparent 42%),
+    linear-gradient(132deg,color-mix(in srgb,var(--paper) 88%,var(--blue)),var(--bg));
+  border:1px solid color-mix(in srgb,var(--blue) 31%,var(--line));
+  box-shadow:inset 0 1px 0 #ffffff0b,0 12px 34px #0000001c;
+}
+.hero:before,.series-hero:before,.result-head:before{
+  content:"";position:absolute;inset:0;pointer-events:none;z-index:-1;
+  background:linear-gradient(115deg,transparent 15%,color-mix(in srgb,var(--blue) 6%,transparent) 52%,transparent 82%);
+}
+.hero h1,.series-hero h1,.result-head h1{letter-spacing:-.045em}
+.eyebrow,.series-eyebrow{color:var(--blue)}
+.panel,.quiz-card,.shortcut,.profile-hero,.theme-choice,.question-card,.review-item,.series-card,.lb-podium-card{
+  background:linear-gradient(145deg,color-mix(in srgb,var(--paper) 93%,var(--blue) 7%),color-mix(in srgb,var(--paper) 97%,var(--bg)));
+  border-color:color-mix(in srgb,var(--line) 78%,var(--blue) 22%);
+  box-shadow:inset 0 1px 0 #ffffff08,0 8px 22px #00000012;
+}
+.panel,.profile-hero,.question-card,.series-card{border-radius:var(--glass-radius)}
+.panel{background:linear-gradient(145deg,color-mix(in srgb,var(--paper) 90%,var(--blue) 10%),color-mix(in srgb,var(--paper) 96%,var(--bg)));}
+.section-head h2{letter-spacing:-.02em}
+.shortcut{transition:border-color .16s ease,background-color .16s ease,transform .16s ease}
+.shortcut .shortcut-icon{border:1px solid color-mix(in srgb,var(--blue) 24%,var(--line));background:linear-gradient(145deg,color-mix(in srgb,var(--soft) 86%,var(--blue) 14%),var(--soft))}
+.primary{
+  background:linear-gradient(135deg,var(--blue),color-mix(in srgb,var(--blue) 72%,#9b8cff));
+  color:#10131c;border-color:color-mix(in srgb,var(--blue) 76%,white 24%);
+  box-shadow:0 4px 14px color-mix(in srgb,var(--blue) 16%,transparent);
+}
+.secondary{background:color-mix(in srgb,var(--soft) 85%,transparent);border-color:var(--glass-line)}
+.pill,.series-filter,.lb-tab,.count,.series-chip,.series-card-meta span{
+  border-color:color-mix(in srgb,var(--line) 72%,var(--blue) 28%);
+}
+.series-hero{border-radius:22px}
+.series-hero:after{font-size:168px;right:8px;bottom:-46px;color:color-mix(in srgb,var(--blue) 10%,transparent)}
+.series-filter{border-radius:999px;padding:9px 14px;transition:background .15s ease,border-color .15s ease,color .15s ease}
+.series-filter.active,.lb-tab.active{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--blue) 35%,transparent);background:color-mix(in srgb,var(--soft) 84%,var(--blue) 16%)}
+.series-card{position:relative;overflow:hidden;gap:11px}
+.series-card:before{content:"";position:absolute;left:0;top:16px;bottom:16px;width:2px;border-radius:4px;background:linear-gradient(180deg,var(--blue),color-mix(in srgb,var(--blue) 5%,transparent));opacity:.7}
+.series-card h3{letter-spacing:-.02em}
+.series-chip{background:color-mix(in srgb,var(--soft) 70%,transparent)}
+.series-test-row{background:color-mix(in srgb,var(--bg) 78%,var(--paper));border-color:color-mix(in srgb,var(--line) 82%,var(--blue) 18%);border-radius:12px}
+.series-test-row button{box-shadow:none}
+.option{background:color-mix(in srgb,var(--paper) 84%,var(--bg));border-color:color-mix(in srgb,var(--line) 80%,var(--blue) 20%)}
+.option.selected{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--blue) 38%,transparent)}
+.letter{border-color:var(--line);color:var(--ink);background:color-mix(in srgb,var(--bg) 70%,var(--paper))}
+.builder-modes span{color:var(--ink);border-color:var(--glass-line)}
+.bottom-nav{
+  background:color-mix(in srgb,var(--paper) 82%,transparent);
+  border-color:color-mix(in srgb,var(--blue) 22%,var(--line));
+  box-shadow:0 12px 36px #00000035,inset 0 1px 0 #ffffff0a;
+  backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  border-radius:20px;padding:6px;
+}
+.tab-btn{border-radius:14px;transition:background .16s ease,color .16s ease}
+.tab-btn.active{background:linear-gradient(135deg,color-mix(in srgb,var(--nav-active) 88%,var(--blue) 12%),var(--nav-active));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--blue) 18%,transparent)}
+.sheet{border:1px solid var(--glass-line);border-bottom:0;background:color-mix(in srgb,var(--paper) 94%,var(--bg));box-shadow:0 -18px 55px #00000030}
+input,select,textarea{accent-color:var(--blue)}
+input:focus,select:focus,textarea:focus{border-color:var(--blue)!important;box-shadow:0 0 0 3px color-mix(in srgb,var(--blue) 14%,transparent)}
+#planner-progress-fill,.progressfill{background:linear-gradient(90deg,var(--blue),#9b8cff)}
+@media(hover:hover) and (pointer:fine){
+  .shortcut:hover,.series-card:hover,.quiz-card:hover{border-color:color-mix(in srgb,var(--blue) 48%,var(--line));transform:translateY(-1px)}
+  .primary:hover{filter:brightness(1.06)}
+}
+@media(max-width:420px){
+  .topbar{border-radius:0 0 15px 15px;padding-left:9px;padding-right:8px}
+  .hero,.series-hero{border-radius:17px}
+  .panel,.series-card,.question-card{border-radius:15px}
+  .bottom-nav{border-radius:17px}
+}
+@media(prefers-reduced-transparency:reduce){
+  .topbar,.bottom-nav{backdrop-filter:none;-webkit-backdrop-filter:none;background:var(--paper)}
+}
+@media(prefers-reduced-motion:reduce){
+  .shortcut,.tab-btn,.series-filter,.primary{transition:none!important}
+}
+
 </style>
 </head>
 <body><div id="brand-splash" role="status" aria-label="BPSC Nexus loading"><div class="splash-inner"><div class="splash-mark"><img src="/static/uluk.png" alt="BPSC Nexus logo"></div><h1>BPSC NEXUS</h1><div class="splash-tag">PREPARE WITH PURPOSE</div><div class="splash-credit">Made with Pure 💗</div><div class="splash-signature">BpscNexus × P r I n C e</div><div class="splash-caption">A platform built for aspirants.</div><button id="skip-splash" class="secondary" style="margin-top:26px;padding:9px 18px">Continue</button></div></div><div class="app">
