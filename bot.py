@@ -44,16 +44,29 @@ pool: AsyncConnectionPool | None = None
 
 VAULTS = {
     "bpsc_pyq": "BPSC PYQ",
+    "upsc_cse_pyq": "UPSC CSE PYQ",
+    "ssc_pyq": "SSC PYQ",
+    "upsc_cds_capf_other": "UPSC CDS/CAPF/Other Exams",
+    "bihar_exams_gk_gs": "Bihar Exams GK/GS",
+    "lucent": "Lucent",
+    "ghatnachakra_science": "Ghatnachakra Science",
+    "ghatnachakra_geography": "Ghatnachakra Geography",
+    "ghatnachakra_economy": "Ghatnachakra Economy",
+    "ghatnachakra_polity": "Ghatnachakra Polity",
+    "ghatnachakra_history": "Ghatnachakra History",
+    "ghatnachakra_ecology": "Ghatnachakra Ecology",
+    # Legacy vault identifiers remain supported for existing quizzes and passes.
     "ghatnachakra_pyq": "Ghatnachakra PYQ",
     "upsc_pyq": "UPSC PYQ",
 }
 PASS_NAMES = {
-    "bpsc_pyq": "BPSC PYQ Pass",
-    "ghatnachakra_pyq": "Ghatnachakra PYQ Pass",
-    "upsc_pyq": "UPSC PYQ Pass",
-    "dual_vault": "Dual Vault Pass",
-    "all_access": "All-Access Pass",
-    "legacy": "Legacy Premium Pass",
+    "bpsc_pyq": "BPSC PYQ Pass", "upsc_cse_pyq": "UPSC CSE PYQ Pass", "ssc_pyq": "SSC PYQ Pass",
+    "upsc_cds_capf_other": "UPSC CDS/CAPF/Other Exams Pass", "bihar_exams_gk_gs": "Bihar Exams GK/GS Pass",
+    "lucent": "Lucent Pass", "ghatnachakra_science": "Ghatnachakra Science Pass",
+    "ghatnachakra_geography": "Ghatnachakra Geography Pass", "ghatnachakra_economy": "Ghatnachakra Economy Pass",
+    "ghatnachakra_polity": "Ghatnachakra Polity Pass", "ghatnachakra_history": "Ghatnachakra History Pass",
+    "ghatnachakra_ecology": "Ghatnachakra Ecology Pass", "ghatnachakra_pyq": "Ghatnachakra PYQ Pass",
+    "upsc_pyq": "UPSC PYQ Pass", "dual_vault": "Dual Vault Pass", "all_access": "All-Access Pass", "legacy": "Legacy Premium Pass",
 }
 DURATIONS = {"7": 7, "30": 30, "90": 90, "180": 180}
 
@@ -93,6 +106,16 @@ async def ensure_schema() -> None:
             ('upsc_pyq', 'UPSC PYQ Pass', 'Access to the UPSC PYQ vault', TRUE),
             ('dual_vault', 'Dual Vault Pass', 'Access to two selected vaults', TRUE),
             ('all_access', 'All-Access Pass', 'Access to all supported vaults', TRUE),
+            ('upsc_cse_pyq', 'UPSC CSE PYQ Lifetime', 'Lifetime access to UPSC CSE PYQ edition only', TRUE),
+            ('ssc_pyq', 'SSC PYQ Lifetime', 'Lifetime access to SSC PYQ edition only', TRUE),
+            ('upsc_cds_capf_other', 'UPSC CDS/CAPF/Other Exams Lifetime', 'Lifetime access to UPSC CDS/CAPF/Other Exams edition only', TRUE),
+            ('bihar_exams_gk_gs', 'Bihar Exams GK/GS Lifetime', 'Lifetime access to Bihar Exams GK/GS edition only', TRUE),
+            ('lucent', 'Lucent Lifetime', 'Lifetime access to Lucent edition only', TRUE),
+            ('ghatnachakra_science', 'Ghatnachakra Science Lifetime', 'Lifetime access to Ghatnachakra Science edition only', TRUE),
+            ('ghatnachakra_geography', 'Ghatnachakra Geography Lifetime', 'Lifetime access to Ghatnachakra Geography edition only', TRUE),
+            ('ghatnachakra_economy', 'Ghatnachakra Economy Lifetime', 'Lifetime access to Ghatnachakra Economy edition only', TRUE),
+            ('ghatnachakra_polity', 'Ghatnachakra Polity Lifetime', 'Lifetime access to Ghatnachakra Polity edition only', TRUE),
+            ('ghatnachakra_history', 'Ghatnachakra History Lifetime', 'Lifetime access to Ghatnachakra History edition only', TRUE),
             ('ghatnachakra_ecology', 'Ghatnachakra Ecology Lifetime', 'Lifetime access to Ghatnachakra Ecology edition only', TRUE),
             ('legacy', 'Legacy Premium Pass', 'Migrated legacy entitlement', TRUE)
             ON CONFLICT (pass_code) DO NOTHING""",
@@ -175,8 +198,20 @@ async def ensure_schema() -> None:
             entitlement_key TEXT NOT NULL, duration_days INTEGER NOT NULL DEFAULT 0, is_active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), retired_at TIMESTAMPTZ NULL)""",
         """INSERT INTO bpsc_individual_products(product_code,product_name,amount_inr,entitlement_key,duration_days,is_active)
-            VALUES('ghatnachakra_ecology','Ghatnachakra Ecology — Lifetime Edition',39,'ghatnachakra_ecology',0,TRUE)
-            ON CONFLICT(product_code) DO NOTHING""",
+        VALUES
+        ('bpsc_pyq','BPSC PYQ — Lifetime Edition',49,'bpsc_pyq',0,TRUE),
+        ('upsc_cse_pyq','UPSC CSE PYQ — Lifetime Edition',49,'upsc_cse_pyq',0,TRUE),
+        ('ssc_pyq','SSC PYQ — Lifetime Edition',49,'ssc_pyq',0,TRUE),
+        ('upsc_cds_capf_other','UPSC CDS/CAPF/Other Exams — Lifetime Edition',99,'upsc_cds_capf_other',0,TRUE),
+        ('bihar_exams_gk_gs','Bihar Exams GK/GS — Lifetime Edition',29,'bihar_exams_gk_gs',0,TRUE),
+        ('lucent','Lucent — Lifetime Edition',69,'lucent',0,TRUE),
+        ('ghatnachakra_science','Ghatnachakra Science — Lifetime Edition',39,'ghatnachakra_science',0,TRUE),
+        ('ghatnachakra_geography','Ghatnachakra Geography — Lifetime Edition',39,'ghatnachakra_geography',0,TRUE),
+        ('ghatnachakra_economy','Ghatnachakra Economy — Lifetime Edition',39,'ghatnachakra_economy',0,TRUE),
+        ('ghatnachakra_polity','Ghatnachakra Polity — Lifetime Edition',39,'ghatnachakra_polity',0,TRUE),
+        ('ghatnachakra_history','Ghatnachakra History — Lifetime Edition',39,'ghatnachakra_history',0,TRUE),
+        ('ghatnachakra_ecology','Ghatnachakra Ecology — Lifetime Edition',39,'ghatnachakra_ecology',0,TRUE)
+        ON CONFLICT(product_code) DO UPDATE SET product_name=EXCLUDED.product_name,amount_inr=EXCLUDED.amount_inr,entitlement_key=EXCLUDED.entitlement_key,duration_days=0""",
     ]
     async with pool.connection() as conn:
         for statement in statements:

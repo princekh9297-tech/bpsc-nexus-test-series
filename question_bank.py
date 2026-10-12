@@ -23,7 +23,7 @@ from telegram.ext import ContextTypes
 
 log = logging.getLogger("bpsc_nexus_question_bank")
 MAX_QUESTIONS_PER_IMPORT = 20000
-MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_FILE_BYTES = 20 * 1024 * 1024
 LETTERS = "ABCDE"
 SUBJECTS = ["General Science", "Bihar Special", "Modern Indian History", "Indian Polity", "Geography", "Economy", "Ancient & Medieval History", "Art & Culture", "Other / Unclassified"]
 
@@ -229,9 +229,26 @@ def _normalize_record(record: Any, default_subject: str, source_name: str, owner
 def _extract_json_records(obj: Any) -> list:
     if isinstance(obj, list): return obj
     if isinstance(obj, dict):
+        # Common nested exports: {chapters:[{name, questions:[...]}]} or
+        # a list of chapter records. Flatten without losing chapter/topic labels.
         for key in ("questions", "items", "data", "results", "mcqs", "records"):
             val = obj.get(key)
             if isinstance(val, list): return val
+        for key in ("chapters", "sections", "subjects", "topics"):
+            val = obj.get(key)
+            if isinstance(val, list):
+                flattened=[]
+                for group in val:
+                    if not isinstance(group, dict): continue
+                    group_name = group.get("name") or group.get("title") or group.get("chapterNameEn") or group.get("section") or ""
+                    group_hi = group.get("hiName") or group.get("chapterNameHi") or ""
+                    for q in group.get("questions", group.get("items", [])) or []:
+                        if isinstance(q, dict):
+                            row=dict(q)
+                            row.setdefault("chapter", group_name)
+                            if group_hi: row.setdefault("chapter_hi", group_hi)
+                            flattened.append(row)
+                if flattened: return flattened
         # One question object is also accepted.
         if any(k in {str(x).lower() for x in obj} for k in ("question", "question_en", "question_text", "q")):
             return [obj]
@@ -245,124 +262,155 @@ class _TextExtractor(HTMLParser):
         if data.strip(): self.parts.append(data.strip())
 
 
+def _js_value_after_assignment(raw: str, names: tuple[str, ...]):
+    """Decode a JSON-compatible JS assignment without executing uploaded code."""
+    for name in names:
+        match = re.search(r"\b(?:const|let|var)\s+" + re.escape(name) + r"\s*=\s*", raw, flags=re.I)
+        if not match: continue
+        start = match.end()
+        while start < len(raw) and raw[start].isspace(): start += 1
+        if start >= len(raw) or raw[start] not in "[{": continue
+        try:
+            value, end = json.JSONDecoder().raw_decode(raw[start:])
+            return value
+        except Exception:
+            continue
+    return None
+
+
+def _answer_index_to_letter(value, option_count: int) -> str | None:
+    if isinstance(value, bool): return None
+    if isinstance(value, int):
+        # These two source formats document/use zero-based indexes.
+        return LETTERS[value] if 0 <= value < min(option_count, len(LETTERS)) else None
+    text = _norm(value).upper()
+    m = re.fullmatch(r"(?:OPTION\s*)?\(?([A-E])\)?[.)] ?", text)
+    if m: return m.group(1)
+    if text.isdigit():
+        n=int(text)
+        if 0 <= n < min(option_count, len(LETTERS)): return LETTERS[n]
+        if 1 <= n <= min(option_count, len(LETTERS)): return LETTERS[n-1]
+    return None
+
+
+def _flatten_chapters(obj: Any) -> list[dict]:
+    """Flatten chapter-wrapped question arrays, preserving chapter and bilingual fields."""
+    if isinstance(obj, list):
+        out=[]
+        for item in obj:
+            if isinstance(item, dict) and isinstance(item.get("questions"), list):
+                chapter = item.get("chapterNameEn") or item.get("name") or item.get("title") or item.get("section") or ""
+                chapter_hi = item.get("chapterNameHi") or item.get("hiName") or ""
+                for q in item["questions"]:
+                    if not isinstance(q, dict): continue
+                    row=dict(q); row.setdefault("chapter", chapter); row.setdefault("topic", q.get("topic") or chapter)
+                    if chapter_hi: row.setdefault("chapter_hi", chapter_hi)
+                    out.append(row)
+            else: out.append(item)
+        return out
+    if isinstance(obj, dict):
+        for key in ("questions", "items", "data", "results", "mcqs", "records"):
+            val=obj.get(key)
+            if isinstance(val, list): return _flatten_chapters(val)
+        for key in ("chapters", "sections", "subjects", "topics"):
+            val=obj.get(key)
+            if isinstance(val, list): return _flatten_chapters(val)
+    return _extract_json_records(obj)
+
+
 def _html_to_records(raw: str) -> list[dict]:
-    # BPSCVEERS-style pages store the complete question bank in `const RAW = [...]`
-    # and transform compact fields (s/c/o/a/x etc.) into the UI at runtime.
-    # Parse the JavaScript array as JSON directly; never execute uploaded scripts.
-    raw_match = re.search(r"\b(?:const|let|var)\s+RAW\s*=\s*", raw, flags=re.I)
-    if raw_match:
-        start = raw.find("[", raw_match.end())
-        if start >= 0:
+    # Format A: compact BPSCVEERS HTML, const RAW = [...].
+    raw_payload = _js_value_after_assignment(raw, ("RAW",))
+    if isinstance(raw_payload, list) and raw_payload:
+        converted=[]
+        for item in raw_payload:
+            if not isinstance(item, dict): continue
+            qparts=item.get("i") or []
+            if isinstance(qparts,str): qparts=[qparts]
+            qtext="\n".join(str(x) for x in qparts if x is not None)
+            tail=item.get("tl") or []
+            if isinstance(tail,str): tail=[tail]
+            if tail: qtext += ("\n" if qtext else "") + "\n".join(str(x) for x in tail if x is not None)
+            opts_raw=item.get("o") or []
+            opts={LETTERS[i]:str(v) for i,v in enumerate(opts_raw[:5]) if v is not None and _norm(v)} if isinstance(opts_raw,list) else opts_raw
+            correct=_answer_index_to_letter(item.get("a"),len(opts))
+            exp=item.get("x") or {}; exp_parts=exp.get("w",[]) if isinstance(exp,dict) else exp
+            if isinstance(exp_parts,str): exp_parts=[exp_parts]
+            explanation="\n".join(str(x) for x in exp_parts if x is not None)
+            if str(item.get("t","mcq")).lower()=="match":
+                li,lii=item.get("li") or [],item.get("lii") or []
+                if li or lii: qtext += "\n\nMatch the following:\nList I: "+" | ".join(map(str,li))+"\nList II: "+" | ".join(map(str,lii))
+            converted.append({"question":qtext or str(item.get("id") or "Question"),"options":opts,"correct_answer":correct,"explanation":explanation,
+                "subject":item.get("s") or "Other / Unclassified","topic":item.get("c") or item.get("s") or None,"source":"BPSCVEERS HTML import"})
+        if converted: return converted
+
+    # Format B: script#quiz-data type=application/json, often an array of chapter objects.
+    script_matches = re.findall(r"<script\b([^>]*)>(.*?)</script\s*>", raw, flags=re.I|re.S)
+    for attrs, body in script_matches:
+        if "application/json" not in attrs.lower() and not re.search(r"id\s*=\s*['\"](?:quiz-data|question-data|quizdata)['\"]",attrs,re.I):
+            continue
+        try:
+            candidate=json.loads(body.strip())
+            source_records=_flatten_chapters(candidate)
+            if source_records:
+                converted=[]
+                for row in source_records:
+                    if not isinstance(row,dict): continue
+                    opts=row.get("opts",row.get("options",row.get("choices",{})))
+                    if isinstance(opts,list):
+                        english={LETTERS[i]:str(v) for i,v in enumerate(opts[:5]) if v is not None}
+                    elif isinstance(opts,dict): english=opts
+                    else: english={}
+                    hiopts=row.get("hiopts")
+                    if isinstance(hiopts,list):
+                        for i,v in enumerate(hiopts[:5]):
+                            if v is not None and LETTERS[i] in english: english[LETTERS[i]]=f"{english[LETTERS[i]]} / {v}"
+                    correct=_answer_index_to_letter(row.get("ans",row.get("answer",row.get("correct_option"))),len(english))
+                    exp=_norm(row.get("exp",row.get("explanation",row.get("explanation_en", ""))))
+                    hiexp=_norm(row.get("hiexp",row.get("explanation_hi", "")))
+                    if hiexp: exp=(exp+" / "+hiexp).strip(" /")
+                    q=_norm(row.get("q",row.get("question",row.get("question_en", ""))))
+                    hi=_norm(row.get("hi",row.get("question_hi", "")))
+                    if hi: q=(q+"\n"+hi).strip()
+                    topic=_norm(row.get("topic") or row.get("subtopic") or row.get("chapter") or row.get("chapterNameEn") or "")
+                    subject=_norm(row.get("subject") or row.get("section") or row.get("category") or "")
+                    if not subject: subject="Current Affairs"
+                    converted.append({"question":q,"options":english,"correct_answer":correct,"explanation":exp,"subject":subject,"topic":topic or None,"source":"Embedded HTML JSON import"})
+                if converted: return converted
+        except Exception as exc:
+            log.warning("Could not parse embedded JSON script: %s",exc)
+
+    # Format C: const DATA = [...] (question-per-object JavaScript data).
+    data_payload=_js_value_after_assignment(raw,("DATA","questions","quizData","questionData"))
+    if isinstance(data_payload,list) and data_payload:
+        converted=[]
+        for row in data_payload:
+            if not isinstance(row,dict): continue
+            opts_raw=row.get("opts",row.get("options",row.get("choices",{})))
+            opts={LETTERS[i]:str(v) for i,v in enumerate(opts_raw[:5]) if v is not None and _norm(v)} if isinstance(opts_raw,list) else opts_raw
+            correct=_answer_index_to_letter(row.get("ans",row.get("answer",row.get("correct_option"))),len(opts))
+            exp=_norm(row.get("exp",row.get("explanation", "")))
+            hi=_norm(row.get("hi",row.get("question_hi", "")))
+            q=_norm(row.get("q",row.get("question",row.get("question_en", ""))))
+            if hi: q=(q+"\n"+hi).strip()
+            subject=_norm(row.get("section") or row.get("subject") or row.get("category") or "Other / Unclassified")
+            topic=_norm(row.get("subtopic") or row.get("topic") or row.get("page") or "")
+            converted.append({"question":q,"options":opts,"correct_answer":correct,"explanation":exp,"subject":subject,"topic":topic or None,"source":"JavaScript DATA HTML import"})
+        if converted: return converted
+
+    # Fallback: general JSON script or conventional JS arrays.
+    for pattern in (r"(?:const|let|var)\s+(?:questions|quizData|questionData)\s*=\s*(\[.*?\])\s*;",r"<script[^>]*type=['\"]application/json['\"][^>]*>(.*?)</script>"):
+        for match in re.finditer(pattern,raw,flags=re.I|re.S):
             try:
-                payload, _end = json.JSONDecoder().raw_decode(raw[start:])
-                if isinstance(payload, list) and payload:
-                    converted = []
-                    for item in payload:
-                        if not isinstance(item, dict):
-                            continue
-                        # Source schema: s=subject, c=chapter, t=type, i=intro/question,
-                        # tl=question tail, o=options, a=zero-based answer index, x.w=explanation.
-                        qparts = item.get("i") or []
-                        if isinstance(qparts, str): qparts = [qparts]
-                        qtext = "\n".join(str(x) for x in qparts if x is not None)
-                        tail = item.get("tl") or []
-                        if isinstance(tail, str): tail = [tail]
-                        if tail: qtext += ("\n" if qtext else "") + "\n".join(str(x) for x in tail if x is not None)
-                        opts_raw = item.get("o") or []
-                        opts = {LETTERS[i]: str(v) for i, v in enumerate(opts_raw[:5]) if v is not None and _norm(v)} if isinstance(opts_raw, list) else opts_raw
-                        answer = item.get("a")
-                        correct = None
-                        if isinstance(answer, int) and 0 <= answer < len(LETTERS): correct = LETTERS[answer]
-                        elif isinstance(answer, str): correct = answer.strip().upper()
-                        exp = item.get("x") or {}
-                        exp_parts = exp.get("w", []) if isinstance(exp, dict) else exp
-                        if isinstance(exp_parts, str): exp_parts = [exp_parts]
-                        explanation = "\n".join(str(x) for x in exp_parts if x is not None)
-                        # Preserve special Match data in the prompt instead of dropping it.
-                        if str(item.get("t", "mcq")).lower() == "match":
-                            li, lii = item.get("li") or [], item.get("lii") or []
-                            if li or lii:
-                                qtext += "\n\nMatch the following:\nList I: " + " | ".join(map(str, li)) + "\nList II: " + " | ".join(map(str, lii))
-                        converted.append({
-                            "question": qtext or str(item.get("id") or "Question"),
-                            "options": opts,
-                            "correct_answer": correct,
-                            "explanation": explanation,
-                            "subject": item.get("s") or "Other / Unclassified",
-                            "topic": item.get("c") or item.get("s") or None,
-                            "source": "BPSCVEERS EPFO HTML import",
-                            "attribution": "Pushpankar Narayan",
-                        })
-                    if converted:
-                        return converted
-            except Exception as exc:
-                log.warning("Could not decode compact RAW question bank: %s", exc)
-    # First accept embedded JSON commonly used by quiz pages.
-    for pattern in (r"(?:const|let|var)\s+(?:questions|quizData|questionData)\s*=\s*(\[.*\])\s*;", r"<script[^>]*type=['\"]application/json['\"][^>]*>(.*?)</script>"):
-        match = re.search(pattern, raw, flags=re.I | re.S)
-        if match:
-            try:
-                candidate = json.loads(html.unescape(match.group(1)))
-                return _extract_json_records(candidate)
-            except Exception:
-                pass
-    # Parse common question-card markup without depending on one CSS framework.
-    from html.parser import HTMLParser as _HP
-    class Parser(_HP):
-        def __init__(self):
-            super().__init__(convert_charrefs=True); self.stack=[]; self.nodes=[]; self.current=None
-        def handle_starttag(self, tag, attrs):
-            attrs=dict(attrs); cls=attrs.get("class", ""); ident=attrs.get("id", "")
-            marker=(cls+" "+ident).lower()
-            if any(x in marker for x in ("question-card", "question-item", "mcq", "quiz-question")):
-                self.current={"question":"", "options":{}, "_fields":{}, "_active":None}; self.nodes.append(self.current)
-            if self.current is not None:
-                field=None
-                if any(x in marker for x in ("question-text", "question-title", "question-statement")): field="question"
-                elif re.search(r"(?:^|\s)(?:option|choice)[-_ ]?([a-e])(?:\s|$)", marker): field="option:"+re.search(r"(?:^|\s)(?:option|choice)[-_ ]?([a-e])(?:\s|$)", marker).group(1).upper()
-                elif any(x in marker for x in ("explanation", "solution")): field="explanation"
-                elif "correct" in marker or "answer-key" in marker: field="correct"
-                if field: self.current["_active"]=field
-                if tag in ("input",):
-                    if attrs.get("checked") is not None and attrs.get("value"): self.current["correct"]=attrs.get("value")
-                if tag == "br": self.current["_text"]=(self.current.get("_text", "")+" ")
-        def handle_data(self, data):
-            if self.current is None: return
-            field=self.current.get("_active")
-            if field:
-                if field.startswith("option:"):
-                    k=field.split(":",1)[1]; self.current["options"][k]=self.current["options"].get(k,"")+data
-                elif field=="question": self.current["question"]+=data
-                else: self.current[field]=self.current.get(field,"")+data
-        def handle_endtag(self, tag):
-            if self.current is not None and tag in ("div", "li", "article", "section"):
-                # Keep card open unless a nested marked card is explicitly encountered.
-                pass
-    p=Parser(); p.feed(raw)
-    records=[]
-    for n in p.nodes:
-        if _norm(n.get("question")) and len(n.get("options",{}))>=2:
-            records.append({"question":_norm(n["question"]), "options":{k:_norm(v) for k,v in n["options"].items()}, "correct_answer":_norm(n.get("correct")), "explanation":_norm(n.get("explanation"))})
-    if records: return records
-    # Last-resort text extraction for a clear plain-text MCQ layout in HTML.
-    extractor=_TextExtractor(); extractor.feed(raw); text="\n".join(extractor.parts)
-    blocks=re.split(r"(?=\b(?:Q(?:uestion)?\s*)?\d+[.)])", text, flags=re.I)
-    for block in blocks:
-        lines=[_norm(x) for x in block.splitlines() if _norm(x)]
-        if not lines: continue
-        rec={"question":lines[0], "options":{}}
-        for line in lines[1:]:
-            m=re.match(r"^\(?([A-E])\)?[.)\-:]\s*(.+)$", line)
-            if m: rec["options"][m.group(1)]=m.group(2)
-            a=re.search(r"(?:correct answer|answer key|answer)\s*[:\-]\s*([A-E])\b", line, re.I)
-            if a: rec["correct_answer"]=a.group(1)
-        if len(rec["options"])>=2: records.append(rec)
-    if not records: raise ValueError("No recognizable MCQs were found in this HTML. Export as JSON or use the CSV template for predictable imports.")
-    return records
+                candidate=json.loads(html.unescape(match.group(1)))
+                return _flatten_chapters(candidate)
+            except Exception: pass
+
+    raise ValueError("Could not recognize this HTML question format. Supported: embedded JSON scripts, chapter-wrapped questions, const DATA/RAW arrays, and common JSON-compatible quiz arrays. The importer never executes uploaded JavaScript.")
 
 
 def parse_file(filename: str, raw: bytes, subject: str, owner_id: int) -> tuple[list[dict], str]:
-    if len(raw) > MAX_FILE_BYTES: raise ValueError("File exceeds the 10 MB import limit.")
+    if len(raw) > MAX_FILE_BYTES: raise ValueError("File exceeds the 20 MB import limit.")
     ext=filename.rsplit(".",1)[-1].lower() if "." in filename else ""
     try: text=raw.decode("utf-8-sig")
     except UnicodeDecodeError: text=raw.decode("utf-8", errors="replace")
@@ -686,17 +734,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
     if data == "qb:history":
         if pool is None: await q.edit_message_text("Database unavailable."); return
         async with pool.connection() as conn:
-            cur=await conn.execute("SELECT id,file_name,total_detected,imported_count,duplicate_count,invalid_count,status,created_at FROM question_import_batches WHERE owner_telegram_id=%s ORDER BY id DESC LIMIT 10",(update.effective_user.id,)); rows=await cur.fetchall()
+            cur=await conn.execute("""SELECT b.id,b.file_name,b.total_detected,b.imported_count,b.duplicate_count,b.invalid_count,b.status,b.created_at,
+                (SELECT COUNT(*) FROM question_bank q WHERE q.import_batch_id=b.id) AS remaining_count
+                FROM question_import_batches b WHERE b.owner_telegram_id=%s ORDER BY b.id DESC LIMIT 25""",(update.effective_user.id,)); rows=await cur.fetchall()
         buttons=[]
         if not rows: text="No imports yet."
         else:
-            lines=["📦 Recent imports",""]
+            lines=["📦 Import batches · newest first", "Batch name · date · original count · current count", ""]
             for r in rows:
-                lines.append(f"#{r['id']} {r['file_name']}\nDetected {r['total_detected']} · Added {r['imported_count']} · Duplicates {r['duplicate_count']} · Invalid {r['invalid_count']}")
-                if r.get('status') != 'rolled_back': buttons.append([InlineKeyboardButton(f"Undo batch #{r['id']}",callback_data=f"qb:undo:{r['id']}")])
+                created=r['created_at'].strftime('%Y-%m-%d %H:%M UTC') if r['created_at'] else 'date unavailable'
+                lines.append(f"#{r['id']} · {r['file_name']}\n{created} · Imported {r['imported_count']} / detected {r['total_detected']} · Currently linked {r['remaining_count']} · {r['status']}")
+                if r.get('status') not in ('deleted','rolled_back') and int(r['remaining_count'] or 0)>0:
+                    buttons.append([InlineKeyboardButton(f"🗑 Delete only batch #{r['id']} ({r['remaining_count']})",callback_data=f"qb:batchdeleteask:{r['id']}")])
             text="\n\n".join(lines)
         buttons.append([InlineKeyboardButton("↩ Question Bank menu",callback_data="qb:home")])
         await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup(buttons)); return
+    if data.startswith("qb:batchdeleteask:"):
+        batch_id=int(data.rsplit(":",1)[1])
+        async with pool.connection() as conn:
+            cur=await conn.execute("""SELECT b.id,b.file_name,b.created_at,b.imported_count,
+                (SELECT COUNT(*) FROM question_bank q WHERE q.import_batch_id=b.id) AS remaining_count,
+                (SELECT COUNT(*) FROM question_bank q WHERE q.import_batch_id=b.id AND EXISTS(SELECT 1 FROM bank_quiz_questions qq WHERE qq.question_id=q.id)) AS used_count
+                FROM question_import_batches b WHERE b.id=%s AND b.owner_telegram_id=%s""",(batch_id,q.from_user.id)); batch=await cur.fetchone()
+        if not batch:
+            await q.edit_message_text("Batch not found or not owned by you.",reply_markup=admin_keyboard()); return
+        await q.edit_message_text(f"⚠️ DELETE IMPORT BATCH #{batch_id}?\n\nName: {batch['file_name']}\nImported originally: {batch['imported_count']}\nStill linked to this batch: {batch['remaining_count']}\nQuestions used in quizzes: {batch['used_count']}\n\nOnly this batch will be affected. Questions already referenced by quizzes will be archived to preserve historical attempts; other questions in other batches will not be touched. This action cannot be undone.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Confirm delete this batch",callback_data=f"qb:batchdeleteconfirm:{batch_id}")],[InlineKeyboardButton("Cancel",callback_data="qb:history")]])); return
+    if data.startswith("qb:batchdeleteconfirm:"):
+        batch_id=int(data.rsplit(":",1)[1])
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT id FROM question_import_batches WHERE id=%s AND owner_telegram_id=%s AND status NOT IN ('deleted','rolled_back') FOR UPDATE",(batch_id,q.from_user.id)); batch=await cur.fetchone()
+            if not batch:
+                await q.edit_message_text("Batch not found, already deleted, or not owned by you.",reply_markup=admin_keyboard()); return
+            cur=await conn.execute("""UPDATE question_bank qb SET status='archived',updated_at=NOW()
+                WHERE qb.import_batch_id=%s AND EXISTS(SELECT 1 FROM bank_quiz_questions qq WHERE qq.question_id=qb.id) RETURNING qb.id""",(batch_id,)); archived=len(await cur.fetchall())
+            cur=await conn.execute("""DELETE FROM question_bank qb WHERE qb.import_batch_id=%s
+                AND NOT EXISTS(SELECT 1 FROM bank_quiz_questions qq WHERE qq.question_id=qb.id) RETURNING qb.id""",(batch_id,)); deleted=len(await cur.fetchall())
+            await conn.execute("UPDATE question_import_batches SET status='deleted' WHERE id=%s",(batch_id,))
+        await q.edit_message_text(f"✅ Batch #{batch_id} processed.\nPermanently removed: {deleted}\nArchived to preserve existing quiz/history references: {archived}\nNo questions from other batches were changed.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📦 View batches",callback_data="qb:history")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
     if data.startswith("qb:answer:"):
         _,_,qid,letter=data.split(":",3); qid=int(qid)
         async with pool.connection() as conn:
@@ -827,7 +901,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE, pool,
     if ext not in ("html","htm","json","csv"):
         await message.reply_text("Unsupported file. Send .html, .htm, .json or .csv. Photo/PDF import is intentionally disabled in this phase."); return True
     if doc.file_size and doc.file_size>MAX_FILE_BYTES:
-        await message.reply_text("File exceeds the 10 MB import limit."); return True
+        await message.reply_text("File exceeds the 20 MB import limit."); return True
     try:
         tgfile=await context.bot.get_file(doc.file_id); raw=bytes(await tgfile.download_as_bytearray())
         default_subject=flow.get("subject",SUBJECTS[-1])

@@ -74,7 +74,7 @@ def json_response(payload, status=200):
 
 async def _attempt_row(pool, attempt_id: int, telegram_id: int):
     async with pool.connection() as conn:
-        cur = await conn.execute("""SELECT a.*,q.title,q.subject,q.duration_minutes,q.positive_marks,q.negative_marks,q.question_time_seconds,q.shuffle_options
+        cur = await conn.execute("""SELECT a.*,q.title,q.subject,q.duration_minutes,q.positive_marks,q.negative_marks,q.question_time_seconds,q.shuffle_options,q.is_custom
             FROM bank_quiz_attempts a JOIN bank_quizzes q ON q.id=a.quiz_id
             WHERE a.id=%s AND a.telegram_id=%s""", (attempt_id, telegram_id))
         return await cur.fetchone()
@@ -101,6 +101,14 @@ async def _grade_attempt(pool, attempt_id: int, telegram_id: int):
         score = correct * float(attempt["positive_marks"]) - incorrect * float(attempt["negative_marks"])
         await conn.execute("""UPDATE bank_quiz_attempts SET submitted_at=NOW(),correct_count=%s,incorrect_count=%s,skipped_count=%s,score=%s
             WHERE id=%s AND telegram_id=%s AND submitted_at IS NULL""", (correct, incorrect, skipped, round(score, 2), attempt_id, telegram_id))
+        # Persist this student's wrong/skipped questions in their private revision box.
+        await ensure_revision_schema(conn)
+        for row in rows:
+            selected=row["selected_option"]
+            reason="skipped" if not selected else ("wrong" if selected != row["correct_option"] else None)
+            if reason:
+                await conn.execute("""INSERT INTO bpsc_nexus_revision_items(telegram_id,question_id,reason)
+                    VALUES(%s,%s,%s) ON CONFLICT(telegram_id,question_id,reason) DO UPDATE SET last_saved_at=NOW(),review_count=bpsc_nexus_revision_items.review_count+1,is_resolved=FALSE""",(telegram_id,row["id"],reason))
         return await _result_payload(conn, attempt_id, telegram_id)
 
 
@@ -374,8 +382,20 @@ async def payment_schema(conn):
         entitlement_key TEXT NOT NULL, duration_days INTEGER NOT NULL DEFAULT 0, is_active BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), retired_at TIMESTAMPTZ NULL)""")
     await conn.execute("""INSERT INTO bpsc_individual_products(product_code,product_name,amount_inr,entitlement_key,duration_days,is_active)
-        VALUES('ghatnachakra_ecology','Ghatnachakra Ecology — Lifetime Edition',39,'ghatnachakra_ecology',0,TRUE)
-        ON CONFLICT(product_code) DO NOTHING""")
+        VALUES
+        ('bpsc_pyq','BPSC PYQ — Lifetime Edition',49,'bpsc_pyq',0,TRUE),
+        ('upsc_cse_pyq','UPSC CSE PYQ — Lifetime Edition',49,'upsc_cse_pyq',0,TRUE),
+        ('ssc_pyq','SSC PYQ — Lifetime Edition',49,'ssc_pyq',0,TRUE),
+        ('upsc_cds_capf_other','UPSC CDS/CAPF/Other Exams — Lifetime Edition',99,'upsc_cds_capf_other',0,TRUE),
+        ('bihar_exams_gk_gs','Bihar Exams GK/GS — Lifetime Edition',29,'bihar_exams_gk_gs',0,TRUE),
+        ('lucent','Lucent — Lifetime Edition',69,'lucent',0,TRUE),
+        ('ghatnachakra_science','Ghatnachakra Science — Lifetime Edition',39,'ghatnachakra_science',0,TRUE),
+        ('ghatnachakra_geography','Ghatnachakra Geography — Lifetime Edition',39,'ghatnachakra_geography',0,TRUE),
+        ('ghatnachakra_economy','Ghatnachakra Economy — Lifetime Edition',39,'ghatnachakra_economy',0,TRUE),
+        ('ghatnachakra_polity','Ghatnachakra Polity — Lifetime Edition',39,'ghatnachakra_polity',0,TRUE),
+        ('ghatnachakra_history','Ghatnachakra History — Lifetime Edition',39,'ghatnachakra_history',0,TRUE),
+        ('ghatnachakra_ecology','Ghatnachakra Ecology — Lifetime Edition',39,'ghatnachakra_ecology',0,TRUE)
+        ON CONFLICT(product_code) DO UPDATE SET product_name=EXCLUDED.product_name,amount_inr=EXCLUDED.amount_inr,entitlement_key=EXCLUDED.entitlement_key,duration_days=0""")
 
 async def membership_page(request):
     page = ROOT / "static" / "membership.html"
@@ -446,6 +466,63 @@ async def static_asset(request):
 
 async def health(request):
     return json_response({"status": "ok", "service": "bpsc-nexus-miniapp"})
+
+
+async def ensure_revision_schema(conn):
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_revision_items (
+        telegram_id BIGINT NOT NULL, question_id BIGINT NOT NULL,
+        reason TEXT NOT NULL CHECK(reason IN ('wrong','skipped','bookmark')),
+        first_saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        review_count INTEGER NOT NULL DEFAULT 0, is_resolved BOOLEAN NOT NULL DEFAULT FALSE,
+        PRIMARY KEY(telegram_id,question_id,reason))""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_nexus_revision_owner ON bpsc_nexus_revision_items(telegram_id,is_resolved,reason)")
+
+
+async def list_revision(request):
+    uid=request['telegram_user']['id']
+    async with request.app['pool'].connection() as conn:
+        await ensure_revision_schema(conn)
+        cur=await conn.execute("""SELECT r.question_id,r.reason,r.first_saved_at,r.last_saved_at,r.review_count,r.is_resolved,
+            q.subject,q.topic,q.question_en,q.question_hi,q.options,q.correct_option,q.explanation_en,q.explanation_hi
+            FROM bpsc_nexus_revision_items r JOIN question_bank q ON q.id=r.question_id
+            WHERE r.telegram_id=%s AND r.is_resolved=FALSE ORDER BY r.last_saved_at DESC LIMIT 2000""",(uid,))
+        rows=await cur.fetchall()
+    items=[]
+    for r in rows:
+        opts=r['options'] if isinstance(r['options'],dict) else json.loads(r['options'] or '{}')
+        items.append({'question_id':int(r['question_id']),'reason':r['reason'],'first_saved_at':r['first_saved_at'].isoformat(),'last_saved_at':r['last_saved_at'].isoformat(),'review_count':int(r['review_count']),'subject':r['subject'],'topic':r['topic'],'question_en':r['question_en'],'question_hi':r['question_hi'],'options':opts,'correct_option':r['correct_option'],'explanation_en':r['explanation_en'],'explanation_hi':r['explanation_hi']})
+    return json_response({'items':items,'count':len(items)})
+
+
+async def set_revision_item(request):
+    uid=request['telegram_user']['id']
+    try:
+        body=await request.json(); qid=int(body.get('question_id')); reason=str(body.get('reason') or 'bookmark'); enabled=bool(body.get('enabled',True))
+        if reason not in ('bookmark','wrong','skipped'): raise ValueError()
+    except Exception: return json_response({'error':'Invalid revision item payload.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_revision_schema(conn)
+        cur=await conn.execute('SELECT 1 FROM question_bank WHERE id=%s',(qid,))
+        if not await cur.fetchone(): return json_response({'error':'Question not found.'},404)
+        if enabled:
+            await conn.execute("""INSERT INTO bpsc_nexus_revision_items(telegram_id,question_id,reason)
+                VALUES(%s,%s,%s) ON CONFLICT(telegram_id,question_id,reason) DO UPDATE SET last_saved_at=NOW(),is_resolved=FALSE""",(uid,qid,reason))
+        else:
+            await conn.execute('DELETE FROM bpsc_nexus_revision_items WHERE telegram_id=%s AND question_id=%s AND reason=%s',(uid,qid,reason))
+    return json_response({'saved':enabled,'question_id':qid,'reason':reason})
+
+
+async def resolve_revision_item(request):
+    uid=request['telegram_user']['id']
+    try:
+        body=await request.json(); qid=int(body.get('question_id')); reason=str(body.get('reason') or 'wrong')
+        if reason not in ('bookmark','wrong','skipped'): raise ValueError()
+    except Exception: return json_response({'error':'Invalid revision payload.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_revision_schema(conn)
+        cur=await conn.execute('UPDATE bpsc_nexus_revision_items SET is_resolved=TRUE,last_saved_at=NOW() WHERE telegram_id=%s AND question_id=%s AND reason=%s RETURNING question_id',(uid,qid,reason))
+        if not await cur.fetchone(): return json_response({'error':'Revision item not found for this account.'},404)
+    return json_response({'resolved':True})
 
 
 async def list_quizzes(request):
@@ -538,8 +615,9 @@ async def create_custom_quiz(request):
         negative = float(body.get("negative_marks", 1/3))
         title = str(body.get("title") or "My Custom Quiz").strip()[:100]
         shuffle_options = bool(body.get("shuffle_options", False))
-        if not 1 <= count <= 100: raise ValueError("Question count must be between 1 and 100.")
-        if not 1 <= duration <= 360: raise ValueError("Total duration must be between 1 and 360 minutes.")
+        use_all_questions = bool(body.get("use_all_questions", False))
+        if not 1 <= count <= 20000: raise ValueError("Question count must be between 1 and 20,000.")
+        if not 1 <= duration <= 360: raise ValueError("Legacy duration setting is invalid.")
         if question_time not in (0, 10, 15, 20, 30, 45, 60, 90, 120): raise ValueError("Choose a supported per-question timer.")
         if selection not in ("random", "sequential", "unseen", "incorrect"): raise ValueError("Invalid question selection method.")
         if mode not in ("practice", "exam", "revision", "rapidfire"): raise ValueError("Choose a valid attempt mode.")
@@ -565,6 +643,10 @@ async def create_custom_quiz(request):
     async with pool.connection() as conn:
         cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank qb WHERE " + " AND ".join(conditions), tuple(params))
         eligible = int((await cur.fetchone())["n"])
+        if use_all_questions:
+            count = eligible
+        if count < 1:
+            return json_response({"error": "No eligible questions match this topic/filter.", "eligible_count": eligible}, 400)
         if eligible < count:
             return json_response({"error": f"Only {eligible} eligible questions match these filters. Reduce the count or change your filters.", "eligible_count": eligible}, 400)
         cur = await conn.execute("SELECT qb.id FROM question_bank qb WHERE " + " AND ".join(conditions) + f" ORDER BY {order} LIMIT %s", tuple(params + [count]))
@@ -573,10 +655,9 @@ async def create_custom_quiz(request):
         title = title or "My Custom Quiz"
         cur = await conn.execute("""INSERT INTO bank_quizzes(title,description,subject,created_by_telegram_id,is_published,duration_minutes,positive_marks,negative_marks,is_custom,custom_owner_telegram_id,question_time_seconds,shuffle_options,published_at)
             VALUES(%s,%s,%s,%s,TRUE,%s,%s,%s,TRUE,%s,%s,%s,NOW()) RETURNING id""",
-            (title, f"Custom {mode} quiz · {count} questions", display_subject, user["id"], duration, positive, negative, user["id"], question_time, shuffle_options))
+            (title, f"Custom {mode} quiz · {count} questions · no full-test timer", display_subject, user["id"], 360, positive, negative, user["id"], question_time, shuffle_options))
         quiz_id = int((await cur.fetchone())["id"])
-        for position, question_id in enumerate(ids):
-            await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)", (quiz_id, position, question_id))
+        await conn.executemany("INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)", [(quiz_id, position, question_id) for position, question_id in enumerate(ids)])
     return json_response({"quiz_id": quiz_id, "title": title, "count": len(ids), "eligible_count": eligible, "mode": mode,
         "message": "Custom quiz created from verified question-bank records."}, 201)
 
@@ -626,8 +707,8 @@ async def get_attempt(request):
         async with pool.connection() as conn:
             result = await _result_payload(conn, attempt_id, user["id"])
         return json_response(result)
-    deadline = attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60
-    if attempt["mode"] == "exam" and time.time() >= deadline:
+    deadline = None if attempt["is_custom"] else attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60
+    if attempt["mode"] == "exam" and deadline is not None and time.time() >= deadline:
         result = await _grade_attempt(pool, attempt_id, user["id"])
         return json_response(result)
     async with pool.connection() as conn:
@@ -647,7 +728,7 @@ async def get_attempt(request):
         questions.append(item)
     settings = attempt["quiz_settings"] if isinstance(attempt["quiz_settings"], dict) else json.loads(attempt["quiz_settings"] or "{}")
     return json_response({"submitted": False, "attempt_id": attempt_id, "quiz_id": int(attempt["quiz_id"]), "title": attempt["title"], "subject": attempt["subject"], "mode": attempt["mode"], "mode_label": settings.get("mode_label", attempt["mode"]),
-                          "duration_minutes": int(attempt["duration_minutes"]), "question_time_seconds": int(attempt["question_time_seconds"] or 0), "shuffle_options": bool(attempt["shuffle_options"]), "started_at": attempt["started_at"].isoformat(), "deadline": datetime.fromtimestamp(deadline, timezone.utc).isoformat(),
+                          "duration_minutes": int(attempt["duration_minutes"]), "question_time_seconds": int(attempt["question_time_seconds"] or 0), "shuffle_options": bool(attempt["shuffle_options"]), "started_at": attempt["started_at"].isoformat(), "deadline": datetime.fromtimestamp(deadline, timezone.utc).isoformat() if deadline is not None else None,
                           "positive_marks": float(attempt["positive_marks"]), "negative_marks": float(attempt["negative_marks"]), "questions": questions})
 
 
@@ -668,7 +749,7 @@ async def save_answer(request):
         return json_response({"error": "Attempt not found."}, 404)
     if attempt["submitted_at"]:
         return json_response({"error": "This attempt is already submitted."}, 409)
-    if attempt["mode"] == "exam" and time.time() >= attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60:
+    if attempt["mode"] == "exam" and not attempt["is_custom"] and time.time() >= attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60:
         result = await _grade_attempt(pool, attempt_id, user["id"])
         return json_response({"error": "Time is up.", "result": result}, 409)
     async with pool.connection() as conn:
@@ -704,7 +785,7 @@ async def save_review(request):
         return json_response({"error": "Attempt not found."}, 404)
     if attempt["submitted_at"]:
         return json_response({"error": "This attempt is already submitted."}, 409)
-    if attempt["mode"] == "exam" and time.time() >= attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60:
+    if attempt["mode"] == "exam" and not attempt["is_custom"] and time.time() >= attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60:
         result = await _grade_attempt(pool, attempt_id, user["id"])
         return json_response({"error": "Time is up.", "result": result}, 409)
     async with pool.connection() as conn:
@@ -793,6 +874,9 @@ def make_app():
     app.router.add_put("/api/preferences/theme", save_theme_preference)
     app.router.add_get("/api/quizzes", list_quizzes)
     app.router.add_get("/api/history", attempt_history)
+    app.router.add_get("/api/revision", list_revision)
+    app.router.add_post("/api/revision", set_revision_item)
+    app.router.add_post("/api/revision/resolve", resolve_revision_item)
     app.router.add_get("/api/quiz-builder/meta", quiz_builder_meta)
     app.router.add_get("/api/quiz-builder/count", quiz_builder_count)
     app.router.add_post("/api/quiz-builder/create", create_custom_quiz)
