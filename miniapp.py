@@ -75,6 +75,67 @@ def json_response(payload, status=200):
     return web.json_response(payload, status=status, dumps=lambda x: json.dumps(x, ensure_ascii=False, default=str))
 
 
+async def _has_personal_all_access(conn, telegram_id: int) -> bool:
+    """Check the canonical premium-pass table; never trust frontend/UI state."""
+    if int(telegram_id) in ADMIN_TELEGRAM_IDS:
+        return True
+    cur = await conn.execute("""SELECT EXISTS (
+        SELECT 1
+        FROM premium_passes pp
+        JOIN app_users u ON u.id=pp.user_id
+        WHERE u.telegram_id=%s
+          AND pp.revoked_at IS NULL
+          AND (pp.expires_at IS NULL OR pp.expires_at>NOW())
+          AND pp.pass_code='all_access'
+          AND '*' = ANY(pp.vault_keys)
+    ) AS allowed""", (int(telegram_id),))
+    row = await cur.fetchone()
+    return bool(row and row['allowed'])
+
+
+async def _quiz_access_allowed(conn, telegram_id: int, quiz_id: int, is_custom: bool = False) -> bool:
+    """Allow admins, an active personal All Access pass, or a specifically entitled/free published series."""
+    if int(telegram_id) in ADMIN_TELEGRAM_IDS:
+        return True
+    if await _has_personal_all_access(conn, telegram_id):
+        return True
+    # A custom quiz is generated from the full question bank and always needs personal All Access.
+    if is_custom:
+        return False
+    cur = await conn.execute("""SELECT s.id, s.access_type
+        FROM bpsc_nexus_test_series_tests st
+        JOIN bpsc_nexus_test_series s ON s.id=st.series_id
+        WHERE st.quiz_id=%s AND s.is_published=TRUE""", (int(quiz_id),))
+    series = await cur.fetchall()
+    if not series:
+        return False
+    if any(row['access_type'] == 'free' for row in series):
+        return True
+    for row in series:
+        cur = await conn.execute("""SELECT 1 FROM bpsc_nexus_test_series_entitlements
+            WHERE series_id=%s AND telegram_id=%s AND revoked_at IS NULL
+              AND (expires_at IS NULL OR expires_at>NOW()) LIMIT 1""", (row['id'], int(telegram_id)))
+        if await cur.fetchone():
+            return True
+    return False
+
+
+async def _active_attempt_access_allowed(pool, attempt, telegram_id: int) -> bool:
+    """Honor a valid entitlement recorded at attempt start; reject legacy unpaid active attempts."""
+    if attempt.get('submitted_at'):
+        return True
+    settings = attempt.get('quiz_settings') or {}
+    if not isinstance(settings, dict):
+        try:
+            settings = json.loads(settings or '{}')
+        except (TypeError, ValueError):
+            settings = {}
+    if settings.get('access_granted') is True:
+        return True
+    async with pool.connection() as conn:
+        return await _quiz_access_allowed(conn, telegram_id, int(attempt['quiz_id']), bool(attempt.get('is_custom')))
+
+
 async def _attempt_row(pool, attempt_id: int, telegram_id: int):
     async with pool.connection() as conn:
         cur = await conn.execute("""SELECT a.*,q.title,q.subject,q.duration_minutes,q.positive_marks,q.negative_marks,q.question_time_seconds,q.shuffle_options,q.is_custom
@@ -932,6 +993,9 @@ async def quiz_builder_count(request):
 async def create_custom_quiz(request):
     user = request["telegram_user"]
     pool = request.app["pool"]
+    async with pool.connection() as conn:
+        if not await _has_personal_all_access(conn, user["id"]):
+            return json_response({"error": "Personal All Access is required to create quizzes. Choose Individual Pro (2 months) or Individual Prime (lifetime) from Membership; group passes do not unlock personal quizzes."}, 403)
     try:
         body = await request.json()
         subject = str(body.get("subject") or "All subjects").strip()
@@ -1014,23 +1078,14 @@ async def start_attempt(request):
         quiz = await cur.fetchone()
         if not quiz:
             return json_response({"error": "Quiz is unavailable."}, 404)
-        cur = await conn.execute("""SELECT s.id,s.access_type FROM bpsc_nexus_test_series_tests st
-            JOIN bpsc_nexus_test_series s ON s.id=st.series_id
-            WHERE st.quiz_id=%s AND s.is_published=TRUE AND s.access_type='paid'
-            ORDER BY s.id LIMIT 1""", (quiz_id,))
-        paid_series = await cur.fetchone()
-        if paid_series:
-            ent = await conn.execute("""SELECT 1 FROM bpsc_nexus_test_series_entitlements
-                WHERE series_id=%s AND telegram_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>NOW())""",
-                (paid_series['id'], user['id']))
-            if not await ent.fetchone():
-                return json_response({"error": "This test belongs to a paid series. Access is not active for your account yet."}, 403)
+        if not await _quiz_access_allowed(conn, user["id"], quiz_id, bool(quiz["is_custom"])):
+            return json_response({"error": "Quiz access is locked. Personal quizzes require an active Individual Pro/Prime pass, or a specific entitlement for a paid Test Series. Open Membership to activate access."}, 403)
         cur = await conn.execute("""SELECT qb.id FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
             WHERE qq.quiz_id=%s AND qb.status='ready' ORDER BY qq.position""", (quiz_id,))
         ids = await cur.fetchall()
         if not ids:
             return json_response({"error": "This quiz has no verified questions."}, 400)
-        cur = await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions,question_time_seconds,quiz_settings) VALUES(%s,%s,%s,%s,%s,%s::jsonb) RETURNING id,started_at", (quiz_id, user["id"], mode, len(ids), int(quiz["question_time_seconds"] or 0), json.dumps({"custom": bool(quiz["is_custom"]), "mode_label": requested_mode})))
+        cur = await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions,question_time_seconds,quiz_settings) VALUES(%s,%s,%s,%s,%s,%s::jsonb) RETURNING id,started_at", (quiz_id, user["id"], mode, len(ids), int(quiz["question_time_seconds"] or 0), json.dumps({"custom": bool(quiz["is_custom"]), "mode_label": requested_mode, "access_granted": True})))
         attempt = await cur.fetchone()
         await conn.execute("""INSERT INTO bank_quiz_attempt_question_snapshots(attempt_id,position,question_id,subject,question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi)
             SELECT %s,qq.position,qb.id,qb.subject,qb.question_en,qb.question_hi,qb.question_type,qb.question_structure,qb.question_flags,qb.options,qb.correct_option, qb.explanation_en,qb.explanation_hi
@@ -1049,6 +1104,8 @@ async def get_attempt(request):
     attempt = await _attempt_row(pool, attempt_id, user["id"])
     if not attempt:
         return json_response({"error": "Attempt not found."}, 404)
+    if not await _active_attempt_access_allowed(pool, attempt, user["id"]):
+        return json_response({"error": "This unfinished attempt has no active membership entitlement. Open Membership to activate Individual Pro/Prime or the relevant Test Series pass."}, 403)
     if attempt["submitted_at"]:
         async with pool.connection() as conn:
             result = await _result_payload(conn, attempt_id, user["id"])
@@ -1095,6 +1152,8 @@ async def save_answer(request):
     attempt = await _attempt_row(pool, attempt_id, user["id"])
     if not attempt:
         return json_response({"error": "Attempt not found."}, 404)
+    if not await _active_attempt_access_allowed(pool, attempt, user["id"]):
+        return json_response({"error": "This unfinished attempt has no active membership entitlement. Open Membership to activate Individual Pro/Prime or the relevant Test Series pass."}, 403)
     if attempt["submitted_at"]:
         return json_response({"error": "This attempt is already submitted."}, 409)
     if attempt["mode"] == "exam" and not attempt["is_custom"] and time.time() >= attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60:
@@ -1131,6 +1190,8 @@ async def save_review(request):
     attempt = await _attempt_row(pool, attempt_id, user["id"])
     if not attempt:
         return json_response({"error": "Attempt not found."}, 404)
+    if not await _active_attempt_access_allowed(pool, attempt, user["id"]):
+        return json_response({"error": "This unfinished attempt has no active membership entitlement. Open Membership to activate Individual Pro/Prime or the relevant Test Series pass."}, 403)
     if attempt["submitted_at"]:
         return json_response({"error": "This attempt is already submitted."}, 409)
     if attempt["mode"] == "exam" and not attempt["is_custom"] and time.time() >= attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60:
@@ -1152,7 +1213,13 @@ async def submit_attempt(request):
         attempt_id = int(request.match_info["attempt_id"])
     except ValueError:
         return json_response({"error": "Invalid attempt ID."}, 400)
-    result = await _grade_attempt(request.app["pool"], attempt_id, user["id"], user.get("first_name", "Student"))
+    pool = request.app["pool"]
+    attempt = await _attempt_row(pool, attempt_id, user["id"])
+    if not attempt:
+        return json_response({"error": "Attempt not found."}, 404)
+    if not await _active_attempt_access_allowed(pool, attempt, user["id"]):
+        return json_response({"error": "This unfinished attempt has no active membership entitlement. Open Membership to activate Individual Pro/Prime or the relevant Test Series pass."}, 403)
+    result = await _grade_attempt(pool, attempt_id, user["id"], user.get("first_name", "Student"))
     if result is None:
         return json_response({"error": "Attempt not found."}, 404)
     return json_response(result)

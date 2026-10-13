@@ -66,3 +66,15 @@ Python syntax checks passed for `bot.py`, `group_quiz.py`, `miniapp.py`, and `qu
 7. Use **Manage topics in a subject** to archive unwanted topics. Use individual/bulk archive for clutter that should be hidden but preserved. Bulk merge is the recommended operation for old Set 1…150 subject records because it preserves their questions and set labels.
 
 Back up PostgreSQL before a large merge. The UI previews exact matched source names and counts before the transaction is committed.
+
+
+## Hotfix: Mini App display error (`createCustomQuiz is not defined`)
+
+The updated `static/index.html` now includes the missing `createCustomQuiz()` and `updateEligibleCount()` functions plus their count-check timer declaration. Replace the repository `static/index.html` with this fixed file and redeploy the Mini App service. No database changes are required for this frontend-only hotfix.
+
+
+## Payment enforcement hotfix (2026-10-13)
+
+This package adds server-side membership enforcement to the Mini App quiz builder and attempt APIs. It checks the canonical `premium_passes` table for an active personal `all_access` pass with the wildcard vault key, and allows explicitly published free test-series quizzes or a specific active entitlement for paid test series. Authorized admins retain access. New attempts record that access was verified at start so a pass expiring mid-attempt does not interrupt that already-authorized attempt. Existing unfinished attempts without this marker are rechecked; submitted history remains available.
+
+Deploy `miniapp.py` and `static/index.html` to the existing Mini App service. Keep the same `DATABASE_URL`, `BOT_TOKEN`, `ADMIN_TELEGRAM_IDS`, and existing static assets. No database reset is required. After deployment, test with (1) an account without an active pass (must receive HTTP 403 when creating or starting a quiz), (2) a user with active Individual Pro/Prime (must succeed), (3) a user entitled to a paid series (must access that series), and (4) an explicitly free published series (must remain available). Group Starter/Elite access is for the selected Telegram group and does not unlock personal Mini App quizzes.
