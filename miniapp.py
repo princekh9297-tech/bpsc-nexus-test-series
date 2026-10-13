@@ -5,6 +5,7 @@ Deploy as a separate Render Web Service from the Telegram bot. Shares DATABASE_U
 from __future__ import annotations
 
 import hashlib
+import aiohttp
 import hmac
 import json
 import logging
@@ -486,7 +487,14 @@ async def arena_answer(request):
     return json_response({"saved":True,"score":score,"answered":done,"finished":done>=int(m["question_count"])})
 
 
+# Public pass prices. Legacy all_access requests remain supported only for already-submitted requests.
 ALL_ACCESS_PRICES = {60: 90, 90: 130, 120: 150, 180: 180, 249: 220, 365: 300}
+PASS_PLANS = {
+    "group_starter": {"product_code": "group_starter", "product_name": "Group Starter Pass", "amount_inr": 99, "duration_days": 30, "scope": "group", "duration_label": "Monthly access", "description": "Quiz access for one selected Telegram group for 30 days."},
+    "group_elite": {"product_code": "group_elite", "product_name": "Group Elite Pass", "amount_inr": 249, "duration_days": 0, "scope": "group", "duration_label": "Lifetime access", "description": "Lifetime quiz access for one selected Telegram group."},
+    "individual_pro": {"product_code": "individual_pro", "product_name": "Individual Pro Pass", "amount_inr": 79, "duration_days": 60, "scope": "individual", "duration_label": "2 months access", "description": "Personal All Access for 60 days."},
+    "individual_prime": {"product_code": "individual_prime", "product_name": "Individual Prime Pass", "amount_inr": 149, "duration_days": 0, "scope": "individual", "duration_label": "Lifetime access", "description": "Personal lifetime All Access."},
+}
 # Product codes are stable entitlement identifiers; retiring a product only hides new sales.
 INDIVIDUAL_PRODUCTS = {
     "ghatnachakra_ecology": {"name": "Ghatnachakra Ecology — Lifetime Edition", "price": 39, "duration_days": 0, "entitlement_key": "ghatnachakra_ecology", "active": True},
@@ -501,6 +509,7 @@ async def payment_schema(conn):
         submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ,
         reviewed_by BIGINT, review_note TEXT, activated_pass_id BIGINT, UNIQUE(transaction_ref))""")
     await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS product_code TEXT NOT NULL DEFAULT 'all_access'")
+    await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS group_chat_id BIGINT")
     await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_payment_requests_status_idx ON bpsc_payment_requests(status, submitted_at DESC)")
     await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_individual_products (
         product_code TEXT PRIMARY KEY, product_name TEXT NOT NULL, amount_inr INTEGER NOT NULL CHECK(amount_inr >= 0),
@@ -531,38 +540,59 @@ async def payment_options(request):
     uid=request["telegram_user"]["id"]
     async with request.app["pool"].connection() as conn:
         await payment_schema(conn)
-        cur=await conn.execute("SELECT id,product_name,duration_days,amount_inr,product_code,transaction_ref,status,submitted_at,reviewed_at FROM bpsc_payment_requests WHERE telegram_id=%s ORDER BY submitted_at DESC LIMIT 20",(uid,))
+        cur=await conn.execute("SELECT id,product_name,duration_days,amount_inr,product_code,group_chat_id,transaction_ref,status,submitted_at,reviewed_at FROM bpsc_payment_requests WHERE telegram_id=%s ORDER BY submitted_at DESC LIMIT 20",(uid,))
         history=await cur.fetchall()
         cur=await conn.execute("SELECT product_code,product_name,amount_inr,entitlement_key,duration_days FROM bpsc_individual_products WHERE is_active=TRUE ORDER BY product_name")
         products=await cur.fetchall()
-    return json_response({"prices":[{"days":d,"price":p} for d,p in ALL_ACCESS_PRICES.items()],"products":[dict(r) for r in products],"history":[dict(r) for r in history]})
+    return json_response({"plans": list(PASS_PLANS.values()), "prices":[{"days":d,"price":p} for d,p in ALL_ACCESS_PRICES.items()],"products":[dict(r) for r in products],"history":[dict(r) for r in history]})
 
 async def submit_payment(request):
     user=request["telegram_user"]
     try: body=await request.json()
     except Exception: return json_response({"error":"Invalid submission."},400)
-    product_code=str(body.get("product_code") or "all_access").strip().lower()
+    product_code=str(body.get("product_code") or "").strip().lower()
     ref=str(body.get("transaction_ref") or "").strip().upper()
     screenshot=str(body.get("screenshot_data") or "")
     if not re.fullmatch(r"[A-Z0-9-]{6,40}",ref): return json_response({"error":"Enter a valid UPI transaction/reference ID (6–40 letters, digits or hyphens)."},400)
     if not screenshot.startswith("data:image/") or len(screenshot)>900000: return json_response({"error":"Upload a clear payment screenshot under 650 KB."},400)
-    async with request.app["pool"].connection() as conn:
-        await payment_schema(conn)
-        if product_code == "all_access":
+    group_chat_id = None
+    product_name = ""
+    amount = 0
+    days = 0
+    if product_code in PASS_PLANS:
+        plan = PASS_PLANS[product_code]
+        product_name, amount, days = plan["product_name"], int(plan["amount_inr"]), int(plan["duration_days"])
+        if plan["scope"] == "group":
+            try: group_chat_id = int(body.get("group_chat_id"))
+            except (TypeError, ValueError): return json_response({"error":"Enter the target Telegram group ID. In the group, run /groupid to get it."},400)
+            if group_chat_id >= 0:
+                return json_response({"error":"That does not look like a Telegram group ID. Add the bot to the group and run /groupid there."},400)
+            # Verify the purchaser is an administrator/owner of this exact group.
             try:
-                days=int(body.get("duration_days")); amount=ALL_ACCESS_PRICES[days]
-            except Exception: return json_response({"error":"Choose a valid All Access duration."},400)
-            product_name=f"All Access · {days} days"
-        else:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember", params={"chat_id": group_chat_id, "user_id": user["id"]}, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        check = await resp.json(content_type=None)
+                member = check.get("result") or {}
+                if not check.get("ok") or member.get("status") not in {"creator", "administrator"}:
+                    return json_response({"error":"Could not verify you as a group admin. Add BPSC Nexus bot to that group, run /groupid there, and submit from the Telegram account that owns/administers it."},400)
+            except Exception:
+                return json_response({"error":"Could not verify group admin status right now. Ensure the bot is in the group and try again."},400)
+    elif product_code == "all_access":
+        return json_response({"error":"The old All Access price list is retired. Please choose Individual Pro or Individual Prime."},400)
+    else:
+        async with request.app["pool"].connection() as conn:
+            await payment_schema(conn)
             cur=await conn.execute("SELECT product_code,product_name,amount_inr,duration_days FROM bpsc_individual_products WHERE product_code=%s AND is_active=TRUE",(product_code,))
             product=await cur.fetchone()
-            if not product: return json_response({"error":"This individual question bank is unavailable for new purchases."},404)
-            amount=int(product["amount_inr"]); days=int(product["duration_days"]); product_name=product["product_name"]
+        if not product: return json_response({"error":"This product is unavailable for new purchases."},404)
+        amount=int(product["amount_inr"]); days=int(product["duration_days"]); product_name=product["product_name"]
+    async with request.app["pool"].connection() as conn:
+        await payment_schema(conn)
         cur=await conn.execute("SELECT status FROM bpsc_payment_requests WHERE transaction_ref=%s",(ref,))
         if await cur.fetchone(): return json_response({"error":"This transaction/reference ID has already been submitted."},409)
-        cur=await conn.execute("INSERT INTO bpsc_payment_requests(telegram_id,product_code,product_name,duration_days,amount_inr,transaction_ref,screenshot_data) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id,submitted_at",(user["id"],product_code,product_name,days,amount,ref,screenshot))
+        cur=await conn.execute("INSERT INTO bpsc_payment_requests(telegram_id,product_code,product_name,duration_days,amount_inr,transaction_ref,screenshot_data,group_chat_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,submitted_at",(user["id"],product_code,product_name,days,amount,ref,screenshot,group_chat_id))
         r=await cur.fetchone()
-    return json_response({"request_id":int(r["id"]),"status":"pending","amount":amount,"product_code":product_code,"product_name":product_name,"submitted_at":r["submitted_at"].isoformat()},201)
+    return json_response({"request_id":int(r["id"]),"status":"pending","amount":amount,"product_code":product_code,"product_name":product_name,"group_chat_id":group_chat_id,"submitted_at":r["submitted_at"].isoformat()},201)
 
 async def index(request):
     # Resolve frontend relative to this file, not the process working directory.
@@ -843,12 +873,27 @@ async def attempt_history(request):
 
 async def quiz_builder_meta(request):
     pool = request.app["pool"]
+    selected_subject = str(request.query.get("subject", "")).strip()
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT subject, COUNT(*) AS n FROM question_bank WHERE status='ready' GROUP BY subject ORDER BY subject")
-        subjects = [{"name": r["subject"], "count": int(r["n"])} for r in await cur.fetchall()]
-        cur = await conn.execute("SELECT DISTINCT topic FROM question_bank WHERE status='ready' AND NULLIF(BTRIM(topic),'') IS NOT NULL ORDER BY topic LIMIT 500")
+        cur = await conn.execute("""SELECT s.name, s.created_at, COUNT(q.id) FILTER (WHERE q.status='ready') AS n
+            FROM question_bank_subjects s LEFT JOIN question_bank q ON q.subject=s.name
+            GROUP BY s.id,s.name,s.created_at ORDER BY LOWER(s.name),s.name""")
+        subjects = [{"name": r["name"], "count": int(r["n"]),
+                     "created_at": r["created_at"].isoformat() if r["created_at"] else None}
+                    for r in await cur.fetchall()]
+        if selected_subject and selected_subject != "All subjects":
+            cur = await conn.execute("""SELECT DISTINCT topic FROM question_bank q
+                JOIN question_bank_subjects s ON s.name=q.subject
+                WHERE q.status='ready' AND q.subject=%s AND NULLIF(BTRIM(q.topic),'') IS NOT NULL
+                ORDER BY topic LIMIT 500""", (selected_subject,))
+        else:
+            cur = await conn.execute("""SELECT DISTINCT q.topic FROM question_bank q
+                JOIN question_bank_subjects s ON s.name=q.subject
+                WHERE q.status='ready' AND NULLIF(BTRIM(q.topic),'') IS NOT NULL
+                ORDER BY q.topic LIMIT 500""")
         topics = [r["topic"] for r in await cur.fetchall()]
-        cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status='ready'")
+        cur = await conn.execute("""SELECT COUNT(*) AS n FROM question_bank q
+            JOIN question_bank_subjects s ON s.name=q.subject WHERE q.status='ready'""")
         total = int((await cur.fetchone())["n"])
     return json_response({"subjects": subjects, "topics": topics, "total_ready": total,
         "selection_modes": ["random", "sequential", "unseen", "incorrect"]})
@@ -859,10 +904,10 @@ async def quiz_builder_count(request):
     subject = str(request.query.get("subject", "All subjects")).strip()
     topic = str(request.query.get("topic", "")).strip()
     selection = str(request.query.get("selection", "random"))
-    conditions = ["qb.status='ready'"]
+    conditions = ["qb.status='ready'", "EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject)"]
     params = []
     if subject and subject != "All subjects":
-        conditions.append("qb.subject=%s"); params.append(subject)
+        conditions.append("EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.name=%s)"); params.append(subject)
     if topic:
         conditions.append("qb.topic=%s"); params.append(topic)
     if selection == "unseen":
@@ -903,10 +948,10 @@ async def create_custom_quiz(request):
     except Exception:
         return json_response({"error": "Invalid quiz builder settings."}, 400)
 
-    conditions = ["qb.status='ready'"]
+    conditions = ["qb.status='ready'", "EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject)"]
     params = []
     if subject != "All subjects":
-        conditions.append("qb.subject=%s"); params.append(subject)
+        conditions.append("EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.name=%s)"); params.append(subject)
     if topic:
         conditions.append("qb.topic=%s"); params.append(topic)
     if selection == "unseen":

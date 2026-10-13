@@ -165,8 +165,9 @@ async def ensure_schema() -> None:
             transaction_ref TEXT NOT NULL, screenshot_data TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
             submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ,
-            reviewed_by BIGINT, review_note TEXT, activated_pass_id BIGINT,
+            reviewed_by BIGINT, review_note TEXT, activated_pass_id BIGINT, group_chat_id BIGINT,
             UNIQUE (transaction_ref))""",
+        "ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS group_chat_id BIGINT",
         "CREATE INDEX IF NOT EXISTS bpsc_payment_requests_status_idx ON bpsc_payment_requests(status, submitted_at DESC)",
     ]
     async with pool.connection() as conn:
@@ -411,6 +412,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_message:
             await update.effective_message.reply_text(
                 "🧩 BPSC Nexus Group Quiz\n\n"
+                "Group Passes: Starter ₹99/month · Elite ₹249/lifetime. Run /groupid to copy this group's ID, then purchase the pass from the private Membership page.\n\n"
                 "Group admins/owners: /startquiz to create a quiz, /pausequiz to pause, "
                 "/resumequiz to continue, /stopquiz to complete early and publish results, "
                 "/schedulequiz to schedule, /leaderboard for rankings, /quizstatus for status, and /quizbrand to customise this group’s branding.\n\n"
@@ -435,7 +437,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await reply_with_uluk(
         message,
-        f"Welcome to BPSC Nexus, {user.first_name or 'Aspirant'}! 🦉\n\nYour quizzes, planner, results and study tools are available in the Mini App.",
+        f"Welcome to BPSC Nexus, {user.first_name or 'Aspirant'}! 🦉\n\nYour quizzes, planner, results and study tools are available in the Mini App.\n\n💳 PREMIUM PASSES\n👥 Group Starter — ₹99/month\n👥 Group Elite — ₹249 lifetime\n👤 Individual Pro — ₹79/2 months\n👤 Individual Prime — ₹149 lifetime\n\n✨ Coaching Institute Test Series: ₹49 per series — coming soon.",
         reply_markup=main_user_keyboard(),
     )
 
@@ -452,6 +454,19 @@ def main_user_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📘 Tutorial", callback_data="user:tutorial")],
     ])
     return InlineKeyboardMarkup(keyboard)
+
+
+
+async def groupid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Help a group owner/admin copy the exact target group ID for a group pass."""
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if chat.type == "private":
+        await message.reply_text("To get a group ID, add BPSC Nexus to the target Telegram group and run /groupid inside that group. Then open Membership in a private chat and enter that ID.")
+        return
+    await message.reply_text(f"🆔 This Telegram group ID is: {chat.id}\n\nCopy this ID into the Group Pass purchase form. The purchaser must be an administrator of this group.")
 
 
 async def personal_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -870,7 +885,9 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
                 cur=await conn.execute("SELECT * FROM bpsc_payment_requests WHERE id=%s",(rid,)); r=await cur.fetchone()
             if not r:
                 await query.edit_message_text("Payment request not found.", reply_markup=admin_home_keyboard()); return True
-            text=(f"💳 Payment request #{rid}\n\nUser: {r['telegram_id']}\nProduct: {r['product_name']}\nAmount: ₹{r['amount_inr']}\nDuration: {r['duration_days']} days\nUPI reference: {r['transaction_ref']}\nStatus: {r['status']}\nSubmitted: {r['submitted_at']}\n\nVerify the credit in your PhonePe/bank app before approving.")
+            group_line = f"\nTarget group ID: {r.get('group_chat_id')}" if r.get('group_chat_id') else ""
+            duration_line = "Lifetime" if int(r.get('duration_days') or 0) == 0 else f"{r['duration_days']} days"
+            text=(f"💳 Payment request #{rid}\n\nUser: {r['telegram_id']}\nProduct: {r['product_name']}\nAmount: ₹{r['amount_inr']}\nDuration: {duration_line}{group_line}\nUPI reference: {r['transaction_ref']}\nStatus: {r['status']}\nSubmitted: {r['submitted_at']}\n\nVerify the credit in your PhonePe/bank app before approving.")
             buttons=[]
             if r['status']=='pending': buttons=[[InlineKeyboardButton("✅ Approve & Activate",callback_data=f"pay:approve:{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"pay:reject:{rid}")]]
             buttons.append([InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")])
@@ -882,6 +899,8 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
                 await context.bot.send_photo(chat_id=update.effective_user.id,photo=BytesIO(base64.b64decode(raw)),caption=f"Payment proof for request #{rid}")
             except Exception: logger.exception("Could not send payment screenshot to admin")
             return True
+        activated = None
+        granted_message = ""
         async with pool.connection() as conn:
             async with conn.transaction():
                 cur=await conn.execute("SELECT * FROM bpsc_payment_requests WHERE id=%s FOR UPDATE",(rid,)); r=await cur.fetchone()
@@ -893,23 +912,81 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
                     await conn.execute("UPDATE bpsc_payment_requests SET status='rejected',reviewed_at=NOW(),reviewed_by=%s WHERE id=%s",(update.effective_user.id,rid))
                     user_msg=f"Your BPSC Nexus payment request #{rid} was rejected. Please contact an admin if you believe this is an error."
                 else:
-                    cur=await conn.execute("SELECT id FROM app_users WHERE telegram_id=%s",(r['telegram_id'],)); u=await cur.fetchone()
-                    if not u:
-                        await query.edit_message_text("User is not registered in app_users. Ask them to press /start, then review again.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")]])); return True
-                    cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code='all_access' AND is_active=TRUE"); cat=await cur.fetchone()
-                    if not cat:
-                        await query.edit_message_text("All-Access pass is missing/inactive in pass_catalogue; no access was granted.",reply_markup=admin_home_keyboard()); return True
-                    cur=await conn.execute("SELECT MAX(expires_at) AS expiry FROM premium_passes WHERE user_id=%s AND pass_code='all_access' AND revoked_at IS NULL AND expires_at>NOW()",(u['id'],)); expiry=(await cur.fetchone())['expiry']
-                    # Renewal begins after current expiry when one exists, otherwise now.
-                    cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys)
-                        VALUES(%s,%s,%s,COALESCE(%s,NOW()),COALESCE(%s,NOW()) + (%s * INTERVAL '1 day'),%s,'all_access',ARRAY['*']::TEXT[]) RETURNING id""",
-                        (u['id'],cat['id'],update.effective_user.id,expiry,expiry,int(r['duration_days']),f"Manual UPI payment request #{rid}; ₹{r['amount_inr']}") )
-                    activated=(await cur.fetchone())['id']
-                    await conn.execute("UPDATE bpsc_payment_requests SET status='approved',reviewed_at=NOW(),reviewed_by=%s,activated_pass_id=%s WHERE id=%s",(update.effective_user.id,activated,rid))
-                    user_msg=f"✅ Your BPSC Nexus payment is approved. All Access for {r['duration_days']} days has been activated. Use /mypremium to check your membership."
+                    code = str(r.get('product_code') or 'all_access').strip().lower()
+                    if code in {'group_starter','group_elite'}:
+                        group_chat_id = r.get('group_chat_id')
+                        if not group_chat_id:
+                            await query.edit_message_text("This group-pass request has no target group ID. Reject it or ask the user to resubmit with /groupid.", reply_markup=admin_home_keyboard()); return True
+                        cur=await conn.execute("SELECT expires_at,is_active,plan_code FROM group_quiz_memberships WHERE chat_id=%s FOR UPDATE",(int(group_chat_id),)); old=await cur.fetchone()
+                        now=datetime.now(timezone.utc)
+                        if code == 'group_elite':
+                            expiry = None
+                        elif old and old['is_active'] and old['expires_at'] is None:
+                            # Do not downgrade a group's existing lifetime entitlement.
+                            expiry = None
+                        else:
+                            base = old['expires_at'] if old and old['is_active'] and old['expires_at'] and old['expires_at'] > now else now
+                            expiry = base + timedelta(days=30)
+                        plan_code = (old['plan_code'] or 'group_elite') if old and old['is_active'] and old['expires_at'] is None and code == 'group_starter' else ('group_elite' if code == 'group_elite' else code)
+                        await conn.execute("""INSERT INTO group_quiz_memberships(chat_id,chat_title,is_active,granted_by,granted_at,revoked_at,expires_at,plan_code)
+                            VALUES(%s,%s,TRUE,%s,NOW(),NULL,%s,%s)
+                            ON CONFLICT(chat_id) DO UPDATE SET chat_title=EXCLUDED.chat_title,is_active=TRUE,granted_by=EXCLUDED.granted_by,granted_at=NOW(),revoked_at=NULL,expires_at=EXCLUDED.expires_at,plan_code=EXCLUDED.plan_code""",
+                            (int(group_chat_id),str(group_chat_id),update.effective_user.id,expiry,plan_code))
+                        await conn.execute("UPDATE bpsc_payment_requests SET status='approved',reviewed_at=NOW(),reviewed_by=%s WHERE id=%s",(update.effective_user.id,rid))
+                        duration = 'lifetime' if expiry is None else f"until {expiry.astimezone(timezone.utc).strftime('%d %b %Y %H:%M UTC')}"
+                        user_msg=f"✅ Your BPSC Nexus {r['product_name']} payment is approved. Group quiz access is active for group {group_chat_id} ({duration}). This pass applies only to that group."
+                        granted_message = f"Group access activated for {group_chat_id}."
+                    elif code in {'individual_pro','individual_prime','all_access'}:
+                        cur=await conn.execute("SELECT id FROM app_users WHERE telegram_id=%s",(r['telegram_id'],)); u=await cur.fetchone()
+                        if not u:
+                            await query.edit_message_text("User is not registered in app_users. Ask them to press /start, then review again.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")]])); return True
+                        cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code='all_access' AND is_active=TRUE"); cat=await cur.fetchone()
+                        if not cat:
+                            await query.edit_message_text("All-Access pass is missing/inactive in pass_catalogue; no access was granted.",reply_markup=admin_home_keyboard()); return True
+                        cur=await conn.execute("SELECT expires_at FROM premium_passes WHERE user_id=%s AND pass_code='all_access' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>NOW()) ORDER BY expires_at NULLS FIRST LIMIT 1 FOR UPDATE",(u['id'],)); current=await cur.fetchone()
+                        now=datetime.now(timezone.utc)
+                        if code == 'individual_prime':
+                            expiry = None
+                        elif current and current['expires_at'] is None:
+                            expiry = None
+                        else:
+                            days = 60 if code == 'individual_pro' else int(r['duration_days'] or 0)
+                            base = current['expires_at'] if current and current['expires_at'] and current['expires_at'] > now else now
+                            expiry = base + timedelta(days=days) if days > 0 else None
+                        cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys)
+                            VALUES(%s,%s,%s,NOW(),%s,%s,'all_access',ARRAY['*']::TEXT[]) RETURNING id""",
+                            (u['id'],cat['id'],update.effective_user.id,expiry,f"Manual UPI payment request #{rid}; ₹{r['amount_inr']}"))
+                        activated=(await cur.fetchone())['id']
+                        await conn.execute("UPDATE bpsc_payment_requests SET status='approved',reviewed_at=NOW(),reviewed_by=%s,activated_pass_id=%s WHERE id=%s",(update.effective_user.id,activated,rid))
+                        duration = 'lifetime' if expiry is None else f"until {expiry.astimezone(timezone.utc).strftime('%d %b %Y %H:%M UTC')}"
+                        user_msg=f"✅ Your BPSC Nexus {r['product_name']} payment is approved. Your personal All Access is active ({duration}). Use /mypremium to check your membership."
+                        granted_message = "Personal All Access activated."
+                    else:
+                        # Individual question-bank purchases must grant only their own vault, never All Access.
+                        cur=await conn.execute("SELECT product_code,product_name,entitlement_key,duration_days FROM bpsc_individual_products WHERE product_code=%s AND is_active=TRUE",(code,)); product=await cur.fetchone()
+                        if not product:
+                            await query.edit_message_text("Product code is no longer active or is unknown. No access was granted; check the request before proceeding.",reply_markup=admin_home_keyboard()); return True
+                        cur=await conn.execute("SELECT id FROM app_users WHERE telegram_id=%s",(r['telegram_id'],)); u=await cur.fetchone()
+                        if not u:
+                            await query.edit_message_text("User is not registered in app_users. Ask them to press /start, then review again.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")]])); return True
+                        await conn.execute("INSERT INTO pass_catalogue(pass_code,pass_name,description,is_active) VALUES(%s,%s,%s,TRUE) ON CONFLICT(pass_code) DO UPDATE SET pass_name=EXCLUDED.pass_name,description=EXCLUDED.description,is_active=TRUE",(code,product['product_name'],f"Individual question-bank entitlement: {product['entitlement_key']}"))
+                        cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code=%s AND is_active=TRUE",(code,)); cat=await cur.fetchone()
+                        if not cat:
+                            await query.edit_message_text("The individual product pass is missing/inactive in the pass catalogue; no access was granted.",reply_markup=admin_home_keyboard()); return True
+                        now=datetime.now(timezone.utc)
+                        days=int(product['duration_days'] or 0)
+                        expiry=now+timedelta(days=days) if days>0 else None
+                        cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys)
+                            VALUES(%s,%s,%s,NOW(),%s,%s,%s,%s) RETURNING id""",
+                            (u['id'],cat['id'],update.effective_user.id,expiry,f"Individual question-bank payment request #{rid}; ₹{r['amount_inr']}",code,[product['entitlement_key']]))
+                        activated=(await cur.fetchone())['id']
+                        await conn.execute("UPDATE bpsc_payment_requests SET status='approved',reviewed_at=NOW(),reviewed_by=%s,activated_pass_id=%s WHERE id=%s",(update.effective_user.id,activated,rid))
+                        user_msg=f"✅ Your payment for {product['product_name']} is approved. Only this question-bank entitlement has been activated; it does not include All Access. Use /mypremium to check your membership."
+                        granted_message = f"Only {product['product_name']} entitlement activated."
         try: await context.bot.send_message(chat_id=int(r['telegram_id']),text=user_msg)
         except Exception: logger.warning("Could not notify user %s about payment request %s",r['telegram_id'],rid)
-        await query.edit_message_text(f"Request #{rid} {parts[1]}d. {'Membership activated.' if parts[1]=='approve' else 'No membership was granted.'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")],[InlineKeyboardButton("Admin Panel",callback_data="adm:home")]]))
+        result_note = (granted_message or "Membership activated.") if parts[1] == 'approve' else "No membership was granted."
+        await query.edit_message_text(f"Request #{rid} {parts[1]}d. {result_note}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Pending Requests",callback_data="pay:pending")],[InlineKeyboardButton("Admin Panel",callback_data="adm:home")]]))
         return True
     return True
 
@@ -1322,7 +1399,7 @@ async def groupgrant_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await conn.execute("""INSERT INTO group_quiz_memberships(chat_id,chat_title,is_active,granted_by,granted_at,revoked_at)
             VALUES(%s,%s,TRUE,%s,NOW(),NULL)
             ON CONFLICT(chat_id) DO UPDATE SET chat_title=EXCLUDED.chat_title,is_active=TRUE,
-            granted_by=EXCLUDED.granted_by,granted_at=NOW(),revoked_at=NULL""", (chat_id, label, user.id))
+            granted_by=EXCLUDED.granted_by,granted_at=NOW(),revoked_at=NULL,expires_at=NULL,plan_code='manual'""", (chat_id, label, user.id))
     await message.reply_text(f"✅ Group Quiz membership activated.\n\nGroup ID: {chat_id}\nName: {label or 'Not set'}\nOnly this group can now use BPSC Nexus group-quiz features.")
 
 
@@ -1364,12 +1441,14 @@ async def grouplist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not is_admin(update) or not is_private(update):
         await message.reply_text("Only the bot owner/admin can view the authorized group list in private chat."); return
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT chat_id,chat_title,granted_at FROM group_quiz_memberships WHERE is_active=TRUE ORDER BY granted_at DESC")
+        cur = await conn.execute("SELECT chat_id,chat_title,granted_at,expires_at,plan_code FROM group_quiz_memberships WHERE is_active=TRUE AND (expires_at IS NULL OR expires_at>NOW()) ORDER BY granted_at DESC")
         rows = await cur.fetchall()
     if not rows:
         await message.reply_text("No groups have active Quiz membership yet. Use /groupgrant <group_id>."); return
     lines = ["📋 Authorized BPSC Nexus Quiz Groups", ""]
-    for row in rows: lines.append(f"• {row['chat_title'] or 'Unnamed group'} — {row['chat_id']}")
+    for row in rows:
+        expiry = 'Lifetime / no expiry' if row['expires_at'] is None else f"Expires {row['expires_at'].astimezone(timezone.utc).strftime('%d %b %Y')}"
+        lines.append(f"• {row['chat_title'] or 'Unnamed group'} — {row['chat_id']} · {expiry}")
     await message.reply_text("\n".join(lines)[:4000])
 
 
@@ -1397,6 +1476,7 @@ def main() -> None:
     application.add_handler(CommandHandler("quiz", quiz_command))
     application.add_handler(CommandHandler("tests", tests_command))
     application.add_handler(CommandHandler("mypremium", mypremium_command))
+    application.add_handler(CommandHandler("groupid", groupid_command))
     application.add_handler(CommandHandler("myanalysis", personal_analysis_command))
     application.add_handler(CommandHandler("tutorial", tutorial_command))
     application.add_handler(CommandHandler("admin", admin_command))

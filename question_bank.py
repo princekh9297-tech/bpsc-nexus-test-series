@@ -27,7 +27,7 @@ log = logging.getLogger("bpsc_nexus_question_bank")
 MAX_QUESTIONS_PER_IMPORT = 20000
 MAX_FILE_BYTES = 20 * 1024 * 1024
 LETTERS = "ABCDE"
-SUBJECTS = ["General Science", "Bihar Special", "Modern Indian History", "Indian Polity", "Geography", "Economy", "Ancient & Medieval History", "Art & Culture", "Other / Unclassified"]
+SUBJECTS: list[str] = []  # Loaded only from explicitly created admin subjects; imports never add to this list.
 
 DDL = [
     """CREATE TABLE IF NOT EXISTS question_bank_subjects (
@@ -341,12 +341,16 @@ def _extract_json_records(obj: Any) -> list:
                 flattened=[]
                 for group in val:
                     if not isinstance(group, dict): continue
-                    group_name = group.get("name") or group.get("title") or group.get("chapterNameEn") or group.get("section") or ""
+                    group_name = group.get("name") or group.get("title") or group.get("chapterNameEn") or group.get("section") or group.get("subject") or ""
                     group_hi = group.get("hiName") or group.get("chapterNameHi") or ""
                     for q in group.get("questions", group.get("items", [])) or []:
                         if isinstance(q, dict):
                             row=dict(q)
-                            row.setdefault("chapter", group_name)
+                            if key == "subjects":
+                                row.setdefault("subject", group_name)
+                            else:
+                                row.setdefault("chapter", group_name)
+                                row.setdefault("topic", group_name)
                             if group_hi: row.setdefault("chapter_hi", group_hi)
                             flattened.append(row)
                 if flattened: return flattened
@@ -686,10 +690,34 @@ async def ensure_schema(pool):
             question_type=qb.question_type, question_structure=qb.question_structure, question_flags=qb.question_flags
             FROM question_bank qb WHERE qb.id=s.question_id
             AND (s.question_type IS DISTINCT FROM qb.question_type OR s.question_structure IS DISTINCT FROM qb.question_structure OR s.question_flags IS DISTINCT FROM qb.question_flags)""")
-        # Keep user-created subjects persistent and available in all admin selectors.
-        cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY name")
-        for row in await cur.fetchall():
-            if row["name"] not in SUBJECTS: SUBJECTS.append(row["name"])
+        # The database table is the single source of truth. Never infer/create subjects
+        # from imported question labels or topic names.
+        cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY LOWER(name), name")
+        SUBJECTS[:] = [row["name"] for row in await cur.fetchall()]
+        # Safe automatic merge for exact names differing only by casing/whitespace.
+        # Semantically different names are left for the explicit admin merge workflow.
+        async with conn.transaction():
+            cur = await conn.execute("""SELECT LOWER(BTRIM(name)) AS norm, ARRAY_AGG(name ORDER BY LENGTH(name), name) AS names
+                FROM question_bank_subjects GROUP BY LOWER(BTRIM(name)) HAVING COUNT(*) > 1""")
+            dup_groups = await cur.fetchall()
+            for group in dup_groups:
+                names = list(group["names"] or [])
+                if len(names) < 2: continue
+                canonical = names[0]
+                for old_name in names[1:]:
+                    await conn.execute("UPDATE question_bank SET subject=%s WHERE subject=%s", (canonical, old_name))
+                    await conn.execute("UPDATE bank_quizzes SET subject=%s WHERE subject=%s", (canonical, old_name))
+                    await conn.execute("UPDATE bank_quiz_attempt_question_snapshots SET subject=%s WHERE subject=%s", (canonical, old_name))
+                    await conn.execute("UPDATE question_import_batches SET selected_subject=%s WHERE selected_subject=%s", (canonical, old_name))
+                    cur = await conn.execute("SELECT to_regclass('public.bpsc_nexus_test_series') AS t")
+                    if (await cur.fetchone())["t"]:
+                        await conn.execute("UPDATE bpsc_nexus_test_series SET subject=%s WHERE subject=%s", (canonical, old_name))
+                    await conn.execute("DELETE FROM question_bank_subjects WHERE name=%s", (old_name,))
+            if dup_groups:
+                cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY LOWER(name), name")
+                SUBJECTS[:] = [row["name"] for row in await cur.fetchall()]
+            # Enforce case/whitespace-insensitive uniqueness after the safe merge pass.
+            await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_question_bank_subjects_normalized_name ON question_bank_subjects (LOWER(BTRIM(name)))")
     await lb.ensure_schema(pool)
     log.info("Question bank schema verified.")
 
@@ -698,11 +726,19 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
     if pool is None: raise RuntimeError("Database is unavailable.")
     async with pool.connection() as conn:
         async with conn.transaction():
-            cur=await conn.execute("INSERT INTO question_import_batches(owner_telegram_id,file_name,file_type,selected_subject,total_detected,invalid_count) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id", (owner_id,filename,file_type,subject,len(records)+invalid_count,invalid_count))
+            cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY name")
+            allowed = {str(r["name"]).strip().casefold(): str(r["name"]).strip() for r in await cur.fetchall()}
+            selected = allowed.get(str(subject or "").strip().casefold())
+            if not selected:
+                raise ValueError("The selected subject no longer exists. Create/select an admin subject and retry import.")
+            cur=await conn.execute("INSERT INTO question_import_batches(owner_telegram_id,file_name,file_type,selected_subject,total_detected,invalid_count) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id", (owner_id,filename,file_type,selected,len(records)+invalid_count,invalid_count))
             batch_id=(await cur.fetchone())["id"]
             imported=duplicates=0
             for item in records:
-                # A source's subject overrides the batch default only when explicitly present.
+                # Honour embedded subject labels only if they match an explicitly created subject.
+                # Unknown labels never create a subject; they fall back to the selected subject.
+                mapped_subject = allowed.get(str(item.get("subject") or "").strip().casefold(), selected)
+                item["subject"] = mapped_subject
                 cur=await conn.execute("""INSERT INTO question_bank(question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status,question_hash,import_batch_id,created_by_telegram_id)
                     VALUES(%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(question_hash) DO NOTHING RETURNING id""",
@@ -716,7 +752,8 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
 def admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add One Question", callback_data="qb:addone"), InlineKeyboardButton("📥 Bulk Import File", callback_data="qb:import")],
-        [InlineKeyboardButton("➕ Create Subject", callback_data="qb:newsubject"), InlineKeyboardButton("🧪 Create Test Series", callback_data="qb:build")],
+        [InlineKeyboardButton("➕ Create Subject", callback_data="qb:newsubject"), InlineKeyboardButton("🗂 Manage / Merge Subjects", callback_data="qb:subjects")],
+        [InlineKeyboardButton("🧪 Create Test Series", callback_data="qb:build")],
         [InlineKeyboardButton("🗃 Browse / Edit", callback_data="qb:browse"), InlineKeyboardButton("🗑 Delete Questions", callback_data="qb:deletehub")],
         [InlineKeyboardButton("🧹 Bulk Delete by IDs", callback_data="qb:bulkdelete"), InlineKeyboardButton("📦 Import History / Undo", callback_data="qb:history")],
         [InlineKeyboardButton("🗂 Manage Test Series", callback_data="qb:manage")],
@@ -725,10 +762,16 @@ def admin_keyboard():
     ])
 
 
-def subject_keyboard(prefix: str):
+def subject_keyboard(prefix: str, page: int = 0):
     rows=[]
-    for i in range(0,len(SUBJECTS),2):
-        rows.append([InlineKeyboardButton(SUBJECTS[j],callback_data=f"{prefix}:{j}") for j in range(i,min(i+2,len(SUBJECTS)))])
+    page=max(0,int(page)); start=page*20; visible=SUBJECTS[start:start+20]
+    for i in range(0,len(visible),2):
+        rows.append([InlineKeyboardButton(visible[j][:40],callback_data=f"{prefix}:{start+j}") for j in range(i,min(i+2,len(visible)))])
+    nav=[]
+    short_prefix=prefix.split(":",1)[1] if ":" in prefix else prefix
+    if page>0: nav.append(InlineKeyboardButton("← Previous",callback_data=f"qb:subpage:{short_prefix}:{page-1}"))
+    if start+20<len(SUBJECTS): nav.append(InlineKeyboardButton("Next →",callback_data=f"qb:subpage:{short_prefix}:{page+1}"))
+    if nav: rows.append(nav)
     rows.append([InlineKeyboardButton("✖ Cancel",callback_data="qb:home")])
     return InlineKeyboardMarkup(rows)
 
@@ -749,12 +792,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
     if data.startswith("qb:") and not is_authorized:
         await q.answer("Not authorized.",show_alert=True); return
     await q.answer()
+    if data.startswith("qb:subpage:"):
+        try:
+            _,_,prefix,page_raw=data.split(":",3); page=max(0,int(page_raw))
+        except ValueError:
+            await q.edit_message_text("Subject page expired. Start again.",reply_markup=admin_keyboard()); return
+        prefix_map={"addsubject":"Choose a subject for the question:","importsubject":"Choose the destination subject for this import:","quizsubject":"Choose a subject for the quiz:"}
+        if prefix not in prefix_map:
+            await q.edit_message_text("Unknown subject selector.",reply_markup=admin_keyboard()); return
+        await q.edit_message_text(prefix_map[prefix]+f"\nPage {page+1} · {len(SUBJECTS)} subjects",reply_markup=subject_keyboard("qb:"+prefix,page)); return
     if data == "qb:newsubject":
         context.user_data["qb_flow"]={"step":"create_subject"}
         await q.edit_message_text("➕ Create a new subject\n\nSend the exact subject name. It will be saved to the database and appear in future import and test-series selectors.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
     if data == "qb:addone":
+        if not SUBJECTS:
+            await q.edit_message_text("Create a subject first, then add questions to it.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Create Subject", callback_data="qb:newsubject")],[InlineKeyboardButton("Back", callback_data="qb:home")]])); return
         context.user_data["qb_flow"]={"step":"add_question_subject"}
-        await q.edit_message_text("➕ Add a question\n\nChoose its subject first:",reply_markup=subject_keyboard("qb:addsubject")); return
+        await q.edit_message_text(f"➕ Add a question\n\nChoose its subject first · {len(SUBJECTS)} subjects",reply_markup=subject_keyboard("qb:addsubject")); return
     if data.startswith("qb:addsubject:"):
         idx=int(data.rsplit(":",1)[1]); context.user_data["qb_flow"]={"step":"add_question_text","subject":SUBJECTS[idx]}
         await q.edit_message_text("Send the MCQ in one message using this format:\n\nQuestion text\nA. Option A\nB. Option B\nC. Option C\nD. Option D\nAnswer: B\nExplanation: Explanation text\n\nHindi text may be included too. The question is previewed before saving.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel",callback_data="qb:home")]])); return
@@ -847,6 +901,92 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
                 await conn.execute("DELETE FROM bank_quiz_attempt_answers WHERE question_id=%s",(qid,))
                 cur=await conn.execute("DELETE FROM question_bank WHERE id=%s RETURNING id",(qid,)); row=await cur.fetchone()
         await q.edit_message_text(f"{'✅ Question #' + str(qid) + ' permanently deleted and removed from quiz sets.' if row else 'Question not found; no question was deleted.'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Delete more",callback_data="qb:deletehub")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
+    if data == "qb:subjects" or data.startswith("qb:subjectspage:"):
+        try: page = max(0, int(data.rsplit(":",1)[1])) if data.startswith("qb:subjectspage:") else 0
+        except ValueError: page = 0
+        async with pool.connection() as conn:
+            cur = await conn.execute("""SELECT s.name, COUNT(q.id) AS n FROM question_bank_subjects s
+                LEFT JOIN question_bank q ON q.subject=s.name GROUP BY s.name ORDER BY LOWER(s.name),s.name""")
+            rows = await cur.fetchall()
+        SUBJECTS[:] = [r["name"] for r in rows]
+        if not rows:
+            await q.edit_message_text("No admin-created subjects yet. Use Create Subject first.", reply_markup=admin_keyboard()); return
+        context.user_data["qb_subject_manage_options"] = SUBJECTS[:]
+        start = page * 20
+        buttons = [[InlineKeyboardButton(f"{r['name'][:32]} · {int(r['n'])} Q", callback_data=f"qb:mergefrom:{start+i}")] for i,r in enumerate(rows[start:start+20])]
+        nav=[]
+        if page > 0: nav.append(InlineKeyboardButton("← Previous", callback_data=f"qb:subjectspage:{page-1}"))
+        if start+20 < len(rows): nav.append(InlineKeyboardButton("Next →", callback_data=f"qb:subjectspage:{page+1}"))
+        if nav: buttons.append(nav)
+        buttons.append([InlineKeyboardButton("🧹 Delete empty subjects", callback_data="qb:deleteempty")])
+        buttons.append([InlineKeyboardButton("⬅ Question Bank menu", callback_data="qb:home")])
+        await q.edit_message_text(f"🗂 Manage subjects · Page {page+1}\n\nSelect a redundant subject to merge into another subject. Questions, quiz labels and saved review snapshots will be reassigned before the old subject record is deleted. Empty subjects can be removed separately.\nTotal subjects: {len(rows)}", reply_markup=InlineKeyboardMarkup(buttons)); return
+    if data.startswith("qb:mergefrom:"):
+        try: source_index = int(data.rsplit(":",1)[1]); options = context.user_data.get("qb_subject_manage_options", SUBJECTS)
+        except (ValueError,TypeError): source_index = -1; options = []
+        if source_index < 0 or source_index >= len(options):
+            await q.edit_message_text("Subject selection expired. Open Manage / Merge Subjects again.", reply_markup=admin_keyboard()); return
+        source = options[source_index]
+        context.user_data["qb_merge_source"] = source
+        context.user_data["qb_merge_target_page"] = 0
+        buttons = [[InlineKeyboardButton(name[:36], callback_data=f"qb:mergeto:{i}")] for i,name in enumerate(options[:20]) if name != source]
+        nav=[]
+        if len(options)>20: nav.append(InlineKeyboardButton("More targets →", callback_data="qb:mergetopage:1"))
+        if nav: buttons.append(nav)
+        buttons.append([InlineKeyboardButton("Cancel", callback_data="qb:subjects")])
+        await q.edit_message_text(f"Merge source: {source}\n\nChoose the canonical subject that should keep these questions:", reply_markup=InlineKeyboardMarkup(buttons)); return
+    if data.startswith("qb:mergetopage:"):
+        try: page=max(0,int(data.rsplit(":",1)[1])); options=context.user_data.get("qb_subject_manage_options",SUBJECTS); source=context.user_data.get("qb_merge_source")
+        except (ValueError,TypeError): page=0; options=[]; source=None
+        start=page*20; buttons=[[InlineKeyboardButton(name[:36],callback_data=f"qb:mergeto:{i}")] for i,name in enumerate(options[start:start+20],start) if name!=source]
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton("← Previous",callback_data=f"qb:mergetopage:{page-1}"))
+        if start+20<len(options): nav.append(InlineKeyboardButton("Next →",callback_data=f"qb:mergetopage:{page+1}"))
+        if nav: buttons.append(nav)
+        buttons.append([InlineKeyboardButton("Cancel",callback_data="qb:subjects")])
+        await q.edit_message_text(f"Merge source: {source}\nChoose target · Page {page+1}",reply_markup=InlineKeyboardMarkup(buttons)); return
+    if data.startswith("qb:mergeto:"):
+        try: target_index = int(data.rsplit(":",1)[1]); options = context.user_data.get("qb_subject_manage_options", SUBJECTS); target = options[target_index]; source = context.user_data.get("qb_merge_source")
+        except (ValueError,TypeError,IndexError): source = None; target = None
+        if not source or not target or source == target:
+            await q.edit_message_text("Merge selection expired or invalid. Start again.", reply_markup=admin_keyboard()); return
+        context.user_data["qb_merge_target"] = target
+        async with pool.connection() as conn:
+            cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE subject=%s", (source,)); n=int((await cur.fetchone())["n"])
+        await q.edit_message_text(f"⚠️ Confirm merge\n\nFrom: {source}\nInto: {target}\nQuestions to reassign: {n}\n\nThe old subject record will be deleted after its references are reassigned. This cannot be undone; make sure the target is correct.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Merge and delete old subject", callback_data="qb:mergeconfirm")],[InlineKeyboardButton("Cancel", callback_data="qb:subjects")]])); return
+    if data == "qb:mergeconfirm":
+        source = context.user_data.get("qb_merge_source"); target = context.user_data.get("qb_merge_target")
+        if not source or not target or source == target:
+            await q.edit_message_text("Merge selection expired. Start again.", reply_markup=admin_keyboard()); return
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                cur = await conn.execute("SELECT 1 FROM question_bank_subjects WHERE name=%s", (target,)); target_exists = await cur.fetchone()
+                cur = await conn.execute("SELECT 1 FROM question_bank_subjects WHERE name=%s", (source,)); source_exists = await cur.fetchone()
+                if not target_exists or not source_exists:
+                    raise ValueError("Source or target subject no longer exists.")
+                cur = await conn.execute("UPDATE question_bank SET subject=%s,updated_at=NOW() WHERE subject=%s RETURNING id", (target, source)); moved = len(await cur.fetchall())
+                await conn.execute("UPDATE bank_quizzes SET subject=%s WHERE subject=%s", (target, source))
+                await conn.execute("UPDATE bank_quiz_attempt_question_snapshots SET subject=%s WHERE subject=%s", (target, source))
+                await conn.execute("UPDATE question_import_batches SET selected_subject=%s WHERE selected_subject=%s", (target, source))
+                # Optional test-series table exists in current deployments; guard it for older schemas.
+                cur = await conn.execute("SELECT to_regclass('public.bpsc_nexus_test_series') AS t")
+                if (await cur.fetchone())["t"]:
+                    await conn.execute("UPDATE bpsc_nexus_test_series SET subject=%s WHERE subject=%s", (target, source))
+                await conn.execute("DELETE FROM question_bank_subjects WHERE name=%s", (source,))
+                cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY LOWER(name), name")
+                SUBJECTS[:] = [r["name"] for r in await cur.fetchall()]
+        context.user_data.pop("qb_merge_source",None); context.user_data.pop("qb_merge_target",None)
+        await q.edit_message_text(f"✅ Merge complete\n\nOld subject deleted: {source}\nCanonical subject: {target}\nQuestions reassigned: {moved}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage more subjects", callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu", callback_data="qb:home")]])); return
+    if data == "qb:deleteempty":
+        async with pool.connection() as conn:
+            cur = await conn.execute("""SELECT s.name FROM question_bank_subjects s LEFT JOIN question_bank q ON q.subject=s.name
+                GROUP BY s.name HAVING COUNT(q.id)=0 ORDER BY s.name""")
+            empty = [r["name"] for r in await cur.fetchall()]
+            if empty:
+                await conn.execute("DELETE FROM question_bank_subjects WHERE name = ANY(%s)", (empty,))
+                cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY LOWER(name),name")
+                SUBJECTS[:] = [r["name"] for r in await cur.fetchall()]
+        await q.edit_message_text(f"✅ Removed {len(empty)} empty subject record(s). No questions were deleted.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage subjects", callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu", callback_data="qb:home")]])); return
     if data == "qb:home":
         context.user_data.pop("qb_flow",None)
         if pool is not None:
@@ -944,8 +1084,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
             cur=await conn.execute("UPDATE bank_quizzes SET is_published=NOT is_published,published_at=CASE WHEN is_published THEN NULL ELSE NOW() END WHERE id=%s RETURNING is_published,title",(quiz_id,)); r=await cur.fetchone()
         await q.edit_message_text(f"Quiz {'published' if r and r['is_published'] else 'unpublished' if r else 'not found'}.\n\n{r['title'] if r else ''}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage this quiz",callback_data=f"qb:manageview:{quiz_id}")],[InlineKeyboardButton("Quiz list",callback_data="qb:manage")]])); return
     if data == "qb:import":
+        if not SUBJECTS:
+            await q.edit_message_text("Create at least one subject before importing questions. Imports can only target subjects you create.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Create Subject", callback_data="qb:newsubject")],[InlineKeyboardButton("Back", callback_data="qb:home")]])); return
         context.user_data["qb_flow"]={"step":"import_subject"}
-        await q.edit_message_text("Choose the default subject for the next file. Questions with an explicit subject field keep their own subject.",reply_markup=subject_keyboard("qb:importsubject")); return
+        await q.edit_message_text(f"Choose the destination subject · {len(SUBJECTS)} subjects\nEmbedded labels map only to subjects you created; all other labels use this selected subject.",reply_markup=subject_keyboard("qb:importsubject")); return
     if data.startswith("qb:importsubject:"):
         idx=int(data.rsplit(":",1)[1]); context.user_data["qb_flow"]={"step":"await_file","subject":SUBJECTS[idx]}
         await q.edit_message_text(f"Default subject: {SUBJECTS[idx]}\nNow send one .html, .json or .csv file in this private chat. The bot will preview import counts before saving.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
@@ -1128,6 +1270,9 @@ async def receive_poll(update: Update, context: ContextTypes.DEFAULT_TYPE, is_au
     message=update.effective_message; user=update.effective_user
     if not message or not user or not is_authorized or message.chat.type!=ChatType.PRIVATE or not message.poll:
         return False
+    if not SUBJECTS:
+        await message.reply_text("Create a subject first in Admin Panel → Question Bank → Create Subject. Poll imports cannot create subjects automatically.", reply_markup=admin_keyboard())
+        return True
     poll=message.poll
     opts={LETTERS[i]: option.text for i,option in enumerate(poll.options[:5]) if _norm(option.text)}
     correct=LETTERS[poll.correct_option_id] if poll.type=="quiz" and poll.correct_option_id is not None and poll.correct_option_id<len(LETTERS) else None
@@ -1158,7 +1303,9 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE, pool,
         await message.reply_text("File exceeds the 20 MB import limit."); return True
     try:
         tgfile=await context.bot.get_file(doc.file_id); raw=bytes(await tgfile.download_as_bytearray())
-        default_subject=flow.get("subject",SUBJECTS[-1])
+        default_subject=flow.get("subject") or (SUBJECTS[-1] if SUBJECTS else "")
+        if not default_subject:
+            await message.reply_text("Create/select a subject before importing questions.", reply_markup=admin_keyboard()); return True
         records, summary=parse_file(filename,raw,default_subject,user.id)
         invalid=int(re.search(r"invalid=(\d+)",summary).group(1))
         if not records:
@@ -1173,8 +1320,20 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE, pool,
             if h in seen: within_duplicates+=1
             seen.add(h)
         expected_duplicates=len(existing)+within_duplicates
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT name FROM question_bank_subjects ORDER BY name")
+            allowed={str(r["name"]).strip().casefold():str(r["name"]).strip() for r in await cur.fetchall()}
+        source_counts={}
+        for record in records:
+            source=str(record.get("subject") or "").strip()
+            target=allowed.get(source.casefold(),default_subject)
+            key=(source or "No embedded subject",target)
+            source_counts[key]=source_counts.get(key,0)+1
+        mapping_lines=[f"• {src} → {target}: {count}" for (src,target),count in sorted(source_counts.items(),key=lambda item:(item[0][1].casefold(),item[0][0].casefold()))[:15]]
+        if len(source_counts)>15: mapping_lines.append(f"• … and {len(source_counts)-15} more source labels")
+        mapping_text="\n".join(mapping_lines) if mapping_lines else f"• All questions → {default_subject}"
         context.user_data["qb_import_preview"]={"filename":filename,"records":records,"subject":default_subject,"invalid":invalid,"expected_duplicates":expected_duplicates}
-        await message.reply_text(f"📋 Import preview\n\nFile: {filename}\nDetected: {len(records)+invalid}\nRecognized: {len(records)}\nReady for scored quizzes: {ready}\nPending answer/options verification: {pending}\nPotential duplicates: {expected_duplicates}\nInvalid rows skipped: {invalid}\n\nNo questions have been saved yet. Confirm to import, or cancel.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm Import",callback_data="qb:confirmimport"),InlineKeyboardButton("✖ Cancel",callback_data="qb:cancelimport")]]))
+        await message.reply_text(f"📋 Import preview\n\nFile: {filename}\nDestination selected: {default_subject}\n\nSubject mapping (only your created subjects are accepted):\n{mapping_text}\n\nDetected: {len(records)+invalid}\nRecognized: {len(records)}\nReady for scored quizzes: {ready}\nPending answer/options verification: {pending}\nPotential duplicates: {expected_duplicates}\nInvalid rows skipped: {invalid}\n\nNo questions have been saved yet. Confirm to import, or cancel.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm Import",callback_data="qb:confirmimport"),InlineKeyboardButton("✖ Cancel",callback_data="qb:cancelimport")]]))
     except Exception as e:
         log.exception("Question import preview failed")
         await message.reply_text(f"Could not parse this file: {str(e)[:500]}")
@@ -1189,12 +1348,6 @@ async def confirm_import(q,context,pool,owner_id):
         # Count invalid parser rows from preview. It is retained separately from recognized records.
         invalid=int(preview.get("invalid",0))
         result=await import_records(pool,records,owner_id,preview["filename"],preview["filename"].rsplit(".",1)[-1].lower(),preview["subject"],invalid)
-        # Register all source-defined subjects so admins can immediately build new test series from them.
-        imported_subjects = sorted({str(item.get("subject") or preview["subject"]).strip() for item in records if str(item.get("subject") or preview["subject"]).strip()})
-        async with pool.connection() as conn:
-            for subject_name in imported_subjects:
-                await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id) VALUES(%s,%s) ON CONFLICT(name) DO NOTHING", (subject_name, owner_id))
-                if subject_name not in SUBJECTS: SUBJECTS.append(subject_name)
         context.user_data.pop("qb_import_preview",None); context.user_data.pop("qb_flow",None)
         await q.edit_message_text("✅ Import complete\n\n"+f"Batch: #{result['batch_id']}\nDetected: {result['detected']}\nAdded: {result['imported']}\nDuplicates skipped: {result['duplicates']}\nInvalid rows: {result['invalid']}\nPending verification: {result['pending']}\n\nQuestions are stored permanently. Pending questions are excluded from scored quizzes.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Verify pending answers",callback_data="qb:pending")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]]))
     except Exception as e:
@@ -1213,8 +1366,14 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await msg.reply_text("Subject name must contain at least 2 characters. Send the name again."); return True
         try:
             async with pool.connection() as conn:
-                await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id) VALUES(%s,%s) ON CONFLICT(name) DO NOTHING", (name,user.id))
-            if name not in SUBJECTS: SUBJECTS.append(name)
+                cur = await conn.execute("SELECT name FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) LIMIT 1", (name,))
+                existing = await cur.fetchone()
+                if existing:
+                    await msg.reply_text(f"A subject with the same name already exists: {existing['name']}\n\nChoose that subject or use Manage / Merge Subjects to clean duplicates.", reply_markup=admin_keyboard())
+                    return True
+                await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id) VALUES(%s,%s)", (name,user.id))
+                cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY LOWER(name), name")
+                SUBJECTS[:] = [r["name"] for r in await cur.fetchall()]
             context.user_data.pop("qb_flow",None)
             await msg.reply_text(f"✅ Subject saved: {name}\n\nIt is now available for question imports and new test series.",reply_markup=admin_keyboard())
         except Exception as exc:
@@ -1225,7 +1384,9 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
         record=parse_forwarded_text(msg.text,user.id)
         if not record:
             await msg.reply_text("I couldn't parse that MCQ. Please include a question, options A–D, and an Answer: B line. No changes were made."); return True
-        record["subject"]=flow.get("subject",SUBJECTS[-1])
+        record["subject"]=flow.get("subject") or (SUBJECTS[-1] if SUBJECTS else "")
+        if not record["subject"]:
+            await msg.reply_text("Create a subject before saving questions.", reply_markup=admin_keyboard()); return True
         context.user_data["qb_forward_preview"]=record
         context.user_data.pop("qb_flow",None)
         await msg.reply_text("📝 Question preview — not saved yet\n\n"+format_question(record)+f"\\nSubject: {record['subject']}\\n\\nSave this question?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Save question",callback_data="qb:saveforward")],[InlineKeyboardButton("✖ Discard",callback_data="qb:cancelforward")]])); return True
@@ -1354,7 +1515,7 @@ def parse_forwarded_text(text: str, owner_id: int) -> dict | None:
         if m: rec["correct_answer"]=m.group(1)
         m=re.match(r"^(?:explanation|solution)\s*[:\-]\s*(.+)$",line,re.I)
         if m: rec["explanation"]=m.group(1)
-    return _normalize_record(rec,SUBJECTS[-1],"Forwarded Telegram message",owner_id) if len(rec["options"])>=2 else None
+    return _normalize_record(rec,SUBJECTS[-1],"Forwarded Telegram message",owner_id) if SUBJECTS and len(rec["options"])>=2 else None
 
 
 def format_question(r):

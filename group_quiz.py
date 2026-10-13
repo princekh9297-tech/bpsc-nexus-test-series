@@ -93,6 +93,8 @@ DDL = [
         revoked_at TIMESTAMPTZ
     )""",
     "ALTER TABLE group_quiz_memberships ADD COLUMN IF NOT EXISTS brand_name TEXT",
+    "ALTER TABLE group_quiz_memberships ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
+    "ALTER TABLE group_quiz_memberships ADD COLUMN IF NOT EXISTS plan_code TEXT NOT NULL DEFAULT 'manual'",
     "CREATE INDEX IF NOT EXISTS idx_group_quiz_memberships_active ON group_quiz_memberships(is_active,chat_id)",
     """CREATE TABLE IF NOT EXISTS group_quiz_admin_reports (
         session_id BIGINT NOT NULL REFERENCES group_quiz_sessions(id) ON DELETE CASCADE,
@@ -114,7 +116,7 @@ async def _group_is_authorized(pool, chat_id: int) -> bool:
     """Only explicitly granted groups may use BPSC Nexus group quiz features."""
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "SELECT 1 FROM group_quiz_memberships WHERE chat_id=%s AND is_active=TRUE",
+            "SELECT 1 FROM group_quiz_memberships WHERE chat_id=%s AND is_active=TRUE AND (expires_at IS NULL OR expires_at>NOW())",
             (int(chat_id),),
         )
         return await cur.fetchone() is not None
@@ -534,10 +536,14 @@ async def _create_range_quiz(pool, pending, user, startpos: int, endpos: int):
                 WHERE qq.quiz_id=%s ORDER BY qq.position OFFSET %s LIMIT %s""",
                 (int(pending["quiz_id"]),startpos-1,count))
         elif pending.get("subject"):
-            cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' AND subject=%s ORDER BY id OFFSET %s LIMIT %s",
-                (pending["subject"],startpos-1,count))
+            if pending.get("topic"):
+                cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' AND subject=%s AND topic=%s ORDER BY id OFFSET %s LIMIT %s",
+                    (pending["subject"],pending["topic"],startpos-1,count))
+            else:
+                cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' AND subject=%s ORDER BY id OFFSET %s LIMIT %s",
+                    (pending["subject"],startpos-1,count))
         else:
-            cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' ORDER BY id OFFSET %s LIMIT %s",
+            cur=await conn.execute("SELECT q.id FROM question_bank q JOIN question_bank_subjects s ON s.name=q.subject WHERE q.status='ready' ORDER BY q.id OFFSET %s LIMIT %s",
                 (startpos-1,count))
         ids=[int(r["id"]) for r in await cur.fetchall()]
         if len(ids)!=count:
@@ -560,6 +566,17 @@ async def _create_range_quiz(pool, pending, user, startpos: int, endpos: int):
             "range_start":startpos,"range_end":endpos,"range_label":f"{startpos}–{endpos}"}
 
 
+async def _show_group_quiz_ranges(q, eligible: int, label: str):
+    buttons=[]
+    for startpos in range(1, eligible+1, 50):
+        endpos=min(startpos+49,eligible)
+        buttons.append([InlineKeyboardButton(f"Questions {startpos}–{endpos} ({endpos-startpos+1})",callback_data=f"gq:range:{startpos}:{endpos}")])
+    buttons.append([InlineKeyboardButton("✍️ Custom range…",callback_data="gq:range_custom")])
+    buttons.append([InlineKeyboardButton("Cancel",callback_data="gq:cancel")])
+    await q.answer(); await q.edit_message_text(f"Question pool: {label}\nEligible questions: {eligible}\n\nChoose exactly which questions to use. Each button selects a fixed 50-question block (last block may be shorter). You can also enter a custom range. No questions will start until you confirm the range.",reply_markup=InlineKeyboardMarkup(buttons))
+    return True
+
+
 async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, pool) -> bool:
     q = update.callback_query
     if not q or not (q.data or "").startswith("gq:"):
@@ -578,32 +595,86 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
     data = q.data
     if data == "gq:bank":
         async with pool.connection() as conn:
-            cur=await conn.execute("SELECT subject,COUNT(*) AS n FROM question_bank WHERE status='ready' GROUP BY subject ORDER BY subject")
+            cur=await conn.execute("""SELECT s.name AS subject,COUNT(q.id) AS n FROM question_bank_subjects s
+                JOIN question_bank q ON q.subject=s.name AND q.status='ready'
+                GROUP BY s.name ORDER BY LOWER(s.name),s.name""")
             rows=await cur.fetchall()
         if not rows:
-            await q.answer("No verified questions in the bank yet.",show_alert=True); return True
+            await q.answer("No verified questions exist under an admin-created subject yet.",show_alert=True); return True
         subjects=[{"name":r["subject"],"n":int(r["n"])} for r in rows]
         context.user_data["gq_subject_options"]=subjects
+        context.user_data["gq_subject_page"]=0
         buttons=[[InlineKeyboardButton(f"🌐 Mixed subjects ({sum(x['n'] for x in subjects)})",callback_data="gq:bank_subject:all")]]
-        buttons += [[InlineKeyboardButton(f"{x['name'][:36]} ({x['n']})",callback_data=f"gq:bank_subject:{i}")] for i,x in enumerate(subjects)]
+        buttons += [[InlineKeyboardButton(f"{x['name'][:36]} ({x['n']})",callback_data=f"gq:bank_subject:{i}")] for i,x in enumerate(subjects[:20])]
+        if len(subjects)>20: buttons.append([InlineKeyboardButton("Next subjects →",callback_data="gq:bankpage:1")])
         buttons.append([InlineKeyboardButton("Cancel",callback_data="gq:cancel")])
-        await q.answer(); await q.edit_message_text("Choose the question pool for this group quiz:",reply_markup=InlineKeyboardMarkup(buttons)); return True
+        await q.answer(); await q.edit_message_text("Choose a subject. Selecting a subject will show only that subject's topics:",reply_markup=InlineKeyboardMarkup(buttons)); return True
+    if data.startswith("gq:bankpage:"):
+        try: page=max(0,int(data.rsplit(":",1)[1])); subjects=context.user_data.get("gq_subject_options",[])
+        except ValueError: page=0; subjects=[]
+        start=page*20; buttons=[[InlineKeyboardButton(f"{x['name'][:36]} ({x['n']})",callback_data=f"gq:bank_subject:{i}")] for i,x in enumerate(subjects[start:start+20],start)]
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton("← Previous",callback_data=f"gq:bankpage:{page-1}"))
+        if start+20<len(subjects): nav.append(InlineKeyboardButton("Next →",callback_data=f"gq:bankpage:{page+1}"))
+        if nav: buttons.append(nav)
+        buttons.append([InlineKeyboardButton("Cancel",callback_data="gq:cancel")])
+        await q.answer(); await q.edit_message_text(f"Choose a subject · Page {page+1}",reply_markup=InlineKeyboardMarkup(buttons)); return True
     if data.startswith("gq:bank_subject:"):
         value=data.rsplit(":",1)[1]
         subjects=context.user_data.get("gq_subject_options",[])
-        if value=="all": subject=None; label="Mixed Subjects"
-        else:
-            try: selected=subjects[int(value)]; subject=selected["name"]; label=subject
-            except (ValueError,IndexError): await q.answer("Subject selection expired. Run /groupquiz again.",show_alert=True); return True
-        eligible=sum(x["n"] for x in subjects) if subject is None else next((x["n"] for x in subjects if x["name"]==subject),0)
-        context.user_data["group_quiz_pending"]={"source_type":"bank","subject":subject,"subject_label":label,"chat_id":chat.id,"chat_title":chat.title or "Telegram group","stage":"choose_range","eligible":eligible}
-        buttons=[]
-        for startpos in range(1, eligible+1, 50):
-            endpos=min(startpos+49,eligible)
-            buttons.append([InlineKeyboardButton(f"Questions {startpos}–{endpos} ({endpos-startpos+1})",callback_data=f"gq:range:{startpos}:{endpos}")])
-        buttons.append([InlineKeyboardButton("✍️ Custom range…",callback_data="gq:range_custom")])
+        if value=="all":
+            label="Mixed Subjects"
+            async with pool.connection() as conn:
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank q JOIN question_bank_subjects s ON s.name=q.subject WHERE q.status='ready'")
+                eligible=int((await cur.fetchone())["n"])
+            context.user_data["group_quiz_pending"]={"source_type":"bank","subject":None,"topic":None,"subject_label":label,"chat_id":chat.id,"chat_title":chat.title or "Telegram group","stage":"choose_range","eligible":eligible}
+            return await _show_group_quiz_ranges(q, eligible, label)
+        try: selected=subjects[int(value)]; subject=selected["name"]; label=subject
+        except (ValueError,IndexError): await q.answer("Subject selection expired. Run /groupquiz again.",show_alert=True); return True
+        async with pool.connection() as conn:
+            cur=await conn.execute("""SELECT topic,COUNT(*) AS n FROM question_bank WHERE status='ready' AND subject=%s
+                AND NULLIF(BTRIM(topic),'') IS NOT NULL GROUP BY topic ORDER BY LOWER(topic),topic""",(subject,))
+            topic_rows=await cur.fetchall()
+        topics=[{"name":r["topic"],"n":int(r["n"])} for r in topic_rows]
+        context.user_data["gq_topic_options"]=topics
+        context.user_data["gq_selected_subject"]=subject
+        context.user_data["gq_topic_page"]=0
+        buttons=[[InlineKeyboardButton(f"All topics ({selected['n']})",callback_data="gq:bank_topic:all")]]
+        buttons += [[InlineKeyboardButton(f"{x['name'][:36]} ({x['n']})",callback_data=f"gq:bank_topic:{i}")] for i,x in enumerate(topics[:20])]
+        if len(topics)>20: buttons.append([InlineKeyboardButton("Next topics →",callback_data="gq:topicpage:1")])
+        buttons.append([InlineKeyboardButton("⬅ Subjects",callback_data="gq:bank")])
         buttons.append([InlineKeyboardButton("Cancel",callback_data="gq:cancel")])
-        await q.answer(); await q.edit_message_text(f"Question pool: {label}\nEligible questions: {eligible}\n\nChoose exactly which questions to use. Each button selects a fixed 50-question block (last block may be shorter). You can also enter a custom range. No questions will start until you confirm the range.",reply_markup=InlineKeyboardMarkup(buttons)); return True
+        await q.answer(); await q.edit_message_text(f"Subject: {label}\n\nChoose a topic. Only topics belonging to {label} are listed:",reply_markup=InlineKeyboardMarkup(buttons)); return True
+    if data.startswith("gq:topicpage:"):
+        try: page=max(0,int(data.rsplit(":",1)[1])); topics=context.user_data.get("gq_topic_options",[]); subject=context.user_data.get("gq_selected_subject")
+        except ValueError: page=0; topics=[]; subject=None
+        start=page*20; buttons=[[InlineKeyboardButton(f"{x['name'][:36]} ({x['n']})",callback_data=f"gq:bank_topic:{i}")] for i,x in enumerate(topics[start:start+20],start)]
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton("← Previous",callback_data=f"gq:topicpage:{page-1}"))
+        if start+20<len(topics): nav.append(InlineKeyboardButton("Next →",callback_data=f"gq:topicpage:{page+1}"))
+        if nav: buttons.append(nav)
+        buttons.append([InlineKeyboardButton("⬅ Subjects",callback_data="gq:bank")])
+        buttons.append([InlineKeyboardButton("Cancel",callback_data="gq:cancel")])
+        await q.answer(); await q.edit_message_text(f"Subject: {subject} · Topics page {page+1}",reply_markup=InlineKeyboardMarkup(buttons)); return True
+    if data.startswith("gq:bank_topic:"):
+        value=data.rsplit(":",1)[1]
+        subject=context.user_data.get("gq_selected_subject")
+        if not subject:
+            await q.answer("Subject selection expired. Start again.",show_alert=True); return True
+        topic=None
+        if value!="all":
+            topics=context.user_data.get("gq_topic_options",[])
+            try: topic=topics[int(value)]["name"]
+            except (ValueError,IndexError): await q.answer("Topic selection expired. Start again.",show_alert=True); return True
+        async with pool.connection() as conn:
+            if topic:
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status='ready' AND subject=%s AND topic=%s",(subject,topic))
+            else:
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status='ready' AND subject=%s",(subject,))
+            eligible=int((await cur.fetchone())["n"])
+        label=subject + (f" · {topic}" if topic else " · All topics")
+        context.user_data["group_quiz_pending"]={"source_type":"bank","subject":subject,"topic":topic,"subject_label":label,"chat_id":chat.id,"chat_title":chat.title or "Telegram group","stage":"choose_range","eligible":eligible}
+        return await _show_group_quiz_ranges(q, eligible, label)
     if data == "gq:range_custom":
         pending=context.user_data.get("group_quiz_pending")
         if not pending or pending.get("chat_id")!=chat.id:
