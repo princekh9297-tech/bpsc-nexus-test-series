@@ -875,28 +875,37 @@ async def quiz_builder_meta(request):
     pool = request.app["pool"]
     selected_subject = str(request.query.get("subject", "")).strip()
     async with pool.connection() as conn:
-        cur = await conn.execute("""SELECT s.name, s.created_at, COUNT(q.id) FILTER (WHERE q.status='ready') AS n
+        cur = await conn.execute("""SELECT s.name, s.created_at, s.subject_type,
+                COUNT(q.id) FILTER (WHERE q.status='ready') AS n,
+                COUNT(DISTINCT NULLIF(BTRIM(q.topic),'')) FILTER (WHERE q.status='ready') AS topic_count
             FROM question_bank_subjects s LEFT JOIN question_bank q ON q.subject=s.name
-            GROUP BY s.id,s.name,s.created_at ORDER BY LOWER(s.name),s.name""")
-        subjects = [{"name": r["name"], "count": int(r["n"]),
-                     "created_at": r["created_at"].isoformat() if r["created_at"] else None}
-                    for r in await cur.fetchall()]
+            WHERE s.archived_at IS NULL
+            GROUP BY s.id,s.name,s.created_at,s.subject_type ORDER BY LOWER(s.name),s.name""")
+        all_rows = await cur.fetchall()
+        def item(r):
+            return {"name": r["name"], "count": int(r["n"] or 0),
+                    "topic_count": int(r["topic_count"] or 0),
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None}
+        subjects = [item(r) for r in all_rows if (r["subject_type"] or "subject") != "collection"]
+        collections = [item(r) for r in all_rows if (r["subject_type"] or "subject") == "collection"]
         if selected_subject and selected_subject != "All subjects":
-            cur = await conn.execute("""SELECT DISTINCT topic FROM question_bank q
+            cur = await conn.execute("""SELECT DISTINCT q.topic FROM question_bank q
                 JOIN question_bank_subjects s ON s.name=q.subject
-                WHERE q.status='ready' AND q.subject=%s AND NULLIF(BTRIM(q.topic),'') IS NOT NULL
-                ORDER BY topic LIMIT 500""", (selected_subject,))
+                WHERE s.archived_at IS NULL AND q.status='ready' AND q.subject=%s
+                  AND NULLIF(BTRIM(q.topic),'') IS NOT NULL
+                ORDER BY q.topic LIMIT 1000""", (selected_subject,))
         else:
             cur = await conn.execute("""SELECT DISTINCT q.topic FROM question_bank q
                 JOIN question_bank_subjects s ON s.name=q.subject
-                WHERE q.status='ready' AND NULLIF(BTRIM(q.topic),'') IS NOT NULL
-                ORDER BY q.topic LIMIT 500""")
+                WHERE s.archived_at IS NULL AND q.status='ready' AND NULLIF(BTRIM(q.topic),'') IS NOT NULL
+                ORDER BY q.topic LIMIT 1000""")
         topics = [r["topic"] for r in await cur.fetchall()]
         cur = await conn.execute("""SELECT COUNT(*) AS n FROM question_bank q
-            JOIN question_bank_subjects s ON s.name=q.subject WHERE q.status='ready'""")
+            JOIN question_bank_subjects s ON s.name=q.subject
+            WHERE s.archived_at IS NULL AND q.status='ready'""")
         total = int((await cur.fetchone())["n"])
-    return json_response({"subjects": subjects, "topics": topics, "total_ready": total,
-        "selection_modes": ["random", "sequential", "unseen", "incorrect"]})
+    return json_response({"subjects": subjects, "collections": collections, "topics": topics,
+        "total_ready": total, "selection_modes": ["random", "sequential", "unseen", "incorrect"]})
 
 
 async def quiz_builder_count(request):
@@ -904,10 +913,10 @@ async def quiz_builder_count(request):
     subject = str(request.query.get("subject", "All subjects")).strip()
     topic = str(request.query.get("topic", "")).strip()
     selection = str(request.query.get("selection", "random"))
-    conditions = ["qb.status='ready'", "EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject)"]
+    conditions = ["qb.status='ready'", "EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.archived_at IS NULL)"]
     params = []
     if subject and subject != "All subjects":
-        conditions.append("EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.name=%s)"); params.append(subject)
+        conditions.append("EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.archived_at IS NULL AND s.name=%s)"); params.append(subject)
     if topic:
         conditions.append("qb.topic=%s"); params.append(topic)
     if selection == "unseen":
@@ -948,10 +957,10 @@ async def create_custom_quiz(request):
     except Exception:
         return json_response({"error": "Invalid quiz builder settings."}, 400)
 
-    conditions = ["qb.status='ready'", "EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject)"]
+    conditions = ["qb.status='ready'", "EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.archived_at IS NULL)"]
     params = []
     if subject != "All subjects":
-        conditions.append("EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.name=%s)"); params.append(subject)
+        conditions.append("EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.archived_at IS NULL AND s.name=%s)"); params.append(subject)
     if topic:
         conditions.append("qb.topic=%s"); params.append(topic)
     if selection == "unseen":

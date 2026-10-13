@@ -34,8 +34,13 @@ DDL = [
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
         created_by_telegram_id BIGINT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        subject_type TEXT NOT NULL DEFAULT 'subject',
+        archived_at TIMESTAMPTZ
     )""",
+    "ALTER TABLE question_bank_subjects ADD COLUMN IF NOT EXISTS subject_type TEXT NOT NULL DEFAULT 'subject'",
+    "ALTER TABLE question_bank_subjects ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ",
+    "CREATE INDEX IF NOT EXISTS idx_question_bank_subjects_type_active ON question_bank_subjects(subject_type, archived_at, created_at DESC)",
     """CREATE TABLE IF NOT EXISTS question_import_batches (
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         owner_telegram_id BIGINT NOT NULL,
@@ -692,12 +697,12 @@ async def ensure_schema(pool):
             AND (s.question_type IS DISTINCT FROM qb.question_type OR s.question_structure IS DISTINCT FROM qb.question_structure OR s.question_flags IS DISTINCT FROM qb.question_flags)""")
         # The database table is the single source of truth. Never infer/create subjects
         # from imported question labels or topic names.
-        cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY LOWER(name), name")
+        cur = await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name), name")
         SUBJECTS[:] = [row["name"] for row in await cur.fetchall()]
         # Safe automatic merge for exact names differing only by casing/whitespace.
         # Semantically different names are left for the explicit admin merge workflow.
         async with conn.transaction():
-            cur = await conn.execute("""SELECT LOWER(BTRIM(name)) AS norm, ARRAY_AGG(name ORDER BY LENGTH(name), name) AS names
+            cur = await conn.execute("""SELECT LOWER(BTRIM(name)) AS norm, ARRAY_AGG(name ORDER BY (archived_at IS NOT NULL), LENGTH(name), name) AS names
                 FROM question_bank_subjects GROUP BY LOWER(BTRIM(name)) HAVING COUNT(*) > 1""")
             dup_groups = await cur.fetchall()
             for group in dup_groups:
@@ -714,7 +719,7 @@ async def ensure_schema(pool):
                         await conn.execute("UPDATE bpsc_nexus_test_series SET subject=%s WHERE subject=%s", (canonical, old_name))
                     await conn.execute("DELETE FROM question_bank_subjects WHERE name=%s", (old_name,))
             if dup_groups:
-                cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY LOWER(name), name")
+                cur = await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name), name")
                 SUBJECTS[:] = [row["name"] for row in await cur.fetchall()]
             # Enforce case/whitespace-insensitive uniqueness after the safe merge pass.
             await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_question_bank_subjects_normalized_name ON question_bank_subjects (LOWER(BTRIM(name)))")
@@ -726,18 +731,29 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
     if pool is None: raise RuntimeError("Database is unavailable.")
     async with pool.connection() as conn:
         async with conn.transaction():
-            cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY name")
-            allowed = {str(r["name"]).strip().casefold(): str(r["name"]).strip() for r in await cur.fetchall()}
+            cur = await conn.execute("SELECT name, subject_type FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY name")
+            allowed_rows = await cur.fetchall()
+            allowed = {str(r["name"]).strip().casefold(): str(r["name"]).strip() for r in allowed_rows}
+            types = {str(r["name"]).strip().casefold(): str(r["subject_type"] or "subject") for r in allowed_rows}
             selected = allowed.get(str(subject or "").strip().casefold())
             if not selected:
-                raise ValueError("The selected subject no longer exists. Create/select an admin subject and retry import.")
+                raise ValueError("The selected subject/collection no longer exists. Create/select an admin subject or collection and retry import.")
+            selected_type = types.get(selected.casefold(), "subject")
             cur=await conn.execute("INSERT INTO question_import_batches(owner_telegram_id,file_name,file_type,selected_subject,total_detected,invalid_count) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id", (owner_id,filename,file_type,selected,len(records)+invalid_count,invalid_count))
             batch_id=(await cur.fetchone())["id"]
             imported=duplicates=0
             for item in records:
-                # Honour embedded subject labels only if they match an explicitly created subject.
-                # Unknown labels never create a subject; they fall back to the selected subject.
-                mapped_subject = allowed.get(str(item.get("subject") or "").strip().casefold(), selected)
+                # Imports never create taxonomy records. Unknown embedded labels map to the selected
+                # destination. For a collection, preserve labels such as "Set 001" as child topics.
+                embedded_label = str(item.get("subject") or "").strip()
+                if selected_type == "collection":
+                    # A collection is a hard parent boundary: embedded labels never split its rows
+                    # into unrelated subjects. They become set/topic labels instead.
+                    mapped_subject = selected
+                    if embedded_label and embedded_label.casefold() != selected.casefold() and not str(item.get("topic") or "").strip():
+                        item["topic"] = embedded_label
+                else:
+                    mapped_subject = allowed.get(embedded_label.casefold(), selected)
                 item["subject"] = mapped_subject
                 cur=await conn.execute("""INSERT INTO question_bank(question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status,question_hash,import_batch_id,created_by_telegram_id)
                     VALUES(%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -752,7 +768,8 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
 def admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add One Question", callback_data="qb:addone"), InlineKeyboardButton("📥 Bulk Import File", callback_data="qb:import")],
-        [InlineKeyboardButton("➕ Create Subject", callback_data="qb:newsubject"), InlineKeyboardButton("🗂 Manage / Merge Subjects", callback_data="qb:subjects")],
+        [InlineKeyboardButton("➕ Create Subject", callback_data="qb:newsubject"), InlineKeyboardButton("📚 Create Collection", callback_data="qb:newcollection")],
+        [InlineKeyboardButton("🗂 Manage / Merge Subjects", callback_data="qb:subjects")],
         [InlineKeyboardButton("🧪 Create Test Series", callback_data="qb:build")],
         [InlineKeyboardButton("🗃 Browse / Edit", callback_data="qb:browse"), InlineKeyboardButton("🗑 Delete Questions", callback_data="qb:deletehub")],
         [InlineKeyboardButton("🧹 Bulk Delete by IDs", callback_data="qb:bulkdelete"), InlineKeyboardButton("📦 Import History / Undo", callback_data="qb:history")],
@@ -797,13 +814,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
             _,_,prefix,page_raw=data.split(":",3); page=max(0,int(page_raw))
         except ValueError:
             await q.edit_message_text("Subject page expired. Start again.",reply_markup=admin_keyboard()); return
-        prefix_map={"addsubject":"Choose a subject for the question:","importsubject":"Choose the destination subject for this import:","quizsubject":"Choose a subject for the quiz:"}
+        prefix_map={"addsubject":"Choose a subject for the question:","importsubject":"Choose the destination subject for this import:","quizsubject":"Choose a subject for the quiz:","topicparent":"Choose the parent subject/collection whose topics you want to manage:","mergebulktarget":"Choose the canonical destination for the bulk merge:"}
         if prefix not in prefix_map:
             await q.edit_message_text("Unknown subject selector.",reply_markup=admin_keyboard()); return
         await q.edit_message_text(prefix_map[prefix]+f"\nPage {page+1} · {len(SUBJECTS)} subjects",reply_markup=subject_keyboard("qb:"+prefix,page)); return
-    if data == "qb:newsubject":
-        context.user_data["qb_flow"]={"step":"create_subject"}
-        await q.edit_message_text("➕ Create a new subject\n\nSend the exact subject name. It will be saved to the database and appear in future import and test-series selectors.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
+    if data in ("qb:newsubject", "qb:newcollection"):
+        create_type = "collection" if data == "qb:newcollection" else "subject"
+        context.user_data["qb_flow"]={"step":"create_collection" if create_type == "collection" else "create_subject", "subject_type": create_type}
+        heading = "Question Collection" if create_type == "collection" else "Subject"
+        await q.edit_message_text(f"➕ Create {heading}\n\nSend the exact {heading.lower()} name. Imports will be grouped under this single name; embedded set labels become topics inside a collection and will never create new subjects automatically.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
     if data == "qb:addone":
         if not SUBJECTS:
             await q.edit_message_text("Create a subject first, then add questions to it.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Create Subject", callback_data="qb:newsubject")],[InlineKeyboardButton("Back", callback_data="qb:home")]])); return
@@ -905,22 +924,133 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
         try: page = max(0, int(data.rsplit(":",1)[1])) if data.startswith("qb:subjectspage:") else 0
         except ValueError: page = 0
         async with pool.connection() as conn:
-            cur = await conn.execute("""SELECT s.name, COUNT(q.id) AS n FROM question_bank_subjects s
-                LEFT JOIN question_bank q ON q.subject=s.name GROUP BY s.name ORDER BY LOWER(s.name),s.name""")
+            cur = await conn.execute("""SELECT s.name, s.subject_type, COUNT(q.id) FILTER (WHERE q.status<>'archived') AS n
+                FROM question_bank_subjects s LEFT JOIN question_bank q ON q.subject=s.name
+                WHERE s.archived_at IS NULL GROUP BY s.name,s.subject_type ORDER BY LOWER(s.name),s.name""")
             rows = await cur.fetchall()
         SUBJECTS[:] = [r["name"] for r in rows]
         if not rows:
             await q.edit_message_text("No admin-created subjects yet. Use Create Subject first.", reply_markup=admin_keyboard()); return
         context.user_data["qb_subject_manage_options"] = SUBJECTS[:]
         start = page * 20
-        buttons = [[InlineKeyboardButton(f"{r['name'][:32]} · {int(r['n'])} Q", callback_data=f"qb:mergefrom:{start+i}")] for i,r in enumerate(rows[start:start+20])]
+        buttons = []
+        for i,r in enumerate(rows[start:start+20]):
+            idx=start+i
+            label = "Collection" if r.get("subject_type") == "collection" else "Subject"
+            type_label = "Make Subject" if r.get("subject_type") == "collection" else "Make Collection"
+            buttons.append([InlineKeyboardButton(f"{r['name'][:22]} · {int(r['n'])} Q", callback_data=f"qb:mergefrom:{idx}"),
+                            InlineKeyboardButton(type_label, callback_data=f"qb:typeflip:{idx}"),
+                            InlineKeyboardButton("Archive", callback_data=f"qb:archiveone:{idx}")])
         nav=[]
         if page > 0: nav.append(InlineKeyboardButton("← Previous", callback_data=f"qb:subjectspage:{page-1}"))
         if start+20 < len(rows): nav.append(InlineKeyboardButton("Next →", callback_data=f"qb:subjectspage:{page+1}"))
         if nav: buttons.append(nav)
+        buttons.append([InlineKeyboardButton("🔀 Bulk merge into one collection/subject", callback_data="qb:mergebulk")])
+        buttons.append([InlineKeyboardButton("🧺 Bulk archive subjects/collections", callback_data="qb:archivebulk")])
         buttons.append([InlineKeyboardButton("🧹 Delete empty subjects", callback_data="qb:deleteempty")])
+        buttons.append([InlineKeyboardButton("🗂 Manage topics in a subject", callback_data="qb:topicmanage")])
         buttons.append([InlineKeyboardButton("⬅ Question Bank menu", callback_data="qb:home")])
-        await q.edit_message_text(f"🗂 Manage subjects · Page {page+1}\n\nSelect a redundant subject to merge into another subject. Questions, quiz labels and saved review snapshots will be reassigned before the old subject record is deleted. Empty subjects can be removed separately.\nTotal subjects: {len(rows)}", reply_markup=InlineKeyboardMarkup(buttons)); return
+        await q.edit_message_text(f"🗂 Manage Subjects & Collections · Page {page+1}\n\nTap a name to merge it into a canonical subject/collection. Archive hides it from import and student selectors without deleting questions or historical attempts.\nActive items: {len(rows)}", reply_markup=InlineKeyboardMarkup(buttons)); return
+    if data.startswith("qb:typeflip:"):
+        try: idx=int(data.rsplit(":",1)[1]); options=context.user_data.get("qb_subject_manage_options", SUBJECTS); name=options[idx]
+        except (ValueError,TypeError,IndexError):
+            await q.edit_message_text("Selection expired. Open Manage Subjects again.",reply_markup=admin_keyboard()); return
+        async with pool.connection() as conn:
+            cur=await conn.execute("UPDATE question_bank_subjects SET subject_type=CASE WHEN subject_type='collection' THEN 'subject' ELSE 'collection' END WHERE name=%s AND archived_at IS NULL RETURNING subject_type",(name,))
+            row=await cur.fetchone()
+            cur=await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name),name")
+            SUBJECTS[:]=[r["name"] for r in await cur.fetchall()]
+        if row:
+            await q.edit_message_text(f"Updated {name} to {'Question Collection' if row['subject_type']=='collection' else 'Subject'}.\n\nIf this is a multi-set bundle such as Eduteria 7500, merge its Set 1–150 subjects into this collection. Missing topic labels will be preserved as the original set names.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage more",callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
+        await q.edit_message_text("Subject/collection not found.",reply_markup=admin_keyboard()); return
+    if data.startswith("qb:archiveone:"):
+        try: idx=int(data.rsplit(":",1)[1]); options=context.user_data.get("qb_subject_manage_options", SUBJECTS); name=options[idx]
+        except (ValueError,TypeError,IndexError):
+            await q.edit_message_text("Selection expired. Open Manage Subjects again.", reply_markup=admin_keyboard()); return
+        context.user_data["qb_archive_subject_name"]=name
+        await q.edit_message_text(f"Archive {name}?\n\nIt will disappear from student subject/collection lists and import selectors. Questions, quizzes and historical attempts will be preserved. You can restore it later through database/admin recovery.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧺 Confirm archive",callback_data="qb:archiveoneconfirm"),InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return
+    if data == "qb:archiveoneconfirm":
+        name=context.user_data.pop("qb_archive_subject_name",None)
+        if not name:
+            await q.edit_message_text("Archive selection expired.",reply_markup=admin_keyboard()); return
+        async with pool.connection() as conn:
+            await conn.execute("UPDATE question_bank_subjects SET archived_at=NOW() WHERE name=%s AND archived_at IS NULL",(name,))
+            cur=await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name),name")
+            SUBJECTS[:]=[r["name"] for r in await cur.fetchall()]
+        await q.edit_message_text(f"Archived: {name}\nNo question rows or attempts were deleted.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage more",callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
+    if data == "qb:mergebulk":
+        await q.edit_message_text("Choose the canonical destination. For a multi-set bundle like Eduteria 7500, first convert the destination to Question Collection, then choose it here. When merging, old subject names will become topic/set names if the destination is a collection.",reply_markup=subject_keyboard("qb:mergebulktarget")); return
+    if data.startswith("qb:mergebulktarget:"):
+        try: idx=int(data.rsplit(":",1)[1]); target=SUBJECTS[idx]
+        except (ValueError,TypeError,IndexError):
+            await q.edit_message_text("Destination selection expired. Start again.",reply_markup=admin_keyboard()); return
+        context.user_data["qb_bulk_merge_target"]=target
+        context.user_data["qb_flow"]={"step":"bulk_merge_subjects","target":target}
+        await q.edit_message_text(f"Bulk merge destination: {target}\n\nSend the exact names of the old subjects/collections to merge into this destination, separated by commas or new lines. Example: Set 1, Set 2, Set 3.\n\nNothing changes until you review and confirm.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return
+    if data == "qb:mergebulkconfirm":
+        payload=context.user_data.pop("qb_bulk_merge_preview",None)
+        if not payload:
+            await q.edit_message_text("Bulk merge preview expired. Start again.",reply_markup=admin_keyboard()); return
+        target, sources=payload["target"],payload["sources"]
+        moved=0
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                cur=await conn.execute("SELECT subject_type FROM question_bank_subjects WHERE name=%s AND archived_at IS NULL",(target,)); target_row=await cur.fetchone()
+                if not target_row: raise ValueError("The destination is no longer active.")
+                target_type=str(target_row["subject_type"] or "subject")
+                for source in sources:
+                    if source==target: continue
+                    cur=await conn.execute("SELECT 1 FROM question_bank_subjects WHERE name=%s AND archived_at IS NULL",(source,)); source_row=await cur.fetchone()
+                    if not source_row: continue
+                    if target_type=="collection":
+                        cur=await conn.execute("UPDATE question_bank SET subject=%s,topic=COALESCE(NULLIF(BTRIM(topic),''),%s),updated_at=NOW() WHERE subject=%s RETURNING id",(target,source,source))
+                    else:
+                        cur=await conn.execute("UPDATE question_bank SET subject=%s,updated_at=NOW() WHERE subject=%s RETURNING id",(target,source,source))
+                    moved += len(await cur.fetchall())
+                    await conn.execute("UPDATE bank_quizzes SET subject=%s WHERE subject=%s",(target,source))
+                    await conn.execute("UPDATE bank_quiz_attempt_question_snapshots SET subject=%s WHERE subject=%s",(target,source))
+                    await conn.execute("UPDATE question_import_batches SET selected_subject=%s WHERE selected_subject=%s",(target,source))
+                    cur=await conn.execute("SELECT to_regclass('public.bpsc_nexus_test_series') AS t")
+                    if (await cur.fetchone())["t"]:
+                        await conn.execute("UPDATE bpsc_nexus_test_series SET subject=%s WHERE subject=%s",(target,source))
+                    await conn.execute("DELETE FROM question_bank_subjects WHERE name=%s",(source,))
+                cur=await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name),name")
+                SUBJECTS[:]=[r["name"] for r in await cur.fetchall()]
+        await q.edit_message_text(f"✅ Bulk merge complete\n\nDestination: {target}\nOld subjects deleted: {len(sources)}\nQuestions reassigned: {moved}\n\nHistorical attempts were preserved. If destination is a collection, missing topic labels were filled with each source subject name.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage more subjects",callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
+    if data == "qb:archivebulk":
+        context.user_data["qb_flow"]={"step":"bulk_archive_subjects"}
+        await q.edit_message_text("🧺 Bulk archive subjects/collections\n\nSend exact names separated by commas or new lines. Nothing will be archived until you review and confirm the preview. Questions and attempts will be preserved.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return
+    if data == "qb:topicmanage":
+        await q.edit_message_text("Choose the parent subject/collection whose topics you want to manage:",reply_markup=subject_keyboard("qb:topicparent")); return
+    if data.startswith("qb:topicparent:"):
+        try: idx=int(data.rsplit(":",1)[1]); parent=SUBJECTS[idx]
+        except (ValueError,TypeError,IndexError):
+            await q.edit_message_text("Selection expired. Open topic management again.",reply_markup=admin_keyboard()); return
+        context.user_data["qb_topic_parent"]=parent
+        context.user_data["qb_flow"]={"step":"bulk_archive_topics","subject":parent}
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT topic,COUNT(*) AS n FROM question_bank WHERE subject=%s AND status<>'archived' AND NULLIF(BTRIM(topic),'') IS NOT NULL GROUP BY topic ORDER BY LOWER(topic),topic",(parent,))
+            topics=await cur.fetchall()
+        listing="\n".join(f"• {r['topic']} — {r['n']} questions" for r in topics[:60]) or "No active topics found."
+        await q.edit_message_text(f"Topics in {parent}\n\n{listing}\n\nTo archive topics, send exact topic names separated by commas or new lines. Matching questions will be hidden from future tests but historical attempt snapshots remain. Nothing happens until preview confirmation.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return
+    if data == "qb:archivebulkconfirm":
+        pending=context.user_data.pop("qb_archive_subjects_preview",None)
+        if not pending:
+            await q.edit_message_text("Bulk archive preview expired. Start again.",reply_markup=admin_keyboard()); return
+        async with pool.connection() as conn:
+            await conn.execute("UPDATE question_bank_subjects SET archived_at=NOW() WHERE name = ANY(%s) AND archived_at IS NULL",(pending,))
+            cur=await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name),name")
+            SUBJECTS[:]=[r["name"] for r in await cur.fetchall()]
+        await q.edit_message_text(f"Archived {len(pending)} item(s):\n"+"\n".join(pending[:30])+"\n\nQuestion rows and historical attempts were preserved.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage Subjects",callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
+    if data == "qb:archivetopicsconfirm":
+        payload=context.user_data.pop("qb_archive_topics_preview",None)
+        if not payload:
+            await q.edit_message_text("Topic archive preview expired. Start again.",reply_markup=admin_keyboard()); return
+        parent, topics = payload["subject"], payload["topics"]
+        async with pool.connection() as conn:
+            cur=await conn.execute("UPDATE question_bank SET status='archived',updated_at=NOW() WHERE subject=%s AND topic = ANY(%s) AND status<>'archived' RETURNING id",(parent,topics))
+            count=len(await cur.fetchall())
+        await q.edit_message_text(f"Archived {len(topics)} topic(s) in {parent}.\nQuestions hidden from future tests: {count}.\nHistorical attempts and saved answer snapshots were preserved.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage more topics",callback_data="qb:topicmanage")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
     if data.startswith("qb:mergefrom:"):
         try: source_index = int(data.rsplit(":",1)[1]); options = context.user_data.get("qb_subject_manage_options", SUBJECTS)
         except (ValueError,TypeError): source_index = -1; options = []
@@ -960,11 +1090,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
             await q.edit_message_text("Merge selection expired. Start again.", reply_markup=admin_keyboard()); return
         async with pool.connection() as conn:
             async with conn.transaction():
-                cur = await conn.execute("SELECT 1 FROM question_bank_subjects WHERE name=%s", (target,)); target_exists = await cur.fetchone()
-                cur = await conn.execute("SELECT 1 FROM question_bank_subjects WHERE name=%s", (source,)); source_exists = await cur.fetchone()
-                if not target_exists or not source_exists:
-                    raise ValueError("Source or target subject no longer exists.")
-                cur = await conn.execute("UPDATE question_bank SET subject=%s,updated_at=NOW() WHERE subject=%s RETURNING id", (target, source)); moved = len(await cur.fetchall())
+                cur = await conn.execute("SELECT subject_type FROM question_bank_subjects WHERE name=%s AND archived_at IS NULL", (target,)); target_row = await cur.fetchone()
+                cur = await conn.execute("SELECT 1 FROM question_bank_subjects WHERE name=%s AND archived_at IS NULL", (source,)); source_exists = await cur.fetchone()
+                if not target_row or not source_exists:
+                    raise ValueError("Source or target subject/collection no longer exists or is archived.")
+                target_type = str(target_row["subject_type"] or "subject")
+                if target_type == "collection":
+                    cur = await conn.execute("UPDATE question_bank SET subject=%s, topic=COALESCE(NULLIF(BTRIM(topic),''),%s), updated_at=NOW() WHERE subject=%s RETURNING id", (target, source, source))
+                else:
+                    cur = await conn.execute("UPDATE question_bank SET subject=%s,updated_at=NOW() WHERE subject=%s RETURNING id", (target, source))
+                moved = len(await cur.fetchall())
                 await conn.execute("UPDATE bank_quizzes SET subject=%s WHERE subject=%s", (target, source))
                 await conn.execute("UPDATE bank_quiz_attempt_question_snapshots SET subject=%s WHERE subject=%s", (target, source))
                 await conn.execute("UPDATE question_import_batches SET selected_subject=%s WHERE selected_subject=%s", (target, source))
@@ -973,18 +1108,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
                 if (await cur.fetchone())["t"]:
                     await conn.execute("UPDATE bpsc_nexus_test_series SET subject=%s WHERE subject=%s", (target, source))
                 await conn.execute("DELETE FROM question_bank_subjects WHERE name=%s", (source,))
-                cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY LOWER(name), name")
+                cur = await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name), name")
                 SUBJECTS[:] = [r["name"] for r in await cur.fetchall()]
         context.user_data.pop("qb_merge_source",None); context.user_data.pop("qb_merge_target",None)
         await q.edit_message_text(f"✅ Merge complete\n\nOld subject deleted: {source}\nCanonical subject: {target}\nQuestions reassigned: {moved}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage more subjects", callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu", callback_data="qb:home")]])); return
     if data == "qb:deleteempty":
         async with pool.connection() as conn:
-            cur = await conn.execute("""SELECT s.name FROM question_bank_subjects s LEFT JOIN question_bank q ON q.subject=s.name
-                GROUP BY s.name HAVING COUNT(q.id)=0 ORDER BY s.name""")
+            cur = await conn.execute("""SELECT s.name FROM question_bank_subjects s
+                WHERE NOT EXISTS (SELECT 1 FROM question_bank q WHERE q.subject=s.name)
+                  AND NOT EXISTS (SELECT 1 FROM bank_quizzes b WHERE b.subject=s.name)
+                  AND NOT EXISTS (SELECT 1 FROM bank_quiz_attempt_question_snapshots snap WHERE snap.subject=s.name)
+                ORDER BY s.name""")
             empty = [r["name"] for r in await cur.fetchall()]
+            # Test-series references are text-based in older deployments; retain any linked names.
+            cur = await conn.execute("SELECT to_regclass('public.bpsc_nexus_test_series') AS t")
+            if (await cur.fetchone())["t"] and empty:
+                cur = await conn.execute("SELECT DISTINCT subject FROM bpsc_nexus_test_series WHERE subject = ANY(%s)", (empty,))
+                linked = {r["subject"] for r in await cur.fetchall()}
+                empty = [name for name in empty if name not in linked]
             if empty:
                 await conn.execute("DELETE FROM question_bank_subjects WHERE name = ANY(%s)", (empty,))
-                cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY LOWER(name),name")
+                cur = await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name),name")
                 SUBJECTS[:] = [r["name"] for r in await cur.fetchall()]
         await q.edit_message_text(f"✅ Removed {len(empty)} empty subject record(s). No questions were deleted.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage subjects", callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu", callback_data="qb:home")]])); return
     if data == "qb:home":
@@ -1321,7 +1465,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE, pool,
             seen.add(h)
         expected_duplicates=len(existing)+within_duplicates
         async with pool.connection() as conn:
-            cur=await conn.execute("SELECT name FROM question_bank_subjects ORDER BY name")
+            cur=await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY name")
             allowed={str(r["name"]).strip().casefold():str(r["name"]).strip() for r in await cur.fetchall()}
         source_counts={}
         for record in records:
@@ -1360,22 +1504,73 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not msg or not msg.text or not user or not is_authorized: return False
     flow=context.user_data.get("qb_flow",{})
     step=flow.get("step")
-    if step == "create_subject":
+    if step == "bulk_merge_subjects":
+        target=flow.get("target") or context.user_data.get("qb_bulk_merge_target")
+        names=[_norm(x) for x in re.split(r"[,\n;]+",msg.text) if _norm(x)]
+        names=list(dict.fromkeys(names))
+        if not target:
+            await msg.reply_text("Merge destination expired. Start again from Manage Subjects.",reply_markup=admin_keyboard()); return True
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT name,subject_type FROM question_bank_subjects WHERE archived_at IS NULL AND LOWER(name)=ANY(%s)",([n.casefold() for n in names],))
+            rows=await cur.fetchall()
+            cur=await conn.execute("SELECT subject_type FROM question_bank_subjects WHERE name=%s AND archived_at IS NULL",(target,)); target_row=await cur.fetchone()
+            cur=await conn.execute("SELECT subject,COUNT(*) AS n FROM question_bank WHERE subject = ANY(%s) GROUP BY subject",([r["name"] for r in rows if r["name"]!=target],))
+            counts={r["subject"]:int(r["n"]) for r in await cur.fetchall()}
+        sources=[r["name"] for r in rows if r["name"]!=target]
+        if not target_row or not sources:
+            await msg.reply_text("No valid source subjects matched, or the destination is unavailable. Nothing changed.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return True
+        context.user_data["qb_bulk_merge_preview"]={"target":target,"sources":sources}
+        context.user_data.pop("qb_flow",None)
+        total=sum(counts.get(name,0) for name in sources)
+        dest_type=str(target_row["subject_type"] or "subject")
+        note="Missing topic labels will be filled with the old subject names." if dest_type=="collection" else "Existing topic labels will be preserved; no new topic labels will be invented."
+        await msg.reply_text(f"🔀 Bulk merge preview\n\nDestination: {target} ({dest_type})\nSources to merge and delete: {len(sources)}\nQuestions to reassign: {total}\n\n"+"\n".join("• "+n+f" — {counts.get(n,0)} Q" for n in sources[:50])+ (f"\n… and {len(sources)-50} more" if len(sources)>50 else "")+f"\n\n{note}\nQuiz subject labels and saved review snapshots will be reassigned. Confirm?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Merge and delete sources",callback_data="qb:mergebulkconfirm"),InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return True
+    if step == "bulk_archive_subjects":
+        names=[_norm(x) for x in re.split(r"[,\n;]+",msg.text) if _norm(x)]
+        names=list(dict.fromkeys(names))
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL AND LOWER(name)=ANY(%s)",([n.casefold() for n in names],))
+            found=[r["name"] for r in await cur.fetchall()]
+        if not found:
+            await msg.reply_text("No active subject/collection names matched. Send exact names or cancel.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return True
+        context.user_data["qb_archive_subjects_preview"]=found
+        context.user_data.pop("qb_flow",None)
+        await msg.reply_text("Bulk archive preview\n\n"+"\n".join("• "+n for n in found)+f"\n\nMatched: {len(found)}. No questions or attempts will be deleted. Confirm archive?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧺 Confirm archive",callback_data="qb:archivebulkconfirm"),InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return True
+    if step == "bulk_archive_topics":
+        parent=flow.get("subject") or context.user_data.get("qb_topic_parent")
+        topics=list(dict.fromkeys(_norm(x) for x in re.split(r"[,\n;]+",msg.text) if _norm(x)))
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT topic,COUNT(*) AS n FROM question_bank WHERE subject=%s AND status<>'archived' AND topic = ANY(%s) GROUP BY topic ORDER BY topic",(parent,topics))
+            rows=await cur.fetchall()
+        found=[r["topic"] for r in rows]
+        if not found:
+            await msg.reply_text("No active topics matched those exact names. Nothing changed.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return True
+        context.user_data["qb_archive_topics_preview"]={"subject":parent,"topics":found}
+        context.user_data.pop("qb_flow",None)
+        total=sum(int(r["n"]) for r in rows)
+        await msg.reply_text(f"Topic archive preview · {parent}\n\n"+"\n".join("• "+t for t in found)+f"\n\nQuestions to hide from future tests: {total}. Historical attempts are preserved. Confirm?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧹 Archive topics",callback_data="qb:archivetopicsconfirm"),InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return True
+    if step in ("create_subject", "create_collection"):
         name = _norm(msg.text)[:100]
+        subject_type = "collection" if step == "create_collection" else "subject"
         if len(name) < 2:
             await msg.reply_text("Subject name must contain at least 2 characters. Send the name again."); return True
         try:
             async with pool.connection() as conn:
-                cur = await conn.execute("SELECT name FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) LIMIT 1", (name,))
+                cur = await conn.execute("SELECT name, archived_at FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) LIMIT 1", (name,))
                 existing = await cur.fetchone()
-                if existing:
-                    await msg.reply_text(f"A subject with the same name already exists: {existing['name']}\n\nChoose that subject or use Manage / Merge Subjects to clean duplicates.", reply_markup=admin_keyboard())
+                if existing and existing["archived_at"] is None:
+                    await msg.reply_text(f"A subject/collection with the same name already exists: {existing['name']}\n\nChoose that item or use Manage / Merge Subjects to clean duplicates.", reply_markup=admin_keyboard())
                     return True
-                await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id) VALUES(%s,%s)", (name,user.id))
-                cur = await conn.execute("SELECT name FROM question_bank_subjects ORDER BY LOWER(name), name")
+                if existing and existing["archived_at"] is not None:
+                    await conn.execute("UPDATE question_bank_subjects SET archived_at=NULL, subject_type=%s WHERE name=%s", (subject_type,existing["name"]))
+                    name=existing["name"]
+                else:
+                    await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id,subject_type) VALUES(%s,%s,%s)", (name,user.id,subject_type))
+                cur = await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name), name")
                 SUBJECTS[:] = [r["name"] for r in await cur.fetchall()]
             context.user_data.pop("qb_flow",None)
-            await msg.reply_text(f"✅ Subject saved: {name}\n\nIt is now available for question imports and new test series.",reply_markup=admin_keyboard())
+            kind_label = "Question Collection" if subject_type == "collection" else "Subject"
+            await msg.reply_text(f"✅ {kind_label} saved: {name}\n\nIt is now available for imports. Imported set labels will be retained as topics under this single {kind_label.lower()}.",reply_markup=admin_keyboard())
         except Exception as exc:
             log.exception("Subject creation failed")
             await msg.reply_text(f"Could not save this subject. No question data was changed. {str(exc)[:250]}",reply_markup=admin_keyboard())
