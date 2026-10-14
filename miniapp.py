@@ -5,7 +5,6 @@ Deploy as a separate Render Web Service from the Telegram bot. Shares DATABASE_U
 from __future__ import annotations
 
 import hashlib
-import aiohttp
 import hmac
 import json
 import logging
@@ -21,6 +20,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 import question_bank as qb
 import leaderboard as lb
+import intel
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("bpsc_nexus_miniapp")
@@ -73,67 +73,6 @@ async def telegram_auth(request: web.Request, handler):
 
 def json_response(payload, status=200):
     return web.json_response(payload, status=status, dumps=lambda x: json.dumps(x, ensure_ascii=False, default=str))
-
-
-async def _has_personal_all_access(conn, telegram_id: int) -> bool:
-    """Check the canonical premium-pass table; never trust frontend/UI state."""
-    if int(telegram_id) in ADMIN_TELEGRAM_IDS:
-        return True
-    cur = await conn.execute("""SELECT EXISTS (
-        SELECT 1
-        FROM premium_passes pp
-        JOIN app_users u ON u.id=pp.user_id
-        WHERE u.telegram_id=%s
-          AND pp.revoked_at IS NULL
-          AND (pp.expires_at IS NULL OR pp.expires_at>NOW())
-          AND pp.pass_code='all_access'
-          AND '*' = ANY(pp.vault_keys)
-    ) AS allowed""", (int(telegram_id),))
-    row = await cur.fetchone()
-    return bool(row and row['allowed'])
-
-
-async def _quiz_access_allowed(conn, telegram_id: int, quiz_id: int, is_custom: bool = False) -> bool:
-    """Allow admins, an active personal All Access pass, or a specifically entitled/free published series."""
-    if int(telegram_id) in ADMIN_TELEGRAM_IDS:
-        return True
-    if await _has_personal_all_access(conn, telegram_id):
-        return True
-    # A custom quiz is generated from the full question bank and always needs personal All Access.
-    if is_custom:
-        return False
-    cur = await conn.execute("""SELECT s.id, s.access_type
-        FROM bpsc_nexus_test_series_tests st
-        JOIN bpsc_nexus_test_series s ON s.id=st.series_id
-        WHERE st.quiz_id=%s AND s.is_published=TRUE""", (int(quiz_id),))
-    series = await cur.fetchall()
-    if not series:
-        return False
-    if any(row['access_type'] == 'free' for row in series):
-        return True
-    for row in series:
-        cur = await conn.execute("""SELECT 1 FROM bpsc_nexus_test_series_entitlements
-            WHERE series_id=%s AND telegram_id=%s AND revoked_at IS NULL
-              AND (expires_at IS NULL OR expires_at>NOW()) LIMIT 1""", (row['id'], int(telegram_id)))
-        if await cur.fetchone():
-            return True
-    return False
-
-
-async def _active_attempt_access_allowed(pool, attempt, telegram_id: int) -> bool:
-    """Honor a valid entitlement recorded at attempt start; reject legacy unpaid active attempts."""
-    if attempt.get('submitted_at'):
-        return True
-    settings = attempt.get('quiz_settings') or {}
-    if not isinstance(settings, dict):
-        try:
-            settings = json.loads(settings or '{}')
-        except (TypeError, ValueError):
-            settings = {}
-    if settings.get('access_granted') is True:
-        return True
-    async with pool.connection() as conn:
-        return await _quiz_access_allowed(conn, telegram_id, int(attempt['quiz_id']), bool(attempt.get('is_custom')))
 
 
 async def _attempt_row(pool, attempt_id: int, telegram_id: int):
@@ -548,14 +487,7 @@ async def arena_answer(request):
     return json_response({"saved":True,"score":score,"answered":done,"finished":done>=int(m["question_count"])})
 
 
-# Public pass prices. Legacy all_access requests remain supported only for already-submitted requests.
 ALL_ACCESS_PRICES = {60: 90, 90: 130, 120: 150, 180: 180, 249: 220, 365: 300}
-PASS_PLANS = {
-    "group_starter": {"product_code": "group_starter", "product_name": "Group Starter Pass", "amount_inr": 99, "duration_days": 30, "scope": "group", "duration_label": "Monthly access", "description": "Quiz access for one selected Telegram group for 30 days."},
-    "group_elite": {"product_code": "group_elite", "product_name": "Group Elite Pass", "amount_inr": 249, "duration_days": 0, "scope": "group", "duration_label": "Lifetime access", "description": "Lifetime quiz access for one selected Telegram group."},
-    "individual_pro": {"product_code": "individual_pro", "product_name": "Individual Pro Pass", "amount_inr": 79, "duration_days": 60, "scope": "individual", "duration_label": "2 months access", "description": "Personal All Access for 60 days."},
-    "individual_prime": {"product_code": "individual_prime", "product_name": "Individual Prime Pass", "amount_inr": 149, "duration_days": 0, "scope": "individual", "duration_label": "Lifetime access", "description": "Personal lifetime All Access."},
-}
 # Product codes are stable entitlement identifiers; retiring a product only hides new sales.
 INDIVIDUAL_PRODUCTS = {
     "ghatnachakra_ecology": {"name": "Ghatnachakra Ecology — Lifetime Edition", "price": 39, "duration_days": 0, "entitlement_key": "ghatnachakra_ecology", "active": True},
@@ -570,7 +502,6 @@ async def payment_schema(conn):
         submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ,
         reviewed_by BIGINT, review_note TEXT, activated_pass_id BIGINT, UNIQUE(transaction_ref))""")
     await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS product_code TEXT NOT NULL DEFAULT 'all_access'")
-    await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS group_chat_id BIGINT")
     await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_payment_requests_status_idx ON bpsc_payment_requests(status, submitted_at DESC)")
     await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_individual_products (
         product_code TEXT PRIMARY KEY, product_name TEXT NOT NULL, amount_inr INTEGER NOT NULL CHECK(amount_inr >= 0),
@@ -601,63 +532,44 @@ async def payment_options(request):
     uid=request["telegram_user"]["id"]
     async with request.app["pool"].connection() as conn:
         await payment_schema(conn)
-        cur=await conn.execute("SELECT id,product_name,duration_days,amount_inr,product_code,group_chat_id,transaction_ref,status,submitted_at,reviewed_at FROM bpsc_payment_requests WHERE telegram_id=%s ORDER BY submitted_at DESC LIMIT 20",(uid,))
+        cur=await conn.execute("SELECT id,product_name,duration_days,amount_inr,product_code,transaction_ref,status,submitted_at,reviewed_at FROM bpsc_payment_requests WHERE telegram_id=%s ORDER BY submitted_at DESC LIMIT 20",(uid,))
         history=await cur.fetchall()
         cur=await conn.execute("SELECT product_code,product_name,amount_inr,entitlement_key,duration_days FROM bpsc_individual_products WHERE is_active=TRUE ORDER BY product_name")
         products=await cur.fetchall()
-    return json_response({"plans": list(PASS_PLANS.values()), "prices":[{"days":d,"price":p} for d,p in ALL_ACCESS_PRICES.items()],"products":[dict(r) for r in products],"history":[dict(r) for r in history]})
+    return json_response({"prices":[{"days":d,"price":p} for d,p in ALL_ACCESS_PRICES.items()],"products":[dict(r) for r in products],"history":[dict(r) for r in history]})
 
 async def submit_payment(request):
     user=request["telegram_user"]
     try: body=await request.json()
     except Exception: return json_response({"error":"Invalid submission."},400)
-    product_code=str(body.get("product_code") or "").strip().lower()
+    product_code=str(body.get("product_code") or "all_access").strip().lower()
     ref=str(body.get("transaction_ref") or "").strip().upper()
     screenshot=str(body.get("screenshot_data") or "")
     if not re.fullmatch(r"[A-Z0-9-]{6,40}",ref): return json_response({"error":"Enter a valid UPI transaction/reference ID (6–40 letters, digits or hyphens)."},400)
     if not screenshot.startswith("data:image/") or len(screenshot)>900000: return json_response({"error":"Upload a clear payment screenshot under 650 KB."},400)
-    group_chat_id = None
-    product_name = ""
-    amount = 0
-    days = 0
-    if product_code in PASS_PLANS:
-        plan = PASS_PLANS[product_code]
-        product_name, amount, days = plan["product_name"], int(plan["amount_inr"]), int(plan["duration_days"])
-        if plan["scope"] == "group":
-            try: group_chat_id = int(body.get("group_chat_id"))
-            except (TypeError, ValueError): return json_response({"error":"Enter the target Telegram group ID. In the group, run /groupid to get it."},400)
-            if group_chat_id >= 0:
-                return json_response({"error":"That does not look like a Telegram group ID. Add the bot to the group and run /groupid there."},400)
-            # Verify the purchaser is an administrator/owner of this exact group.
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember", params={"chat_id": group_chat_id, "user_id": user["id"]}, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                        check = await resp.json(content_type=None)
-                member = check.get("result") or {}
-                if not check.get("ok") or member.get("status") not in {"creator", "administrator"}:
-                    return json_response({"error":"Could not verify you as a group admin. Add BPSC Nexus bot to that group, run /groupid there, and submit from the Telegram account that owns/administers it."},400)
-            except Exception:
-                return json_response({"error":"Could not verify group admin status right now. Ensure the bot is in the group and try again."},400)
-    elif product_code == "all_access":
-        return json_response({"error":"The old All Access price list is retired. Please choose Individual Pro or Individual Prime."},400)
-    else:
-        async with request.app["pool"].connection() as conn:
-            await payment_schema(conn)
-            cur=await conn.execute("SELECT product_code,product_name,amount_inr,duration_days FROM bpsc_individual_products WHERE product_code=%s AND is_active=TRUE",(product_code,))
-            product=await cur.fetchone()
-        if not product: return json_response({"error":"This product is unavailable for new purchases."},404)
-        amount=int(product["amount_inr"]); days=int(product["duration_days"]); product_name=product["product_name"]
     async with request.app["pool"].connection() as conn:
         await payment_schema(conn)
+        if product_code == "all_access":
+            try:
+                days=int(body.get("duration_days")); amount=ALL_ACCESS_PRICES[days]
+            except Exception: return json_response({"error":"Choose a valid All Access duration."},400)
+            product_name=f"All Access · {days} days"
+        else:
+            cur=await conn.execute("SELECT product_code,product_name,amount_inr,duration_days FROM bpsc_individual_products WHERE product_code=%s AND is_active=TRUE",(product_code,))
+            product=await cur.fetchone()
+            if not product: return json_response({"error":"This individual question bank is unavailable for new purchases."},404)
+            amount=int(product["amount_inr"]); days=int(product["duration_days"]); product_name=product["product_name"]
         cur=await conn.execute("SELECT status FROM bpsc_payment_requests WHERE transaction_ref=%s",(ref,))
         if await cur.fetchone(): return json_response({"error":"This transaction/reference ID has already been submitted."},409)
-        cur=await conn.execute("INSERT INTO bpsc_payment_requests(telegram_id,product_code,product_name,duration_days,amount_inr,transaction_ref,screenshot_data,group_chat_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,submitted_at",(user["id"],product_code,product_name,days,amount,ref,screenshot,group_chat_id))
+        cur=await conn.execute("INSERT INTO bpsc_payment_requests(telegram_id,product_code,product_name,duration_days,amount_inr,transaction_ref,screenshot_data) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id,submitted_at",(user["id"],product_code,product_name,days,amount,ref,screenshot))
         r=await cur.fetchone()
-    return json_response({"request_id":int(r["id"]),"status":"pending","amount":amount,"product_code":product_code,"product_name":product_name,"group_chat_id":group_chat_id,"submitted_at":r["submitted_at"].isoformat()},201)
+    return json_response({"request_id":int(r["id"]),"status":"pending","amount":amount,"product_code":product_code,"product_name":product_name,"submitted_at":r["submitted_at"].isoformat()},201)
 
 async def index(request):
     # Resolve frontend relative to this file, not the process working directory.
     page = ROOT / "static" / "index.html"
+    if not page.is_file() and (ROOT / "index.html").is_file():
+        page = ROOT / "index.html"
     if not page.is_file():
         log.error("Mini App frontend missing at %s", page)
         return web.Response(
@@ -934,39 +846,15 @@ async def attempt_history(request):
 
 async def quiz_builder_meta(request):
     pool = request.app["pool"]
-    selected_subject = str(request.query.get("subject", "")).strip()
     async with pool.connection() as conn:
-        cur = await conn.execute("""SELECT s.name, s.created_at, s.subject_type,
-                COUNT(q.id) FILTER (WHERE q.status='ready') AS n,
-                COUNT(DISTINCT NULLIF(BTRIM(q.topic),'')) FILTER (WHERE q.status='ready') AS topic_count
-            FROM question_bank_subjects s LEFT JOIN question_bank q ON q.subject=s.name
-            WHERE s.archived_at IS NULL
-            GROUP BY s.id,s.name,s.created_at,s.subject_type ORDER BY LOWER(s.name),s.name""")
-        all_rows = await cur.fetchall()
-        def item(r):
-            return {"name": r["name"], "count": int(r["n"] or 0),
-                    "topic_count": int(r["topic_count"] or 0),
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None}
-        subjects = [item(r) for r in all_rows if (r["subject_type"] or "subject") != "collection"]
-        collections = [item(r) for r in all_rows if (r["subject_type"] or "subject") == "collection"]
-        if selected_subject and selected_subject != "All subjects":
-            cur = await conn.execute("""SELECT DISTINCT q.topic FROM question_bank q
-                JOIN question_bank_subjects s ON s.name=q.subject
-                WHERE s.archived_at IS NULL AND q.status='ready' AND q.subject=%s
-                  AND NULLIF(BTRIM(q.topic),'') IS NOT NULL
-                ORDER BY q.topic LIMIT 1000""", (selected_subject,))
-        else:
-            cur = await conn.execute("""SELECT DISTINCT q.topic FROM question_bank q
-                JOIN question_bank_subjects s ON s.name=q.subject
-                WHERE s.archived_at IS NULL AND q.status='ready' AND NULLIF(BTRIM(q.topic),'') IS NOT NULL
-                ORDER BY q.topic LIMIT 1000""")
+        cur = await conn.execute("SELECT subject, COUNT(*) AS n FROM question_bank WHERE status='ready' GROUP BY subject ORDER BY subject")
+        subjects = [{"name": r["subject"], "count": int(r["n"])} for r in await cur.fetchall()]
+        cur = await conn.execute("SELECT DISTINCT topic FROM question_bank WHERE status='ready' AND NULLIF(BTRIM(topic),'') IS NOT NULL ORDER BY topic LIMIT 500")
         topics = [r["topic"] for r in await cur.fetchall()]
-        cur = await conn.execute("""SELECT COUNT(*) AS n FROM question_bank q
-            JOIN question_bank_subjects s ON s.name=q.subject
-            WHERE s.archived_at IS NULL AND q.status='ready'""")
+        cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status='ready'")
         total = int((await cur.fetchone())["n"])
-    return json_response({"subjects": subjects, "collections": collections, "topics": topics,
-        "total_ready": total, "selection_modes": ["random", "sequential", "unseen", "incorrect"]})
+    return json_response({"subjects": subjects, "topics": topics, "total_ready": total,
+        "selection_modes": ["random", "sequential", "unseen", "incorrect"]})
 
 
 async def quiz_builder_count(request):
@@ -974,10 +862,10 @@ async def quiz_builder_count(request):
     subject = str(request.query.get("subject", "All subjects")).strip()
     topic = str(request.query.get("topic", "")).strip()
     selection = str(request.query.get("selection", "random"))
-    conditions = ["qb.status='ready'", "EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.archived_at IS NULL)"]
+    conditions = ["qb.status='ready'"]
     params = []
     if subject and subject != "All subjects":
-        conditions.append("EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.archived_at IS NULL AND s.name=%s)"); params.append(subject)
+        conditions.append("qb.subject=%s"); params.append(subject)
     if topic:
         conditions.append("qb.topic=%s"); params.append(topic)
     if selection == "unseen":
@@ -993,9 +881,6 @@ async def quiz_builder_count(request):
 async def create_custom_quiz(request):
     user = request["telegram_user"]
     pool = request.app["pool"]
-    async with pool.connection() as conn:
-        if not await _has_personal_all_access(conn, user["id"]):
-            return json_response({"error": "Personal All Access is required to create quizzes. Choose Individual Pro (2 months) or Individual Prime (lifetime) from Membership; group passes do not unlock personal quizzes."}, 403)
     try:
         body = await request.json()
         subject = str(body.get("subject") or "All subjects").strip()
@@ -1021,10 +906,10 @@ async def create_custom_quiz(request):
     except Exception:
         return json_response({"error": "Invalid quiz builder settings."}, 400)
 
-    conditions = ["qb.status='ready'", "EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.archived_at IS NULL)"]
+    conditions = ["qb.status='ready'"]
     params = []
     if subject != "All subjects":
-        conditions.append("EXISTS (SELECT 1 FROM question_bank_subjects s WHERE s.name=qb.subject AND s.archived_at IS NULL AND s.name=%s)"); params.append(subject)
+        conditions.append("qb.subject=%s"); params.append(subject)
     if topic:
         conditions.append("qb.topic=%s"); params.append(topic)
     if selection == "unseen":
@@ -1078,14 +963,23 @@ async def start_attempt(request):
         quiz = await cur.fetchone()
         if not quiz:
             return json_response({"error": "Quiz is unavailable."}, 404)
-        if not await _quiz_access_allowed(conn, user["id"], quiz_id, bool(quiz["is_custom"])):
-            return json_response({"error": "Quiz access is locked. Personal quizzes require an active Individual Pro/Prime pass, or a specific entitlement for a paid Test Series. Open Membership to activate access."}, 403)
+        cur = await conn.execute("""SELECT s.id,s.access_type FROM bpsc_nexus_test_series_tests st
+            JOIN bpsc_nexus_test_series s ON s.id=st.series_id
+            WHERE st.quiz_id=%s AND s.is_published=TRUE AND s.access_type='paid'
+            ORDER BY s.id LIMIT 1""", (quiz_id,))
+        paid_series = await cur.fetchone()
+        if paid_series:
+            ent = await conn.execute("""SELECT 1 FROM bpsc_nexus_test_series_entitlements
+                WHERE series_id=%s AND telegram_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>NOW())""",
+                (paid_series['id'], user['id']))
+            if not await ent.fetchone():
+                return json_response({"error": "This test belongs to a paid series. Access is not active for your account yet."}, 403)
         cur = await conn.execute("""SELECT qb.id FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
             WHERE qq.quiz_id=%s AND qb.status='ready' ORDER BY qq.position""", (quiz_id,))
         ids = await cur.fetchall()
         if not ids:
             return json_response({"error": "This quiz has no verified questions."}, 400)
-        cur = await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions,question_time_seconds,quiz_settings) VALUES(%s,%s,%s,%s,%s,%s::jsonb) RETURNING id,started_at", (quiz_id, user["id"], mode, len(ids), int(quiz["question_time_seconds"] or 0), json.dumps({"custom": bool(quiz["is_custom"]), "mode_label": requested_mode, "access_granted": True})))
+        cur = await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions,question_time_seconds,quiz_settings) VALUES(%s,%s,%s,%s,%s,%s::jsonb) RETURNING id,started_at", (quiz_id, user["id"], mode, len(ids), int(quiz["question_time_seconds"] or 0), json.dumps({"custom": bool(quiz["is_custom"]), "mode_label": requested_mode})))
         attempt = await cur.fetchone()
         await conn.execute("""INSERT INTO bank_quiz_attempt_question_snapshots(attempt_id,position,question_id,subject,question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi)
             SELECT %s,qq.position,qb.id,qb.subject,qb.question_en,qb.question_hi,qb.question_type,qb.question_structure,qb.question_flags,qb.options,qb.correct_option, qb.explanation_en,qb.explanation_hi
@@ -1104,8 +998,6 @@ async def get_attempt(request):
     attempt = await _attempt_row(pool, attempt_id, user["id"])
     if not attempt:
         return json_response({"error": "Attempt not found."}, 404)
-    if not await _active_attempt_access_allowed(pool, attempt, user["id"]):
-        return json_response({"error": "This unfinished attempt has no active membership entitlement. Open Membership to activate Individual Pro/Prime or the relevant Test Series pass."}, 403)
     if attempt["submitted_at"]:
         async with pool.connection() as conn:
             result = await _result_payload(conn, attempt_id, user["id"])
@@ -1152,8 +1044,6 @@ async def save_answer(request):
     attempt = await _attempt_row(pool, attempt_id, user["id"])
     if not attempt:
         return json_response({"error": "Attempt not found."}, 404)
-    if not await _active_attempt_access_allowed(pool, attempt, user["id"]):
-        return json_response({"error": "This unfinished attempt has no active membership entitlement. Open Membership to activate Individual Pro/Prime or the relevant Test Series pass."}, 403)
     if attempt["submitted_at"]:
         return json_response({"error": "This attempt is already submitted."}, 409)
     if attempt["mode"] == "exam" and not attempt["is_custom"] and time.time() >= attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60:
@@ -1190,8 +1080,6 @@ async def save_review(request):
     attempt = await _attempt_row(pool, attempt_id, user["id"])
     if not attempt:
         return json_response({"error": "Attempt not found."}, 404)
-    if not await _active_attempt_access_allowed(pool, attempt, user["id"]):
-        return json_response({"error": "This unfinished attempt has no active membership entitlement. Open Membership to activate Individual Pro/Prime or the relevant Test Series pass."}, 403)
     if attempt["submitted_at"]:
         return json_response({"error": "This attempt is already submitted."}, 409)
     if attempt["mode"] == "exam" and not attempt["is_custom"] and time.time() >= attempt["started_at"].timestamp() + int(attempt["duration_minutes"]) * 60:
@@ -1213,17 +1101,61 @@ async def submit_attempt(request):
         attempt_id = int(request.match_info["attempt_id"])
     except ValueError:
         return json_response({"error": "Invalid attempt ID."}, 400)
-    pool = request.app["pool"]
-    attempt = await _attempt_row(pool, attempt_id, user["id"])
-    if not attempt:
-        return json_response({"error": "Attempt not found."}, 404)
-    if not await _active_attempt_access_allowed(pool, attempt, user["id"]):
-        return json_response({"error": "This unfinished attempt has no active membership entitlement. Open Membership to activate Individual Pro/Prime or the relevant Test Series pass."}, 403)
-    result = await _grade_attempt(pool, attempt_id, user["id"], user.get("first_name", "Student"))
+    result = await _grade_attempt(request.app["pool"], attempt_id, user["id"], user.get("first_name", "Student"))
     if result is None:
         return json_response({"error": "Attempt not found."}, 404)
     return json_response(result)
 
+
+async def intel_articles(request):
+    user=request["telegram_user"]
+    limit=min(50,max(1,int(request.query.get("limit","20"))))
+    offset=max(0,int(request.query.get("offset","0")))
+    search=(request.query.get("q") or "").strip()[:120]
+    async with request.app["pool"].connection() as conn:
+        cur=await conn.execute("""SELECT a.id,a.title,a.canonical_url,a.published_at,a.discovered_at,s.name AS source_name,
+          v.summary,v.background,v.key_facts,v.significance,v.mains_points,v.bihar_relevance,v.language
+          FROM intel_articles a JOIN intel_sources s ON s.id=a.source_id
+          JOIN LATERAL (SELECT * FROM intel_content_versions WHERE article_id=a.id ORDER BY version_number DESC LIMIT 1) v ON TRUE
+          WHERE a.review_status='approved' AND a.processing_status='drafted'
+          AND (%s='' OR a.title ILIKE %s OR v.summary ILIKE %s)
+          ORDER BY COALESCE(a.published_at,a.discovered_at) DESC LIMIT %s OFFSET %s""",
+          (search,'%'+search+'%','%'+search+'%',limit,offset))
+        rows=await cur.fetchall()
+    return json_response({"articles":rows,"limit":limit,"offset":offset})
+
+async def intel_article_detail(request):
+    aid=int(request.match_info['article_id']); user=request['telegram_user']
+    async with request.app['pool'].connection() as conn:
+        cur=await conn.execute("""SELECT a.id,a.title,a.canonical_url,a.published_at,a.discovered_at,s.name AS source_name,
+          v.summary,v.background,v.key_facts,v.significance,v.mains_points,v.bihar_relevance,v.mcqs,v.language
+          FROM intel_articles a JOIN intel_sources s ON s.id=a.source_id
+          JOIN LATERAL (SELECT * FROM intel_content_versions WHERE article_id=a.id ORDER BY version_number DESC LIMIT 1) v ON TRUE
+          WHERE a.id=%s AND a.review_status='approved' AND a.processing_status='drafted'""",(aid,))
+        row=await cur.fetchone()
+        if not row: return json_response({"error":"Article not found."},404)
+        await conn.execute("INSERT INTO intel_read_status(telegram_id,article_id) VALUES(%s,%s) ON CONFLICT(telegram_id,article_id) DO UPDATE SET read_at=NOW()",(user['id'],aid))
+        cur=await conn.execute("SELECT EXISTS(SELECT 1 FROM intel_bookmarks WHERE telegram_id=%s AND article_id=%s) AS saved",(user['id'],aid)); saved=(await cur.fetchone())['saved']
+    return json_response({"article":row,"saved":saved})
+
+async def intel_bookmark(request):
+    user=request['telegram_user']; data=await request.json(); aid=int(data.get('article_id',0)); saved=bool(data.get('saved',True))
+    async with request.app['pool'].connection() as conn:
+        cur=await conn.execute("SELECT 1 FROM intel_articles WHERE id=%s AND review_status='approved'",(aid,))
+        if not await cur.fetchone(): return json_response({"error":"Article not found."},404)
+        if saved: await conn.execute("INSERT INTO intel_bookmarks(telegram_id,article_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",(user['id'],aid))
+        else: await conn.execute("DELETE FROM intel_bookmarks WHERE telegram_id=%s AND article_id=%s",(user['id'],aid))
+    return json_response({"saved":saved})
+
+async def intel_bookmarks(request):
+    user=request['telegram_user']
+    async with request.app['pool'].connection() as conn:
+        cur=await conn.execute("""SELECT a.id,a.title,a.canonical_url,a.published_at,s.name AS source_name,v.summary
+          FROM intel_bookmarks b JOIN intel_articles a ON a.id=b.article_id JOIN intel_sources s ON s.id=a.source_id
+          JOIN LATERAL(SELECT summary FROM intel_content_versions WHERE article_id=a.id ORDER BY version_number DESC LIMIT 1)v ON TRUE
+          WHERE b.telegram_id=%s AND a.review_status='approved' ORDER BY b.created_at DESC LIMIT 100""",(user['id'],))
+        rows=await cur.fetchall()
+    return json_response({"articles":rows})
 
 async def startup(app):
     if not BOT_TOKEN or not DATABASE_URL:
@@ -1233,6 +1165,7 @@ async def startup(app):
     await qb.ensure_schema(pool)
     await lb.ensure_schema(pool)
     await lb.backfill_bank_attempts(pool)
+    await intel.ensure_schema(pool)
     async with pool.connection() as conn:
         await payment_schema(conn)
         await ensure_test_series_schema(conn)
@@ -1279,6 +1212,10 @@ def make_app():
     app.router.add_post("/api/payments", submit_payment)
     app.router.add_get("/static/{filename}", static_asset)
     app.router.add_get("/healthz", health)
+    app.router.add_get("/api/intel/articles", intel_articles)
+    app.router.add_get("/api/intel/articles/{article_id}", intel_article_detail)
+    app.router.add_get("/api/intel/bookmarks", intel_bookmarks)
+    app.router.add_post("/api/intel/bookmarks", intel_bookmark)
     app.router.add_get("/api/tasks", list_tasks)
     app.router.add_post("/api/tasks", create_task)
     app.router.add_patch("/api/tasks/{task_id}", update_task)

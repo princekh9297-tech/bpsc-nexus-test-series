@@ -1,0 +1,24 @@
+# Add this cron service to your existing render.yaml (do not replace existing services).
+# Set PIB_FEED_URL only after verifying the official PIB feed endpoint.
+services:
+  - type: cron
+    name: bpsc-nexus-intel-poller
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python intel_worker.py
+    schedule: "*/20 * * * *"
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: PIB_FEED_URL
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: INTEL_TELEGRAM_CHAT_ID
+        sync: false
+      - key: INTEL_AI_BASE_URL
+        sync: false
+      - key: INTEL_AI_API_KEY
+        sync: false
+      - key: INTEL_AI_MODEL
+        sync: false
