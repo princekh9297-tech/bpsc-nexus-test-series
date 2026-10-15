@@ -818,6 +818,16 @@ async def ensure_access_schema(conn):
         reset_note TEXT NOT NULL DEFAULT ''
     )""")
     await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_nexus_demo_trials_expiry_idx ON bpsc_nexus_demo_trials(expires_at)")
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_demo_registrations (
+        telegram_id BIGINT PRIMARY KEY,
+        telegram_username VARCHAR(64) NOT NULL DEFAULT '',
+        submitted_contact VARCHAR(100) NOT NULL,
+        contact_type VARCHAR(16) NOT NULL DEFAULT 'username',
+        registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        source VARCHAR(32) NOT NULL DEFAULT 'miniapp'
+    )""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_nexus_demo_registrations_registered_idx ON bpsc_nexus_demo_registrations(registered_at DESC)")
 
 
 async def _ensure_trial(conn, telegram_id: int):
@@ -884,12 +894,90 @@ async def _access_state(conn, telegram_id: int, is_admin: bool = False, create_t
 async def access_status(request):
     user=request['telegram_user']; is_admin=_is_series_admin(user)
     async with request.app['pool'].connection() as conn:
-        trial_before=await conn.execute("SELECT 1 FROM bpsc_nexus_demo_trials WHERE telegram_id=%s",(user['id'],))
-        existed=bool(await trial_before.fetchone())
-        state=await _access_state(conn,user['id'],is_admin,True)
-    state['trial_started_now']=bool(state['demo_started_at'] and not existed and state['demo_active'])
+        await ensure_access_schema(conn)
+        cur=await conn.execute("SELECT 1 FROM bpsc_nexus_demo_registrations WHERE telegram_id=%s",(user['id'],))
+        registered=bool(await cur.fetchone())
+        # Do not start a trial until the student submits the required contact field.
+        state=await _access_state(conn,user['id'],is_admin,False)
+        if not is_admin and state['demo_enabled'] and not registered and not state['has_paid_access']:
+            state['registration_required']=True
+            state['trial_started_now']=False
+            state['demo_message_title']='Register to unlock your demo'
+            return json_response(state)
+        if registered:
+            await conn.execute("UPDATE bpsc_nexus_demo_registrations SET last_seen_at=NOW() WHERE telegram_id=%s",(user['id'],))
+        existed=bool(state['demo_started_at'])
+        if not is_admin and registered and state['demo_enabled'] and not existed:
+            await _ensure_trial(conn,user['id'])
+            state=await _access_state(conn,user['id'],is_admin,False)
+            state['trial_started_now']=bool(state['demo_active'])
+        else:
+            state['trial_started_now']=False
+        state['registration_required']=False
     state['demo_message_title']=f"Your {state['demo_duration_hours']}-hour BPSC Nexus Demo is live" if state['demo_active'] else ('Your demo has ended' if state['demo_expired'] else 'Explore BPSC Nexus')
     return json_response(state)
+
+
+async def register_demo(request):
+    user=request['telegram_user']
+    try:
+        body=await request.json(); contact=str(body.get('contact','')).strip()
+    except Exception:
+        return json_response({'error':'Enter your Telegram username or Telegram user ID.'},400)
+    if contact.startswith('@'):
+        contact=contact[1:]
+    if not contact or len(contact)>100:
+        return json_response({'error':'Enter a valid Telegram username or Telegram user ID.'},400)
+    if contact.isdigit():
+        if int(contact)<=0: return json_response({'error':'Telegram user ID must be a positive number.'},400)
+        contact_type='telegram_id'
+    elif re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}',contact):
+        contact_type='username'
+        contact='@'+contact
+    else:
+        return json_response({'error':'Use a Telegram username (5–32 characters) or numeric Telegram user ID.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("SELECT enabled,duration_hours FROM bpsc_nexus_demo_config WHERE singleton=TRUE")
+        config=await cur.fetchone()
+        if not config or not config['enabled']:
+            return json_response({'error':'The demo is currently closed. Please contact the BPSC Nexus team.'},403)
+        await conn.execute("""INSERT INTO bpsc_nexus_demo_registrations(telegram_id,telegram_username,submitted_contact,contact_type,registered_at,last_seen_at,source)
+            VALUES(%s,%s,%s,%s,NOW(),NOW(),'miniapp')
+            ON CONFLICT(telegram_id) DO UPDATE SET telegram_username=EXCLUDED.telegram_username,submitted_contact=EXCLUDED.submitted_contact,contact_type=EXCLUDED.contact_type,last_seen_at=NOW()""",
+            (user['id'],str(user.get('username') or '')[:64],contact,contact_type))
+        trial, _=await _ensure_trial(conn,user['id'])
+        await _write_admin_audit(conn,user['id'],'demo_registration',str(user['id']),{'submitted_contact':contact,'contact_type':contact_type})
+        state=await _access_state(conn,user['id'],_is_series_admin(user),False)
+    state.update({'registration_required':False,'trial_started_now':bool(state['demo_active']),'demo_message_title':f"Your {state['demo_duration_hours']}-hour BPSC Nexus Demo is live" if state['demo_active'] else 'Your demo is registered'})
+    return json_response(state)
+
+
+async def admin_demo_registrations(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try: days=max(1,min(90,int(request.query.get('days','2'))))
+    except Exception: days=2
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("""SELECT COUNT(*) FILTER (WHERE registered_at >= NOW() - (%s * INTERVAL '1 day')) AS total,
+            COUNT(*) FILTER (WHERE registered_at >= NOW() - INTERVAL '2 days' AND started_at >= NOW() - INTERVAL '2 days') AS started_in_window,
+            COUNT(*) FILTER (WHERE expires_at>NOW()) AS active_now,
+            COUNT(*) FILTER (WHERE expires_at IS NOT NULL AND expires_at<=NOW()) AS expired,
+            COUNT(*) FILTER (WHERE started_at IS NULL) AS registered_not_started
+            FROM (SELECT r.telegram_id,r.registered_at,t.started_at,t.expires_at FROM bpsc_nexus_demo_registrations r LEFT JOIN bpsc_nexus_demo_trials t ON t.telegram_id=r.telegram_id) x""",(days,))
+        stats=dict(await cur.fetchone())
+        cur=await conn.execute("""SELECT r.telegram_id,r.telegram_username,r.submitted_contact,r.contact_type,r.registered_at,
+            t.started_at AS demo_started_at,t.expires_at,
+            CASE WHEN t.expires_at>NOW() THEN 'active' WHEN t.expires_at IS NOT NULL THEN 'expired' ELSE 'registered' END AS demo_status
+            FROM bpsc_nexus_demo_registrations r LEFT JOIN bpsc_nexus_demo_trials t ON t.telegram_id=r.telegram_id
+            WHERE r.registered_at >= NOW() - (%s * INTERVAL '1 day')
+            ORDER BY r.registered_at DESC LIMIT 1000""",(days,))
+        rows=[dict(x) for x in await cur.fetchall()]
+    for row in rows:
+        for key in ('registered_at','demo_started_at','expires_at'):
+            if row.get(key): row[key]=row[key].isoformat()
+    return json_response({'stats':stats,'registrations':rows,'days':days})
 
 
 async def admin_overview(request):
@@ -2181,6 +2269,8 @@ def make_app():
     app.router.add_post("/api/admin/test-series/{series_id}/publish", admin_publish_test_series)
     app.router.add_post("/api/admin/test-series/{series_id}/entitlement", admin_series_entitlement)
     app.router.add_get("/api/access", access_status)
+    app.router.add_post("/api/demo/register", register_demo)
+    app.router.add_get("/api/admin/demo/registrations", admin_demo_registrations)
     app.router.add_get("/api/admin/overview", admin_overview)
     app.router.add_get("/api/admin/banks", admin_banks)
     app.router.add_post("/api/admin/banks/access", admin_set_bank_access)
