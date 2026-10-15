@@ -5,6 +5,7 @@ Deploy as a separate Render Web Service from the Telegram bot. Shares DATABASE_U
 from __future__ import annotations
 
 import hashlib
+import base64
 import hmac
 import json
 import logging
@@ -60,16 +61,106 @@ def validate_init_data(init_data: str) -> dict:
     return {"id": telegram_id, "first_name": str(user.get("first_name", "Student")), "username": user.get("username")}
 
 
+ADMIN_LOGIN_ID = os.environ.get("ADMIN_LOGIN_ID", "").strip()
+ADMIN_LOGIN_PASSWORD = os.environ.get("ADMIN_LOGIN_PASSWORD", "")
+ADMIN_LOGIN_TELEGRAM_ID = int(os.environ.get("ADMIN_LOGIN_TELEGRAM_ID", "0") or 0)
+ADMIN_SESSION_SECRET = os.environ.get("ADMIN_SESSION_SECRET", "")
+ADMIN_SESSION_COOKIE = "bpsc_nexus_admin_session"
+ADMIN_SESSION_SECONDS = 12 * 60 * 60
+_ADMIN_LOGIN_FAILURES = {}
+
+
+def _admin_session_sign(payload: str) -> str:
+    secret = ADMIN_SESSION_SECRET or BOT_TOKEN
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _make_admin_session(admin_id: int, login_id: str) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps({"id": admin_id, "login": login_id, "exp": int(time.time()) + ADMIN_SESSION_SECONDS}, separators=(",", ":")).encode()).decode().rstrip("=")
+    return payload + "." + _admin_session_sign(payload)
+
+
+def _read_admin_session(token: str):
+    if not token or "." not in token:
+        return None
+    payload, signature = token.rsplit(".", 1)
+    if not hmac.compare_digest(signature, _admin_session_sign(payload)):
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        data = json.loads(raw.decode("utf-8"))
+        admin_id = int(data.get("id", 0))
+        if int(data.get("exp", 0)) < int(time.time()) or admin_id not in ADMIN_TELEGRAM_IDS:
+            return None
+        return {"id": admin_id, "first_name": "Admin", "username": str(data.get("login", "admin")), "_admin_session": True}
+    except Exception:
+        return None
+
+
 @web.middleware
 async def telegram_auth(request: web.Request, handler):
     if not request.path.startswith("/api/"):
         return await handler(request)
+    if request.path in ("/api/admin/login", "/api/admin/logout", "/api/admin/session"):
+        return await handler(request)
+    # A valid password session is authoritative for admin routes, even when the
+    # Mini App was opened by a non-admin Telegram account. Other APIs still use
+    # Telegram's signed initData.
+    if request.path.startswith("/api/admin/") or request.path.startswith("/api/leaderboard/admin/"):
+        admin_user = _read_admin_session(request.cookies.get(ADMIN_SESSION_COOKIE, ""))
+        if admin_user:
+            request["telegram_user"] = admin_user
+            request["admin_session"] = True
+            return await handler(request)
     init_data = request.headers.get("X-Telegram-Init-Data", "")
     try:
         request["telegram_user"] = validate_init_data(init_data)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=401)
     return await handler(request)
+
+
+async def admin_login(request: web.Request):
+    """Create an HttpOnly admin session using Render-configured credentials."""
+    if not ADMIN_LOGIN_ID or not ADMIN_LOGIN_PASSWORD or not ADMIN_LOGIN_TELEGRAM_ID:
+        return json_response({"error": "Admin password login is not configured. Set ADMIN_LOGIN_ID, ADMIN_LOGIN_PASSWORD and ADMIN_LOGIN_TELEGRAM_ID in Render."}, 503)
+    if ADMIN_LOGIN_TELEGRAM_ID not in ADMIN_TELEGRAM_IDS:
+        return json_response({"error": "ADMIN_LOGIN_TELEGRAM_ID must also be included in ADMIN_TELEGRAM_IDS."}, 503)
+    ip = request.remote or "unknown"
+    now = time.time()
+    attempts = [t for t in _ADMIN_LOGIN_FAILURES.get(ip, []) if now - t < 900]
+    if len(attempts) >= 8:
+        _ADMIN_LOGIN_FAILURES[ip] = attempts
+        return json_response({"error": "Too many login attempts. Wait 15 minutes and try again."}, 429)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    login_id = str(data.get("id", "")).strip()
+    password = str(data.get("password", ""))
+    ok = hmac.compare_digest(login_id, ADMIN_LOGIN_ID) and hmac.compare_digest(password, ADMIN_LOGIN_PASSWORD)
+    if not ok:
+        attempts.append(now)
+        _ADMIN_LOGIN_FAILURES[ip] = attempts
+        return json_response({"error": "Invalid admin ID or password."}, 401)
+    _ADMIN_LOGIN_FAILURES.pop(ip, None)
+    response = json_response({"ok": True, "expires_in": ADMIN_SESSION_SECONDS, "admin": True})
+    response.set_cookie(ADMIN_SESSION_COOKIE, _make_admin_session(ADMIN_LOGIN_TELEGRAM_ID, ADMIN_LOGIN_ID), max_age=ADMIN_SESSION_SECONDS,
+                        httponly=True, secure=True, samesite="Strict", path="/")
+    return response
+
+
+async def admin_logout(request: web.Request):
+    response = json_response({"ok": True})
+    response.del_cookie(ADMIN_SESSION_COOKIE, path="/")
+    return response
+
+
+async def admin_session_status(request: web.Request):
+    user = _read_admin_session(request.cookies.get(ADMIN_SESSION_COOKIE, ""))
+    if user:
+        return json_response({"authenticated": True, "login_id": user.get("username"), "expires_in": ADMIN_SESSION_SECONDS})
+    return json_response({"authenticated": False})
 
 
 def json_response(payload, status=200):
@@ -708,6 +799,7 @@ async def _write_admin_audit(conn, admin_id: int, action: str, target: str, deta
 async def ensure_access_schema(conn):
     """Additive demo and paywall migrations; does not reset existing content."""
     await conn.execute("ALTER TABLE bank_quizzes ADD COLUMN IF NOT EXISTS access_type VARCHAR(12) NOT NULL DEFAULT 'inherit'")
+    await conn.execute("ALTER TABLE bank_quizzes ADD COLUMN IF NOT EXISTS admin_hidden BOOLEAN NOT NULL DEFAULT FALSE")
     await conn.execute("ALTER TABLE question_bank_subjects ADD COLUMN IF NOT EXISTS access_type VARCHAR(12) NOT NULL DEFAULT 'free'")
     await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_demo_config (
         singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK(singleton=TRUE),
@@ -753,6 +845,20 @@ async def _has_all_access_pass(conn, telegram_id: int) -> bool:
           AND (pp.expires_at IS NULL OR pp.expires_at>NOW())
           AND (pp.pass_code IN ('all_access','legacy') OR pp.vault_keys @> ARRAY['*']::TEXT[])
     ) AS ok""", (telegram_id,))
+    return bool((await cur.fetchone())['ok'])
+
+
+async def _has_subject_entitlement(conn, telegram_id: int, subject: str) -> bool:
+    """Check an active pass for this exact bank subject or an all-access pass."""
+    normalized=re.sub(r'[^a-z0-9]+','',str(subject or '').lower())
+    if not normalized: return False
+    cur=await conn.execute("""SELECT EXISTS(
+        SELECT 1 FROM app_users u JOIN premium_passes pp ON pp.user_id=u.id
+        WHERE u.telegram_id=%s AND pp.revoked_at IS NULL AND (pp.expires_at IS NULL OR pp.expires_at>NOW())
+          AND (pp.pass_code IN ('all_access','legacy') OR pp.vault_keys @> ARRAY['*']::TEXT[]
+            OR EXISTS(SELECT 1 FROM unnest(pp.vault_keys) k WHERE regexp_replace(lower(k),'[^a-z0-9]','','g')=%s)
+            OR regexp_replace(lower(pp.pass_code),'[^a-z0-9]','','g')=%s)
+    ) AS ok""",(telegram_id,normalized,normalized))
     return bool((await cur.fetchone())['ok'])
 
 
@@ -871,6 +977,148 @@ async def admin_set_series_access(request):
     return json_response({'series':dict(row),'updated':True})
 
 
+async def admin_cleanup_catalog(request):
+    """Return subject/test/series records for safe cleanup in the Mini App."""
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    await qb.ensure_schema(request.app['pool'])
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        await ensure_test_series_schema(conn)
+        cur=await conn.execute("""WITH subject_names AS (
+                SELECT id,name,subject_type,archived_at FROM question_bank_subjects
+                UNION ALL
+                SELECT NULL::BIGINT, q.subject, 'subject'::TEXT, NULL::TIMESTAMPTZ
+                FROM (SELECT DISTINCT subject FROM question_bank WHERE NULLIF(BTRIM(subject),'') IS NOT NULL) q
+                WHERE NOT EXISTS (SELECT 1 FROM question_bank_subjects s WHERE LOWER(BTRIM(s.name))=LOWER(BTRIM(q.subject)))
+            )
+            SELECT n.id,n.name,n.subject_type,(n.archived_at IS NOT NULL) AS archived,
+                COALESCE(qc.ready_questions,0) AS ready_questions,COALESCE(qc.total_questions,0) AS total_questions,
+                COALESCE(qc.snapshot_count,0) AS snapshot_count,
+                COALESCE(qc.quiz_count,0) AS quiz_count,COALESCE(qc.series_count,0) AS series_count
+            FROM subject_names n
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*) FILTER (WHERE qb.status='ready') AS ready_questions,
+                    COUNT(*) AS total_questions,
+                    (SELECT COUNT(*) FROM bank_quiz_attempt_question_snapshots ss WHERE LOWER(BTRIM(ss.subject))=LOWER(BTRIM(n.name))) AS snapshot_count,
+                    (SELECT COUNT(DISTINCT q.id) FROM bank_quizzes q WHERE LOWER(BTRIM(q.subject))=LOWER(BTRIM(n.name))) AS quiz_count,
+                    (SELECT COUNT(*) FROM bpsc_nexus_test_series ts WHERE LOWER(BTRIM(ts.subject))=LOWER(BTRIM(n.name))) AS series_count
+                FROM question_bank qb WHERE LOWER(BTRIM(qb.subject))=LOWER(BTRIM(n.name))
+            ) qc ON TRUE
+            ORDER BY (COALESCE(qc.ready_questions,0)=0) DESC,LOWER(n.name),n.name""")
+        subjects=[dict(r) for r in await cur.fetchall()]
+        cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.is_published,q.admin_hidden,
+                COALESCE(qc.ready_questions,0) AS ready_questions,COALESCE(qc.linked_questions,0) AS linked_questions,
+                COALESCE(at.attempt_count,0) AS attempt_count,COALESCE(ch.challenge_count,0) AS challenge_count,
+                COALESCE(st.series_count,0) AS series_count
+            FROM bank_quizzes q
+            LEFT JOIN LATERAL (SELECT COUNT(DISTINCT qb.id) FILTER (WHERE qb.status='ready') AS ready_questions,
+                COUNT(DISTINCT qq.question_id) AS linked_questions FROM bank_quiz_questions qq
+                LEFT JOIN question_bank qb ON qb.id=qq.question_id WHERE qq.quiz_id=q.id) qc ON TRUE
+            LEFT JOIN LATERAL (SELECT COUNT(*) AS attempt_count FROM bank_quiz_attempts a WHERE a.quiz_id=q.id) at ON TRUE
+            LEFT JOIN LATERAL (SELECT COUNT(*) AS challenge_count FROM bpsc_leaderboard_daily_challenges c WHERE c.quiz_id=q.id) ch ON TRUE
+            LEFT JOIN LATERAL (SELECT COUNT(*) AS series_count FROM bpsc_nexus_test_series_tests st WHERE st.quiz_id=q.id) st ON TRUE
+            ORDER BY (COALESCE(qc.ready_questions,0)=0) DESC,q.id DESC LIMIT 500""")
+        quizzes=[dict(r) for r in await cur.fetchall()]
+        cur=await conn.execute("SELECT to_regclass('public.group_quiz_sessions') AS table_name")
+        group_table=await cur.fetchone()
+        if group_table and group_table['table_name']:
+            cur=await conn.execute("SELECT quiz_id,COUNT(*) AS n FROM group_quiz_sessions GROUP BY quiz_id")
+            group_refs={int(r['quiz_id']):int(r['n']) for r in await cur.fetchall()}
+            for item in quizzes: item['group_session_count']=group_refs.get(int(item['id']),0)
+        else:
+            for item in quizzes: item['group_session_count']=0
+        cur=await conn.execute("""SELECT s.id,s.title,s.exam_type,s.is_published,
+                COUNT(DISTINCT st.quiz_id) AS linked_tests,
+                COUNT(DISTINCT st.quiz_id) FILTER (WHERE q.is_published=TRUE AND COALESCE(q.admin_hidden,FALSE)=FALSE AND EXISTS (
+                    SELECT 1 FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
+                    WHERE qq.quiz_id=q.id AND qb.status='ready')) AS ready_tests
+            FROM bpsc_nexus_test_series s LEFT JOIN bpsc_nexus_test_series_tests st ON st.series_id=s.id
+            LEFT JOIN bank_quizzes q ON q.id=st.quiz_id GROUP BY s.id ORDER BY (COUNT(DISTINCT st.quiz_id)=0) DESC,s.id DESC LIMIT 300""")
+        series=[dict(r) for r in await cur.fetchall()]
+    return json_response({'subjects':subjects,'quizzes':quizzes,'series':series})
+
+
+async def admin_remove_subject(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try:
+        body=await request.json(); name=str(body.get('name') or '').strip(); action=str(body.get('action') or '').lower()
+        if not name or len(name)>180 or action not in ('archive','delete','restore'): raise ValueError()
+    except Exception: return json_response({'error':'Choose a valid subject and action.'},400)
+    await qb.ensure_schema(request.app['pool'])
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        await ensure_test_series_schema(conn)
+        if action=='restore':
+            cur=await conn.execute("UPDATE question_bank_subjects SET archived_at=NULL WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) RETURNING id,name",(name,)); row=await cur.fetchone()
+            if not row:return json_response({'error':'Registered subject not found to restore.'},404)
+            await _write_admin_audit(conn,admin['id'],'subject_restore',row['name'],{})
+            return json_response({'name':row['name'],'action':'restore','success':True})
+        cur=await conn.execute("""SELECT COUNT(*) FILTER (WHERE status='ready') AS ready_count,COUNT(*) AS total_count
+            FROM question_bank WHERE LOWER(BTRIM(subject))=LOWER(BTRIM(%s))""",(name,)); counts=dict(await cur.fetchone())
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quizzes WHERE LOWER(BTRIM(subject))=LOWER(BTRIM(%s))",(name,)); quiz_count=int((await cur.fetchone())['n'])
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_attempt_question_snapshots WHERE LOWER(BTRIM(subject))=LOWER(BTRIM(%s))",(name,)); snapshot_count=int((await cur.fetchone())['n'])
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_test_series WHERE LOWER(BTRIM(subject))=LOWER(BTRIM(%s))",(name,)); series_count=int((await cur.fetchone())['n'])
+        if action=='delete':
+            if int(counts['total_count'] or 0) or quiz_count or snapshot_count or series_count:
+                return json_response({'error':'This subject still has questions, quizzes, historical attempts or test-series references. Archive it instead; no data was deleted.','ready_questions':int(counts['ready_count'] or 0),'total_questions':int(counts['total_count'] or 0),'quizzes':quiz_count,'history_records':snapshot_count,'series':series_count},409)
+            cur=await conn.execute("DELETE FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) RETURNING name",(name,)); row=await cur.fetchone()
+            if not row:return json_response({'error':'Empty subject record not found.'},404)
+            await _write_admin_audit(conn,admin['id'],'subject_delete',row['name'],{'questions':0})
+            return json_response({'name':row['name'],'action':'delete','success':True})
+        # Archiving is reversible and never deletes questions or attempts.
+        cur=await conn.execute("UPDATE question_bank_subjects SET archived_at=NOW() WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) RETURNING name",(name,)); row=await cur.fetchone()
+        if not row:
+            cur=await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id,subject_type,access_type,archived_at) VALUES(%s,%s,'subject','free',NOW()) RETURNING name",(name,admin['id'])); row=await cur.fetchone()
+        await _write_admin_audit(conn,admin['id'],'subject_archive',row['name'],{'ready_questions':int(counts['ready_count'] or 0),'total_questions':int(counts['total_count'] or 0)})
+    return json_response({'name':row['name'],'action':'archive','success':True,'questions_preserved':int(counts['total_count'] or 0)})
+
+
+async def admin_remove_quiz(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try: qid=int(request.match_info['quiz_id']); body=await request.json(); action=str(body.get('action') or '').lower()
+    except Exception: return json_response({'error':'Invalid test action.'},400)
+    if action not in ('archive','restore','delete'): return json_response({'error':'Action must be archive, restore or delete.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("SELECT id,title,is_published,admin_hidden FROM bank_quizzes WHERE id=%s",(qid,)); quiz=await cur.fetchone()
+        if not quiz:return json_response({'error':'Test not found.'},404)
+        if action=='archive':
+            await conn.execute("UPDATE bank_quizzes SET admin_hidden=TRUE WHERE id=%s",(qid,))
+            await _write_admin_audit(conn,admin['id'],'quiz_archive',str(qid),{'title':quiz['title']})
+            return json_response({'id':qid,'title':quiz['title'],'action':'archive','success':True})
+        if action=='restore':
+            await conn.execute("UPDATE bank_quizzes SET admin_hidden=FALSE WHERE id=%s",(qid,))
+            await _write_admin_audit(conn,admin['id'],'quiz_restore',str(qid),{'title':quiz['title']})
+            return json_response({'id':qid,'title':quiz['title'],'action':'restore','success':True})
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_attempts WHERE quiz_id=%s",(qid,)); attempts=int((await cur.fetchone())['n'])
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_leaderboard_daily_challenges WHERE quiz_id=%s",(qid,)); challenges=int((await cur.fetchone())['n'])
+        cur=await conn.execute("SELECT to_regclass('public.group_quiz_sessions') AS table_name")
+        group_table=await cur.fetchone(); group_sessions=0
+        if group_table and group_table['table_name']:
+            cur=await conn.execute("SELECT COUNT(*) AS n FROM group_quiz_sessions WHERE quiz_id=%s",(qid,)); group_sessions=int((await cur.fetchone())['n'])
+        if attempts or challenges or group_sessions:
+            return json_response({'error':'This test has attempt history, leaderboard challenges or Telegram group-quiz references. Archive it to remove it from student navigation while preserving records.','attempts':attempts,'challenges':challenges,'group_sessions':group_sessions},409)
+        await conn.execute("DELETE FROM bank_quizzes WHERE id=%s",(qid,))
+        await _write_admin_audit(conn,admin['id'],'quiz_delete',str(qid),{'title':quiz['title'],'attempts':0})
+    return json_response({'id':qid,'title':quiz['title'],'action':'delete','success':True})
+
+
+async def admin_remove_series(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try: sid=int(request.match_info['series_id'])
+    except Exception:return json_response({'error':'Invalid test-series ID.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_test_series_schema(conn)
+        cur=await conn.execute("DELETE FROM bpsc_nexus_test_series WHERE id=%s RETURNING id,title",(sid,)); row=await cur.fetchone()
+        if not row:return json_response({'error':'Test series not found.'},404)
+        await _write_admin_audit(conn,admin['id'],'series_delete',str(sid),{'title':row['title']})
+    return json_response({'id':sid,'title':row['title'],'success':True})
+
+
 async def admin_demo_settings(request):
     user=request['telegram_user']
     if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
@@ -900,6 +1148,381 @@ async def admin_demo_grant(request):
     return json_response({'telegram_id':target,'duration_hours':hours,'granted':True})
 
 
+async def _admin_payment_rows(conn, status: str, limit: int = 50):
+    await payment_schema(conn)
+    if status not in ('pending','approved','rejected','all'):
+        status='pending'
+    if status == 'all':
+        cur=await conn.execute("""SELECT id,telegram_id,product_code,product_name,duration_days,amount_inr,transaction_ref,status,submitted_at,reviewed_at,reviewed_by,review_note,activated_pass_id
+            FROM bpsc_payment_requests ORDER BY submitted_at DESC LIMIT %s""",(limit,))
+    else:
+        cur=await conn.execute("""SELECT id,telegram_id,product_code,product_name,duration_days,amount_inr,transaction_ref,status,submitted_at,reviewed_at,reviewed_by,review_note,activated_pass_id
+            FROM bpsc_payment_requests WHERE status=%s ORDER BY submitted_at ASC LIMIT %s""",(status,limit))
+    rows=[]
+    for r in await cur.fetchall():
+        d=dict(r)
+        for k in ('submitted_at','reviewed_at'):
+            if d.get(k): d[k]=d[k].isoformat()
+        rows.append(d)
+    return rows
+
+
+async def admin_payments(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    status=str(request.query.get('status','pending')).lower()
+    async with request.app['pool'].connection() as conn:
+        rows=await _admin_payment_rows(conn,status,100)
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_payment_requests WHERE status='pending'")
+        pending=int((await cur.fetchone())['n'])
+    return json_response({'requests':rows,'pending_count':pending,'status':status})
+
+
+async def admin_payment_detail(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try: rid=int(request.match_info['request_id'])
+    except ValueError: return json_response({'error':'Invalid payment request ID.'},400)
+    async with request.app['pool'].connection() as conn:
+        await payment_schema(conn)
+        cur=await conn.execute("SELECT * FROM bpsc_payment_requests WHERE id=%s",(rid,)); r=await cur.fetchone()
+    if not r: return json_response({'error':'Payment request not found.'},404)
+    d=dict(r)
+    for k in ('submitted_at','reviewed_at'):
+        if d.get(k): d[k]=d[k].isoformat()
+    return json_response({'request':d})
+
+
+async def _notify_telegram_user(telegram_id: int, message: str):
+    token=os.environ.get('BOT_TOKEN','').strip()
+    if not token: return
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f'https://api.telegram.org/bot{token}/sendMessage',json={'chat_id':int(telegram_id),'text':message},timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                await resp.read()
+    except Exception:
+        log.warning('Could not send Mini App admin notification to Telegram user %s',telegram_id)
+
+
+async def admin_review_payment(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try:
+        rid=int(request.match_info['request_id']); body=await request.json(); action=str(body.get('action','')).lower(); note=str(body.get('note','')).strip()[:500]
+        if action not in ('approve','reject'): raise ValueError()
+    except Exception: return json_response({'error':'Choose approve or reject and provide a valid request ID.'},400)
+    result_message=''
+    async with request.app['pool'].connection() as conn:
+        await payment_schema(conn)
+        async with conn.transaction():
+            cur=await conn.execute('SELECT * FROM bpsc_payment_requests WHERE id=%s FOR UPDATE',(rid,)); r=await cur.fetchone()
+            if not r: return json_response({'error':'Payment request not found.'},404)
+            if r['status']!='pending': return json_response({'error':f"This request was already {r['status']}."},409)
+            if action=='reject':
+                await conn.execute("UPDATE bpsc_payment_requests SET status='rejected',reviewed_at=NOW(),reviewed_by=%s,review_note=%s WHERE id=%s",(admin['id'],note or 'Rejected in Mini App Admin Console',rid))
+                await _write_admin_audit(conn,admin['id'],'payment_reject',str(rid),{'telegram_id':r['telegram_id'],'product_code':r['product_code'],'note':note})
+                result_message=f"Your BPSC Nexus payment request #{rid} for {r['product_name']} was rejected. Please contact an admin if you believe this is an error."
+                pass_id=None
+            else:
+                cur=await conn.execute('SELECT id FROM app_users WHERE telegram_id=%s',(r['telegram_id'],)); app_user=await cur.fetchone()
+                if not app_user: return json_response({'error':'The student is not registered yet. Ask them to open the Mini App once, then retry.'},409)
+                product_code=str(r['product_code'] or 'all_access')
+                if product_code=='all_access':
+                    cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code='all_access' AND is_active=TRUE"); cat=await cur.fetchone()
+                    if not cat: return json_response({'error':'All-Access pass is missing or inactive in pass_catalogue.'},500)
+                    cur=await conn.execute("SELECT MAX(expires_at) AS expiry FROM premium_passes WHERE user_id=%s AND pass_code='all_access' AND revoked_at IS NULL AND expires_at>NOW()",(app_user['id'],)); expiry=(await cur.fetchone())['expiry']
+                    cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys)
+                        VALUES(%s,%s,%s,COALESCE(%s,NOW()),COALESCE(%s,NOW())+(%s*INTERVAL '1 day'),%s,'all_access',ARRAY['*']::TEXT[]) RETURNING id""",
+                        (app_user['id'],cat['id'],admin['id'],expiry,expiry,int(r['duration_days']),f"Mini App UPI payment #{rid}; ₹{r['amount_inr']}"))
+                    pass_id=int((await cur.fetchone())['id'])
+                    result_message=f"✅ Your BPSC Nexus payment is approved. All Access for {r['duration_days']} days is now active."
+                else:
+                    cur=await conn.execute("SELECT product_code,product_name,entitlement_key,duration_days FROM bpsc_individual_products WHERE product_code=%s",(product_code,)); product=await cur.fetchone()
+                    if not product: return json_response({'error':'Purchased product no longer exists in the product catalogue; no access was granted.'},409)
+                    await conn.execute("INSERT INTO pass_catalogue(pass_code,pass_name,description,is_active) VALUES(%s,%s,%s,TRUE) ON CONFLICT(pass_code) DO UPDATE SET pass_name=EXCLUDED.pass_name,is_active=TRUE",(product['product_code'],product['product_name'],f"Individual entitlement: {product['entitlement_key']}"))
+                    cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code=%s AND is_active=TRUE",(product['product_code'],)); cat=await cur.fetchone()
+                    # Lifetime individual products create a dedicated pass for that product only.
+                    cur=await conn.execute("""INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,expires_at,note,pass_code,vault_keys)
+                        VALUES(%s,%s,%s,NULL,%s,%s,ARRAY[%s]::TEXT[]) RETURNING id""",
+                        (app_user['id'],cat['id'],admin['id'],f"Mini App UPI payment #{rid}; ₹{r['amount_inr']}",product['product_code'],product['entitlement_key']))
+                    pass_id=int((await cur.fetchone())['id'])
+                    result_message=f"✅ Your BPSC Nexus payment is approved. {product['product_name']} access is now active."
+                await conn.execute("UPDATE bpsc_payment_requests SET status='approved',reviewed_at=NOW(),reviewed_by=%s,review_note=%s,activated_pass_id=%s WHERE id=%s",(admin['id'],note or 'Approved in Mini App Admin Console',pass_id,rid))
+                await _write_admin_audit(conn,admin['id'],'payment_approve',str(rid),{'telegram_id':r['telegram_id'],'product_code':product_code,'pass_id':pass_id,'note':note})
+    if action=='reject': result_message=f"Your BPSC Nexus payment request #{rid} for {r['product_name']} was rejected. Please contact an admin if you believe this is an error."
+    await _notify_telegram_user(int(r['telegram_id']),result_message)
+    return json_response({'request_id':rid,'status':'approved' if action=='approve' else 'rejected','activated_pass_id':pass_id if action=='approve' else None,'updated':True})
+
+
+async def admin_members_search(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    query=str(request.query.get('q','')).strip()[:100]
+    if not query: return json_response({'members':[]})
+    async with request.app['pool'].connection() as conn:
+        if query.isdigit():
+            cur=await conn.execute("""SELECT u.id,u.telegram_id,u.first_name,u.username,
+                COUNT(pp.id) FILTER(WHERE pp.revoked_at IS NULL AND (pp.expires_at IS NULL OR pp.expires_at>NOW())) AS active_passes
+                FROM app_users u LEFT JOIN premium_passes pp ON pp.user_id=u.id WHERE u.telegram_id=%s GROUP BY u.id LIMIT 20""",(int(query),))
+        else:
+            pattern='%'+query.replace('%','\\%').replace('_','\\_')+'%'
+            cur=await conn.execute("""SELECT u.id,u.telegram_id,u.first_name,u.username,
+                COUNT(pp.id) FILTER(WHERE pp.revoked_at IS NULL AND (pp.expires_at IS NULL OR pp.expires_at>NOW())) AS active_passes
+                FROM app_users u LEFT JOIN premium_passes pp ON pp.user_id=u.id
+                WHERE COALESCE(u.first_name,'') ILIKE %s OR COALESCE(u.username,'') ILIKE %s OR CAST(u.telegram_id AS TEXT) ILIKE %s
+                GROUP BY u.id ORDER BY u.telegram_id DESC LIMIT 50""",(pattern,pattern,pattern))
+        rows=[dict(r) for r in await cur.fetchall()]
+    return json_response({'members':rows})
+
+
+async def admin_member_detail(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try: target=int(request.match_info['telegram_id'])
+    except ValueError: return json_response({'error':'Invalid Telegram ID.'},400)
+    async with request.app['pool'].connection() as conn:
+        cur=await conn.execute("SELECT id,telegram_id,first_name,username FROM app_users WHERE telegram_id=%s",(target,)); member=await cur.fetchone()
+        if not member: return json_response({'error':'Student not found. Ask them to open the Mini App once.'},404)
+        cur=await conn.execute("""SELECT pp.id,pp.pass_code,pp.vault_keys,pp.granted_at,pp.expires_at,pp.revoked_at,pp.note,pp.granted_by_telegram_id
+            FROM premium_passes pp WHERE pp.user_id=%s ORDER BY pp.granted_at DESC LIMIT 100""",(member['id'],)); passes=[]
+        for r in await cur.fetchall():
+            d=dict(r)
+            for k in ('granted_at','expires_at','revoked_at'):
+                if d.get(k): d[k]=d[k].isoformat()
+            passes.append(d)
+        cur=await conn.execute("SELECT started_at,expires_at FROM bpsc_nexus_demo_trials WHERE telegram_id=%s",(target,)); trial=await cur.fetchone()
+    demo=dict(trial) if trial else None
+    if demo:
+        for k in ('started_at','expires_at'):
+            if demo.get(k): demo[k]=demo[k].isoformat()
+    return json_response({'member':dict(member),'passes':passes,'demo':demo})
+
+
+async def admin_member_grant(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try:
+        body=await request.json(); target=int(body.get('telegram_id')); code=str(body.get('pass_code','')).strip().lower(); days=int(body.get('duration_days',0)); note=str(body.get('note','Admin grant from Mini App'))[:500]; selected_keys=body.get('vault_keys') or []
+        if target<=0 or not re.fullmatch(r'[a-z0-9_]{2,80}',code) or days not in (0,7,30,60,90,120,180,249,365): raise ValueError()
+        if code=='dual_vault':
+            allowed_keys={'bpsc_pyq','ghatnachakra_pyq','upsc_pyq'}; selected_keys=list(dict.fromkeys(str(k) for k in selected_keys if str(k) in allowed_keys))
+            if len(selected_keys)!=2: raise ValueError('Dual Vault requires exactly two different vaults.')
+    except Exception: return json_response({'error':'Choose a valid member, pass and duration.'},400)
+    async with request.app['pool'].connection() as conn:
+        async with conn.transaction():
+            cur=await conn.execute('SELECT id FROM app_users WHERE telegram_id=%s',(target,)); member=await cur.fetchone()
+            if not member: return json_response({'error':'Student not found. Ask them to open the Mini App once.'},404)
+            if code=='all_access':
+                cur=await conn.execute("SELECT id FROM pass_catalogue WHERE pass_code='all_access' AND is_active=TRUE"); cat=await cur.fetchone()
+                if not cat: return json_response({'error':'All-Access pass missing from catalogue.'},500)
+                cur=await conn.execute("SELECT MAX(expires_at) AS expiry FROM premium_passes WHERE user_id=%s AND pass_code='all_access' AND revoked_at IS NULL AND expires_at>NOW()",(member['id'],)); expiry=(await cur.fetchone())['expiry']
+                expires_sql="COALESCE(%s,NOW())+(%s*INTERVAL '1 day')" if days else 'NULL'
+                if days:
+                    cur=await conn.execute(f"INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,expires_at,note,pass_code,vault_keys) VALUES(%s,%s,%s,{expires_sql},%s,'all_access',ARRAY['*']::TEXT[]) RETURNING id",(member['id'],cat['id'],admin['id'],expiry,days,note))
+                else:
+                    cur=await conn.execute("INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,expires_at,note,pass_code,vault_keys) VALUES(%s,%s,%s,NULL,%s,'all_access',ARRAY['*']::TEXT[]) RETURNING id",(member['id'],cat['id'],admin['id'],note))
+            else:
+                cur=await conn.execute("SELECT product_code,product_name,entitlement_key FROM bpsc_individual_products WHERE product_code=%s AND is_active=TRUE",(code,)); product=await cur.fetchone()
+                if product:
+                    await conn.execute("INSERT INTO pass_catalogue(pass_code,pass_name,description,is_active) VALUES(%s,%s,%s,TRUE) ON CONFLICT(pass_code) DO UPDATE SET pass_name=EXCLUDED.pass_name,is_active=TRUE",(code,product['product_name'],f"Individual entitlement: {product['entitlement_key']}"))
+                    cur=await conn.execute("SELECT id,pass_name FROM pass_catalogue WHERE pass_code=%s",(code,)); cat=await cur.fetchone(); vault_keys=[str(product['entitlement_key'])]
+                else:
+                    cur=await conn.execute("SELECT id,pass_name FROM pass_catalogue WHERE pass_code=%s AND is_active=TRUE",(code,)); cat=await cur.fetchone()
+                    vault_keys=selected_keys if code=='dual_vault' else [code]
+                if not cat: return json_response({'error':'Unknown or inactive pass code.'},404)
+                if code=='dual_vault' and len(vault_keys)!=2: return json_response({'error':'Dual Vault requires exactly two different vaults.'},400)
+                if days:
+                    cur=await conn.execute("INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,expires_at,note,pass_code,vault_keys) VALUES(%s,%s,%s,NOW()+(%s*INTERVAL '1 day'),%s,%s,%s) RETURNING id",(member['id'],cat['id'],admin['id'],days,note,code,vault_keys))
+                else:
+                    cur=await conn.execute("INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,expires_at,note,pass_code,vault_keys) VALUES(%s,%s,%s,NULL,%s,%s,%s) RETURNING id",(member['id'],cat['id'],admin['id'],note,code,vault_keys))
+            pass_id=int((await cur.fetchone())['id'])
+            await _write_admin_audit(conn,admin['id'],'member_pass_grant',str(target),{'pass_id':pass_id,'pass_code':code,'duration_days':days,'note':note})
+    return json_response({'granted':True,'pass_id':pass_id,'telegram_id':target})
+
+
+async def admin_pass_revoke(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try: pid=int(request.match_info['pass_id'])
+    except ValueError: return json_response({'error':'Invalid pass ID.'},400)
+    async with request.app['pool'].connection() as conn:
+        cur=await conn.execute("UPDATE premium_passes SET revoked_at=NOW(),revoked_by_telegram_id=%s WHERE id=%s AND revoked_at IS NULL RETURNING user_id,pass_code",(admin['id'],pid)); row=await cur.fetchone()
+        if not row: return json_response({'error':'Pass not found or already revoked.'},404)
+        cur=await conn.execute("SELECT telegram_id FROM app_users WHERE id=%s",(row['user_id'],)); member=await cur.fetchone()
+        await _write_admin_audit(conn,admin['id'],'pass_revoke',str(pid),{'telegram_id':member['telegram_id'] if member else None,'pass_code':row['pass_code']})
+    return json_response({'revoked':True,'pass_id':pid,'telegram_id':member['telegram_id'] if member else None})
+
+
+async def admin_pass_extend(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try: pid=int(request.match_info['pass_id']); body=await request.json(); days=int(body.get('days'))
+    except Exception: return json_response({'error':'Provide a valid pass ID and number of days.'},400)
+    if days<1 or days>3650: return json_response({'error':'Extension must be between 1 and 3650 days.'},400)
+    async with request.app['pool'].connection() as conn:
+        cur=await conn.execute("UPDATE premium_passes SET expires_at=GREATEST(COALESCE(expires_at,NOW()),NOW())+(%s*INTERVAL '1 day') WHERE id=%s AND revoked_at IS NULL AND expires_at IS NOT NULL RETURNING user_id,pass_code",(days,pid)); row=await cur.fetchone()
+        if not row: return json_response({'error':'Pass is revoked, permanent, or not found. Revoke/grant a replacement if needed.'},404)
+        cur=await conn.execute("SELECT telegram_id FROM app_users WHERE id=%s",(row['user_id'],)); member=await cur.fetchone()
+        await _write_admin_audit(conn,admin['id'],'pass_extend',str(pid),{'days':days,'telegram_id':member['telegram_id'] if member else None})
+    return json_response({'extended':True,'pass_id':pid,'days':days})
+
+
+async def admin_import_subjects(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    async with request.app['pool'].connection() as conn:
+        await qb.ensure_schema(request.app['pool'])
+        cur=await conn.execute("SELECT name,subject_type FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name),name")
+        rows=[dict(r) for r in await cur.fetchall()]
+    return json_response({'subjects':rows})
+
+
+async def admin_create_import_subject(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try:
+        body=await request.json(); name=str(body.get('name','')).strip(); kind=str(body.get('subject_type','subject')).lower()
+        if not name or len(name)>100 or kind not in ('subject','collection'): raise ValueError()
+    except Exception: return json_response({'error':'Enter a name up to 100 characters and choose subject or collection.'},400)
+    await qb.ensure_schema(request.app['pool'])
+    async with request.app['pool'].connection() as conn:
+        try:
+            await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id,subject_type,access_type) VALUES(%s,%s,%s,'free')",(name,admin['id'],kind))
+        except Exception as e:
+            if 'unique' in str(e).lower(): return json_response({'error':'A subject or collection with this name already exists.'},409)
+            raise
+        await _write_admin_audit(conn,admin['id'],'import_subject_create',name,{'subject_type':kind})
+    return json_response({'name':name,'subject_type':kind,'created':True},201)
+
+
+async def admin_bulk_import(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try:
+        form=await request.multipart(); fields={}; upload=None
+        async for part in form:
+            if part.name=='file': upload=part
+            else: fields[part.name]=(await part.text())
+        if upload is None: return json_response({'error':'Choose an HTML, JSON or CSV question file.'},400)
+        filename=str(upload.filename or 'questions.csv').replace('\\','/').split('/')[-1][:180]
+        raw=await upload.read(decode=False)
+        if not raw: return json_response({'error':'The selected file is empty.'},400)
+        if len(raw)>20*1024*1024: return json_response({'error':'Import files are limited to 20 MB.'},413)
+        subject=str(fields.get('subject','')).strip()
+        if not subject: return json_response({'error':'Choose the destination subject/collection.'},400)
+        records,diag=qb.parse_file(filename,raw,subject,int(admin['id']))
+        match=re.search(r'invalid=(\d+)',diag); invalid=int(match.group(1)) if match else 0
+        file_type=filename.rsplit('.',1)[-1].lower() if '.' in filename else 'unknown'
+        result=await qb.import_records(request.app['pool'],records,int(admin['id']),filename,file_type,subject,invalid)
+        async with request.app['pool'].connection() as conn:
+            await _write_admin_audit(conn,admin['id'],'bulk_question_import',filename,result)
+        return json_response({'result':result,'filename':filename},201)
+    except ValueError as e: return json_response({'error':str(e)},400)
+    except Exception as e:
+        log.exception('Mini App bulk question import failed')
+        return json_response({'error':'Import failed safely. Check that the file uses the supported template and the destination subject still exists.'},500)
+
+
+async def admin_questions_search(request):
+    if not _is_series_admin(request['telegram_user']): return json_response({'error':'Admin access required.'},403)
+    query=str(request.query.get('q','')).strip()[:250]
+    subject=str(request.query.get('subject','')).strip()[:150]
+    status=str(request.query.get('status','all')).lower()
+    if status not in {'all','ready','pending','archived'}: status='all'
+    try: limit=max(1,min(50,int(request.query.get('limit','25'))))
+    except ValueError: limit=25
+    conditions=[]; params=[]
+    if query:
+        if query.isdigit(): conditions.append('q.id=%s'); params.append(int(query))
+        else:
+            conditions.append("(q.question_en ILIKE %s OR COALESCE(q.question_hi,'') ILIKE %s OR COALESCE(q.topic,'') ILIKE %s OR q.subject ILIKE %s)")
+            like='%'+query.replace('%','\\%').replace('_','\\_')+'%'; params.extend([like,like,like,like])
+    if subject: conditions.append('q.subject=%s'); params.append(subject)
+    if status!='all': conditions.append('q.status=%s'); params.append(status)
+    where=(' WHERE '+' AND '.join(conditions)) if conditions else ''
+    async with request.app['pool'].connection() as conn:
+        cur=await conn.execute(f"SELECT q.id,q.question_en,q.question_hi,q.subject,q.topic,q.status,q.correct_option,q.options FROM question_bank q{where} ORDER BY q.id DESC LIMIT %s",tuple(params+[limit]))
+        rows=[]
+        for r in await cur.fetchall():
+            d=dict(r); opts=d.get('options') or {}; d['options']=opts if isinstance(opts,dict) else json.loads(opts); d['id']=int(d['id']); rows.append(d)
+    return json_response({'questions':rows,'count':len(rows)})
+
+async def admin_question_detail(request):
+    if not _is_series_admin(request['telegram_user']): return json_response({'error':'Admin access required.'},403)
+    try: qid=int(request.match_info['question_id'])
+    except ValueError: return json_response({'error':'Invalid question ID.'},400)
+    async with request.app['pool'].connection() as conn:
+        cur=await conn.execute("SELECT id,question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status FROM question_bank WHERE id=%s",(qid,)); r=await cur.fetchone()
+    if not r: return json_response({'error':'Question not found.'},404)
+    d=dict(r)
+    for key in ('question_structure','question_flags','options'):
+        if not isinstance(d.get(key),dict): d[key]=json.loads(d.get(key) or '{}')
+    return json_response({'question':d})
+
+async def admin_question_update(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try:
+        qid=int(request.match_info['question_id']); body=await request.json()
+        q_en=str(body.get('question_en','')).strip(); q_hi=str(body.get('question_hi','')).strip(); options=body.get('options')
+        if not isinstance(options,dict): raise ValueError('Options must be an object with A, B, C and D keys.')
+        normalized={str(k).upper():str(v).strip() for k,v in options.items() if str(k).upper() in {'A','B','C','D','E'} and str(v).strip()}
+        if not q_en: raise ValueError('English question text is required.')
+        if len(normalized)<2: raise ValueError('At least two non-empty options are required.')
+        correct=str(body.get('correct_option') or '').upper().strip() or None
+        if correct and correct not in normalized: raise ValueError('Correct answer must match one of the supplied option keys.')
+        status=str(body.get('status','pending')).lower()
+        if status not in {'ready','pending','archived'}: raise ValueError('Choose ready, pending or archived status.')
+        if status=='ready' and not correct: raise ValueError('A ready question must have a correct answer.')
+        subject=str(body.get('subject','')).strip(); topic=str(body.get('topic','')).strip()[:250]
+        if not subject: raise ValueError('Choose a subject/collection.')
+        explanation_en=str(body.get('explanation_en','')).strip(); explanation_hi=str(body.get('explanation_hi','')).strip(); source=str(body.get('source','')).strip()[:500]; source_url=str(body.get('source_url','')).strip()[:1000]; attribution=str(body.get('attribution','')).strip()[:500]
+        digest=hashlib.sha256((q_en.casefold()+'|'+json.dumps(normalized,ensure_ascii=False,sort_keys=True)+'|'+str(correct or '')).encode('utf-8')).hexdigest()
+    except ValueError as e: return json_response({'error':str(e)},400)
+    except Exception: return json_response({'error':'Invalid question payload.'},400)
+    async with request.app['pool'].connection() as conn:
+        async with conn.transaction():
+            cur=await conn.execute("SELECT id FROM question_bank_subjects WHERE name=%s AND archived_at IS NULL",(subject,))
+            if not await cur.fetchone(): return json_response({'error':'The selected subject/collection is not active.'},400)
+            cur=await conn.execute("SELECT id FROM question_bank WHERE question_hash=%s AND id<>%s",(digest,qid))
+            if await cur.fetchone(): return json_response({'error':'A question with the same content/answer hash already exists. No changes were saved.'},409)
+            cur=await conn.execute("UPDATE question_bank SET question_en=%s,question_hi=%s,options=%s::jsonb,correct_option=%s,explanation_en=%s,explanation_hi=%s,subject=%s,topic=%s,source=%s,source_url=%s,attribution=%s,status=%s,question_hash=%s,updated_at=NOW() WHERE id=%s RETURNING id",(q_en,q_hi or None,json.dumps(normalized,ensure_ascii=False),correct,explanation_en or None,explanation_hi or None,subject,topic or None,source or None,source_url or None,attribution or None,status,digest,qid))
+            row=await cur.fetchone()
+            if not row: return json_response({'error':'Question not found.'},404)
+            await _write_admin_audit(conn,admin['id'],'question_update',str(qid),{'subject':subject,'status':status})
+    return json_response({'updated':True,'question_id':qid,'status':status})
+
+async def admin_question_archive(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try: qid=int(request.match_info['question_id'])
+    except ValueError: return json_response({'error':'Invalid question ID.'},400)
+    async with request.app['pool'].connection() as conn:
+        cur=await conn.execute("UPDATE question_bank SET status='archived',updated_at=NOW() WHERE id=%s AND status<>'archived' RETURNING id",(qid,)); row=await cur.fetchone()
+        if not row: return json_response({'error':'Question not found or already archived.'},404)
+        await _write_admin_audit(conn,admin['id'],'question_archive',str(qid),{})
+    return json_response({'archived':True,'question_id':qid})
+
+async def admin_question_delete(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try: qid=int(request.match_info['question_id']); body=await request.json(); confirm=body.get('confirm') is True
+    except Exception: return json_response({'error':'Invalid delete request.'},400)
+    if not confirm: return json_response({'error':'Explicit confirmation is required.'},400)
+    async with request.app['pool'].connection() as conn:
+        async with conn.transaction():
+            cur=await conn.execute('SELECT id,status FROM question_bank WHERE id=%s FOR UPDATE',(qid,)); row=await cur.fetchone()
+            if not row: return json_response({'error':'Question not found.'},404)
+            await conn.execute('DELETE FROM bank_quiz_questions WHERE question_id=%s',(qid,))
+            await conn.execute('DELETE FROM bank_quiz_attempt_answers WHERE question_id=%s',(qid,))
+            await conn.execute('DELETE FROM bpsc_nexus_revision_items WHERE question_id=%s',(qid,))
+            await conn.execute('DELETE FROM bpsc_nexus_arena_answers a USING bpsc_nexus_arena_questions q WHERE a.match_id=q.match_id AND a.position=q.position AND q.question_id=%s',(qid,))
+            await conn.execute('DELETE FROM bpsc_nexus_arena_questions WHERE question_id=%s',(qid,))
+            cur=await conn.execute('DELETE FROM question_bank WHERE id=%s RETURNING id',(qid,)); deleted=await cur.fetchone()
+            await _write_admin_audit(conn,admin['id'],'question_delete',str(qid),{'previous_status':row['status']})
+    return json_response({'deleted':bool(deleted),'question_id':qid})
+
 async def admin_series(request):
     user=request['telegram_user']
     if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
@@ -917,7 +1540,7 @@ async def list_test_series(request):
     user_id = request['telegram_user']['id']
     exam = request.query.get('exam', '').upper()
     kind = request.query.get('type', '')
-    clauses = ["s.is_published=TRUE"]
+    clauses = ["s.is_published=TRUE", "EXISTS (SELECT 1 FROM bpsc_nexus_test_series_tests est JOIN bank_quizzes eq ON eq.id=est.quiz_id JOIN bank_quiz_questions eqq ON eqq.quiz_id=eq.id JOIN question_bank eqb ON eqb.id=eqq.question_id WHERE est.series_id=s.id AND eq.is_published=TRUE AND COALESCE(eq.admin_hidden,FALSE)=FALSE AND eqb.status='ready')"]
     params = [user_id]
     if exam in ('UPSC', 'BPSC'):
         clauses.append('s.exam_type=%s'); params.append(exam)
@@ -927,10 +1550,11 @@ async def list_test_series(request):
         await ensure_access_schema(conn)
         access_state=await _access_state(conn,user_id,user_id in ADMIN_TELEGRAM_IDS,True)
         cur = await conn.execute(f"""SELECT s.id,s.title,s.description,s.exam_type,s.series_type,s.subject,s.difficulty,s.access_type,
-            COUNT(st.quiz_id) AS test_count,
+            COUNT(DISTINCT st.quiz_id) FILTER (WHERE q0.is_published=TRUE AND COALESCE(q0.admin_hidden,FALSE)=FALSE AND EXISTS (SELECT 1 FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id WHERE qq.quiz_id=q0.id AND qb.status='ready')) AS test_count,
             BOOL_OR(e.telegram_id IS NOT NULL AND e.revoked_at IS NULL AND (e.expires_at IS NULL OR e.expires_at>NOW())) AS entitled
             FROM bpsc_nexus_test_series s
             LEFT JOIN bpsc_nexus_test_series_tests st ON st.series_id=s.id
+            LEFT JOIN bank_quizzes q0 ON q0.id=st.quiz_id
             LEFT JOIN bpsc_nexus_test_series_entitlements e ON e.series_id=s.id AND e.telegram_id=%s
             WHERE {' AND '.join(clauses)}
             GROUP BY s.id ORDER BY s.sort_order,s.id DESC LIMIT 200""", tuple(params))
@@ -943,8 +1567,8 @@ async def list_test_series(request):
                 FROM bpsc_nexus_test_series_tests st JOIN bank_quizzes q ON q.id=st.quiz_id
                 LEFT JOIN bank_quiz_questions qq ON qq.quiz_id=q.id
                 LEFT JOIN question_bank qb ON qb.id=qq.question_id AND qb.status='ready'
-                WHERE st.series_id=%s AND q.is_published=TRUE
-                GROUP BY q.id,st.position ORDER BY st.position,q.id""", (s['id'],))
+                WHERE st.series_id=%s AND q.is_published=TRUE AND COALESCE(q.admin_hidden,FALSE)=FALSE
+                GROUP BY q.id,st.position HAVING COUNT(qb.id) FILTER (WHERE qb.status='ready')>0 ORDER BY st.position,q.id""", (s['id'],))
             tests=[]
             for t in await tc.fetchall():
                 tests.append({'quiz_id':int(t['id']),'title':t['title'],'description':t['description'] or '',
@@ -1035,20 +1659,32 @@ async def list_quizzes(request):
         cur = await conn.execute("""SELECT q.id,q.title,q.description,q.subject,q.duration_minutes,q.positive_marks,q.negative_marks,
             q.question_time_seconds,q.shuffle_options,q.is_custom,q.access_type,COUNT(qq.question_id) AS total_questions,
             BOOL_OR(COALESCE(s.access_type,'free')='paid') AS bank_paid,
+            ARRAY_REMOVE(ARRAY_AGG(DISTINCT qb.subject) FILTER (WHERE COALESCE(s.access_type,'free')='paid'),NULL) AS paid_subjects,
             EXISTS(SELECT 1 FROM bpsc_nexus_test_series_tests st JOIN bpsc_nexus_test_series_entitlements e ON e.series_id=st.series_id
                 WHERE st.quiz_id=q.id AND e.telegram_id=%s AND e.revoked_at IS NULL AND (e.expires_at IS NULL OR e.expires_at>NOW())) AS series_entitled
             FROM bank_quizzes q
             JOIN bank_quiz_questions qq ON qq.quiz_id=q.id
             JOIN question_bank qb ON qb.id=qq.question_id AND qb.status='ready'
             LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) AND s.archived_at IS NULL
-            WHERE q.is_published=TRUE AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s)
+            WHERE q.is_published=TRUE AND COALESCE(q.admin_hidden,FALSE)=FALSE AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s)
             GROUP BY q.id ORDER BY q.is_custom ASC,q.id DESC LIMIT 100""", (user_id,user_id))
         rows = await cur.fetchall()
+        entitled_by_quiz={}
+        for row in rows:
+            mode=str(row['access_type'] or 'inherit')
+            effective='paid' if mode=='paid' or (mode=='inherit' and bool(row['bank_paid'])) else 'free'
+            subjects=list(row.get('paid_subjects') or [])
+            if effective!='paid' or access['is_admin'] or access['demo_active'] or access['has_all_access_pass'] or bool(row['series_entitled']):
+                entitled_by_quiz[int(row['id'])]=True
+            else:
+                # A product pass unlocks only its matching subject, not unrelated paid banks.
+                entitlement_subjects=subjects or [str(row.get('subject') or '')]
+                entitled_by_quiz[int(row['id'])]=bool(entitlement_subjects) and all([await _has_subject_entitlement(conn,user_id,subj) for subj in entitlement_subjects])
     quizzes=[]
     for r in rows:
         mode=str(r['access_type'] or 'inherit')
         effective='paid' if mode=='paid' or (mode=='inherit' and bool(r['bank_paid'])) else 'free'
-        locked=effective=='paid' and not (access['has_paid_access'] or bool(r['series_entitled']))
+        locked=effective=='paid' and not entitled_by_quiz.get(int(r['id']),False)
         quizzes.append({"id":int(r["id"]),"title":r["title"],"description":r["description"],"subject":r["subject"],
             "duration_minutes":int(r["duration_minutes"]),"positive_marks":float(r["positive_marks"]),"negative_marks":float(r["negative_marks"]),
             "question_time_seconds":int(r["question_time_seconds"] or 0),"shuffle_options":True,"shuffle_questions":True,"is_custom":bool(r["is_custom"]),
@@ -1083,9 +1719,13 @@ async def attempt_history(request):
 async def quiz_builder_meta(request):
     pool = request.app["pool"]
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT subject, COUNT(*) AS n FROM question_bank WHERE status='ready' GROUP BY subject ORDER BY subject")
+        cur = await conn.execute("""SELECT qb.subject,COUNT(*) AS n FROM question_bank qb WHERE qb.status='ready'
+            AND NOT EXISTS (SELECT 1 FROM question_bank_subjects s WHERE LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) AND s.archived_at IS NOT NULL)
+            GROUP BY qb.subject ORDER BY qb.subject""")
         subjects = [{"name": r["subject"], "count": int(r["n"])} for r in await cur.fetchall()]
-        cur = await conn.execute("SELECT DISTINCT topic FROM question_bank WHERE status='ready' AND NULLIF(BTRIM(topic),'') IS NOT NULL ORDER BY topic LIMIT 500")
+        cur = await conn.execute("""SELECT DISTINCT qb.topic FROM question_bank qb WHERE qb.status='ready' AND NULLIF(BTRIM(qb.topic),'') IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM question_bank_subjects s WHERE LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) AND s.archived_at IS NOT NULL)
+            ORDER BY qb.topic LIMIT 500""")
         topics = [r["topic"] for r in await cur.fetchall()]
         cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status='ready'")
         total = int((await cur.fetchone())["n"])
@@ -1214,8 +1854,14 @@ async def start_attempt(request):
             WHERE st.quiz_id=%s AND e.telegram_id=%s AND e.revoked_at IS NULL
               AND (e.expires_at IS NULL OR e.expires_at>NOW())) AS ok""",(quiz_id,user['id']))
         series_entitled=bool((await cur.fetchone())['ok'])
-        if quiz_paid and not (access_state['has_paid_access'] or series_entitled):
-            return json_response({"error":"This question bank is locked. Your demo may have ended; activate a membership to continue.","code":"PAID_ACCESS_REQUIRED","demo_expires_at":access_state['demo_expires_at']},403)
+        if quiz_paid and not (access_state['is_admin'] or access_state['demo_active'] or access_state['has_all_access_pass'] or series_entitled):
+            cur=await conn.execute("""SELECT DISTINCT qb.subject FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
+                LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) AND s.archived_at IS NULL
+                WHERE qq.quiz_id=%s AND qb.status='ready' AND (COALESCE(s.access_type,'free')='paid' OR %s='paid')""",(quiz_id,quiz_access))
+            paid_subjects=[r['subject'] for r in await cur.fetchall()]
+            subject_access=bool(paid_subjects) and all([await _has_subject_entitlement(conn,user['id'],subject) for subject in paid_subjects])
+            if not subject_access:
+                return json_response({"error":"This question bank is locked. Your demo may have ended; activate the matching subject pass or All Access to continue.","code":"PAID_ACCESS_REQUIRED","demo_expires_at":access_state['demo_expires_at']},403)
         cur = await conn.execute("""SELECT s.id,s.access_type FROM bpsc_nexus_test_series_tests st
             JOIN bpsc_nexus_test_series s ON s.id=st.series_id
             WHERE st.quiz_id=%s AND s.is_published=TRUE AND s.access_type='paid'
@@ -1482,7 +2128,7 @@ async def cleanup(app):
 
 
 def make_app():
-    app = web.Application(middlewares=[telegram_auth], client_max_size=1024 * 1024)
+    app = web.Application(middlewares=[telegram_auth], client_max_size=22 * 1024 * 1024)
     app.router.add_get("/", index)
     app.router.add_get("/membership", membership_page)
     app.router.add_get("/api/payments", payment_options)
@@ -1504,12 +2150,31 @@ def make_app():
     app.router.add_post("/api/arena/matches/{match_id}/answers", arena_answer)
     app.router.add_get("/api/preferences/theme", get_theme_preference)
     app.router.add_put("/api/preferences/theme", save_theme_preference)
+    app.router.add_post("/api/admin/login", admin_login)
+    app.router.add_post("/api/admin/logout", admin_logout)
+    app.router.add_get("/api/admin/session", admin_session_status)
     app.router.add_get("/api/leaderboard", leaderboard_data)
     app.router.add_get("/api/leaderboard/admin/challenges", leaderboard_admin_challenges)
     app.router.add_post("/api/leaderboard/admin/challenges", leaderboard_admin_challenges)
     app.router.add_get("/api/leaderboard/admin/attempts", leaderboard_admin_attempts)
     app.router.add_get("/api/leaderboard/admin/stats", leaderboard_admin_stats)
     app.router.add_post("/api/leaderboard/admin/exclude", leaderboard_admin_exclude)
+    app.router.add_get("/api/admin/payments", admin_payments)
+    app.router.add_get("/api/admin/payments/{request_id}", admin_payment_detail)
+    app.router.add_post("/api/admin/payments/{request_id}/review", admin_review_payment)
+    app.router.add_get("/api/admin/members", admin_members_search)
+    app.router.add_get("/api/admin/members/{telegram_id}", admin_member_detail)
+    app.router.add_post("/api/admin/members/grant", admin_member_grant)
+    app.router.add_post("/api/admin/passes/{pass_id}/revoke", admin_pass_revoke)
+    app.router.add_post("/api/admin/passes/{pass_id}/extend", admin_pass_extend)
+    app.router.add_get("/api/admin/questions", admin_questions_search)
+    app.router.add_get("/api/admin/questions/{question_id}", admin_question_detail)
+    app.router.add_put("/api/admin/questions/{question_id}", admin_question_update)
+    app.router.add_post("/api/admin/questions/{question_id}/archive", admin_question_archive)
+    app.router.add_post("/api/admin/questions/{question_id}/delete", admin_question_delete)
+    app.router.add_get("/api/admin/import/subjects", admin_import_subjects)
+    app.router.add_post("/api/admin/import/subjects", admin_create_import_subject)
+    app.router.add_post("/api/admin/import/questions", admin_bulk_import)
     app.router.add_get("/api/test-series", list_test_series)
     app.router.add_post("/api/admin/test-series", admin_create_test_series)
     app.router.add_post("/api/admin/test-series/{series_id}/tests", admin_link_series_test)
@@ -1521,6 +2186,10 @@ def make_app():
     app.router.add_post("/api/admin/banks/access", admin_set_bank_access)
     app.router.add_get("/api/admin/quizzes", admin_quizzes)
     app.router.add_get("/api/admin/series", admin_series)
+    app.router.add_get("/api/admin/cleanup", admin_cleanup_catalog)
+    app.router.add_post("/api/admin/subjects/remove", admin_remove_subject)
+    app.router.add_post("/api/admin/quizzes/{quiz_id}/remove", admin_remove_quiz)
+    app.router.add_post("/api/admin/test-series/{series_id}/remove", admin_remove_series)
     app.router.add_post("/api/admin/quizzes/{quiz_id}/access", admin_set_quiz_access)
     app.router.add_post("/api/admin/test-series/{series_id}/access", admin_set_series_access)
     app.router.add_post("/api/admin/demo/settings", admin_demo_settings)
