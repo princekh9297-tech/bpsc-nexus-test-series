@@ -471,21 +471,35 @@ def _arena_code():
     import secrets, string
     return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
 
+async def arena_subjects(request):
+    async with request.app["pool"].connection() as conn:
+        cur=await conn.execute("SELECT DISTINCT subject FROM question_bank WHERE status='ready' AND subject IS NOT NULL AND BTRIM(subject)<>'' ORDER BY subject")
+        rows=await cur.fetchall()
+    return json_response({"subjects":[str(r["subject"]) for r in rows]})
+
 async def arena_list(request):
     uid=request["telegram_user"]["id"]
     async with request.app["pool"].connection() as conn:
-        cur=await conn.execute("""SELECT m.id,m.invite_code,m.status,m.created_at,m.question_count,p.score,p.rating_delta,
+        cur=await conn.execute("""SELECT m.id,m.invite_code,m.status,m.created_at,m.question_count,m.subject_filter,m.question_seconds,p.score,p.rating_delta,
             (SELECT COUNT(*) FROM bpsc_nexus_arena_players pp WHERE pp.match_id=m.id) AS players
             FROM bpsc_nexus_arena_matches m JOIN bpsc_nexus_arena_players p ON p.match_id=m.id AND p.telegram_id=%s
             ORDER BY m.created_at DESC LIMIT 20""",(uid,))
         rows=await cur.fetchall()
         cur=await conn.execute("SELECT rating,wins,losses,draws FROM bpsc_nexus_arena_ratings WHERE telegram_id=%s",(uid,)); rating=await cur.fetchone()
-    return json_response({"matches":[{"id":int(r["id"]),"invite_code":r["invite_code"],"status":r["status"],"created_at":r["created_at"].isoformat(),"question_count":int(r["question_count"]),"score":int(r["score"] or 0),"players":int(r["players"])} for r in rows],"rating":int(rating["rating"]) if rating else 1000,"wins":int(rating["wins"]) if rating else 0,"losses":int(rating["losses"]) if rating else 0,"draws":int(rating["draws"]) if rating else 0})
+    return json_response({"matches":[{"id":int(r["id"]),"invite_code":r["invite_code"],"status":r["status"],"created_at":r["created_at"].isoformat(),"question_count":int(r["question_count"]),"subject":r.get("subject_filter") or "All subjects","question_seconds":int(r.get("question_seconds") or 20),"score":int(r["score"] or 0),"players":int(r["players"])} for r in rows],"rating":int(rating["rating"]) if rating else 1000,"wins":int(rating["wins"]) if rating else 0,"losses":int(rating["losses"]) if rating else 0,"draws":int(rating["draws"]) if rating else 0})
 
 async def arena_create(request):
     uid=request["telegram_user"]["id"]
-    try: body=await request.json(); mode=str(body.get("mode","invite")); mode=mode if mode in {"invite","matchmaking"} else "invite"
-    except Exception: mode="invite"
+    try:
+        body=await request.json()
+        mode=str(body.get("mode","invite")); mode=mode if mode in {"invite","matchmaking"} else "invite"
+        try: question_count=max(5,min(50,int(body.get("question_count",10))))
+        except (TypeError,ValueError): question_count=10
+        try: question_seconds=max(0,min(120,int(body.get("question_seconds",20))))
+        except (TypeError,ValueError): question_seconds=20
+        subject=str(body.get("subject","All subjects")).strip()[:120] or "All subjects"
+    except Exception:
+        mode="invite"; question_count=10; question_seconds=20; subject="All subjects"
     async with request.app["pool"].connection() as conn:
         # Matchmaking joins the oldest open queue room, if one exists.
         if mode=="matchmaking":
@@ -497,12 +511,15 @@ async def arena_create(request):
                 await conn.execute("INSERT INTO bpsc_nexus_arena_players(match_id,telegram_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",(match_id,uid))
                 await conn.execute("UPDATE bpsc_nexus_arena_matches SET status='active',started_at=NOW() WHERE id=%s AND status='waiting'",(match_id,))
                 return json_response({"match_id":match_id,"status":"active","joined":True})
-        cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' ORDER BY RANDOM() LIMIT 10")
+        if subject == "All subjects":
+            cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' ORDER BY RANDOM() LIMIT %s",(question_count,))
+        else:
+            cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' AND subject=%s ORDER BY RANDOM() LIMIT %s",(subject,question_count))
         qs=await cur.fetchall()
-        if len(qs)<5: return json_response({"error":"The question bank needs at least five verified questions before Arena can start."},503)
+        if len(qs)<question_count: return json_response({"error":f"Only {len(qs)} verified questions are available for {subject}. Choose fewer questions or another subject."},503)
         code=_arena_code()
-        cur=await conn.execute("""INSERT INTO bpsc_nexus_arena_matches(invite_code,match_type,status,question_count,created_by_telegram_id)
-            VALUES(%s,%s,'waiting',%s,%s) RETURNING id""",(code,mode,len(qs),uid))
+        cur=await conn.execute("""INSERT INTO bpsc_nexus_arena_matches(invite_code,match_type,status,question_count,created_by_telegram_id,subject_filter,question_seconds)
+            VALUES(%s,%s,'waiting',%s,%s,%s,%s) RETURNING id""",(code,mode,question_count,uid,subject,question_seconds))
         match_id=int((await cur.fetchone())["id"])
         await conn.execute("INSERT INTO bpsc_nexus_arena_players(match_id,telegram_id) VALUES(%s,%s)",(match_id,uid))
         for pos,q in enumerate(qs,1):
@@ -531,7 +548,7 @@ async def arena_match(request):
     try: mid=int(request.match_info["match_id"])
     except ValueError: return json_response({"error":"Invalid match."},400)
     async with request.app["pool"].connection() as conn:
-        cur=await conn.execute("SELECT m.id,m.invite_code,m.status,m.question_count,m.started_at FROM bpsc_nexus_arena_matches m JOIN bpsc_nexus_arena_players p ON p.match_id=m.id AND p.telegram_id=%s WHERE m.id=%s",(uid,mid)); m=await cur.fetchone()
+        cur=await conn.execute("SELECT m.id,m.invite_code,m.status,m.question_count,m.started_at,m.subject_filter,m.question_seconds FROM bpsc_nexus_arena_matches m JOIN bpsc_nexus_arena_players p ON p.match_id=m.id AND p.telegram_id=%s WHERE m.id=%s",(uid,mid)); m=await cur.fetchone()
         if not m:return json_response({"error":"Arena match not found."},404)
         cur=await conn.execute("SELECT telegram_id,score,finished_at FROM bpsc_nexus_arena_players WHERE match_id=%s ORDER BY joined_at",(mid,)); players=await cur.fetchall()
         cur=await conn.execute("""SELECT q.position,q.question_id,b.subject,b.question_en,b.question_hi,b.options,a.selected_option
@@ -539,7 +556,7 @@ async def arena_match(request):
             LEFT JOIN bpsc_nexus_arena_answers a ON a.match_id=q.match_id AND a.position=q.position AND a.telegram_id=%s
             WHERE q.match_id=%s ORDER BY q.position""",(uid,mid)); qs=await cur.fetchall()
         cur=await conn.execute("SELECT position,selected_option FROM bpsc_nexus_arena_answers WHERE match_id=%s AND telegram_id=%s",(mid,uid)); answered={int(r["position"]):r["selected_option"] for r in await cur.fetchall()}
-    return json_response({"id":int(m["id"]),"invite_code":m["invite_code"],"status":m["status"],"question_count":int(m["question_count"]),"started_at":m["started_at"].isoformat() if m["started_at"] else None,"players":[{"is_you":int(p["telegram_id"])==uid,"score":int(p["score"] or 0),"finished":bool(p["finished_at"])} for p in players],"questions":[{"position":int(q["position"]),"id":int(q["question_id"]),"subject":q["subject"],"question_en":q["question_en"],"question_hi":q["question_hi"],"options":q["options"] if isinstance(q["options"],dict) else json.loads(q["options"] or "{}"),"selected_option":answered.get(int(q["position"]))} for q in qs]})
+    return json_response({"id":int(m["id"]),"invite_code":m["invite_code"],"status":m["status"],"question_count":int(m["question_count"]),"subject":m.get("subject_filter") or "All subjects","question_seconds":int(m.get("question_seconds") or 20),"started_at":m["started_at"].isoformat() if m["started_at"] else None,"players":[{"is_you":int(p["telegram_id"])==uid,"score":int(p["score"] or 0),"finished":bool(p["finished_at"])} for p in players],"questions":[{"position":int(q["position"]),"id":int(q["question_id"]),"subject":q["subject"],"question_en":q["question_en"],"question_hi":q["question_hi"],"options":q["options"] if isinstance(q["options"],dict) else json.loads(q["options"] or "{}"),"selected_option":answered.get(int(q["position"]))} for q in qs]})
 
 async def arena_answer(request):
     uid=request["telegram_user"]["id"]
@@ -2192,6 +2209,8 @@ async def startup(app):
             id BIGSERIAL PRIMARY KEY, invite_code VARCHAR(8) UNIQUE NOT NULL, match_type VARCHAR(20) NOT NULL,
             status VARCHAR(16) NOT NULL DEFAULT 'waiting', question_count INTEGER NOT NULL DEFAULT 10,
             created_by_telegram_id BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), started_at TIMESTAMPTZ NULL, finished_at TIMESTAMPTZ NULL)""")
+        await conn.execute("ALTER TABLE bpsc_nexus_arena_matches ADD COLUMN IF NOT EXISTS subject_filter TEXT NOT NULL DEFAULT 'All subjects'")
+        await conn.execute("ALTER TABLE bpsc_nexus_arena_matches ADD COLUMN IF NOT EXISTS question_seconds INTEGER NOT NULL DEFAULT 20")
         await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_arena_players (
             match_id BIGINT NOT NULL REFERENCES bpsc_nexus_arena_matches(id) ON DELETE CASCADE, telegram_id BIGINT NOT NULL,
             score INTEGER NOT NULL DEFAULT 0, joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), finished_at TIMESTAMPTZ NULL,
@@ -2231,6 +2250,7 @@ def make_app():
     app.router.add_post("/api/tasks", create_task)
     app.router.add_patch("/api/tasks/{task_id}", update_task)
     app.router.add_delete("/api/tasks/{task_id}", delete_task)
+    app.router.add_get("/api/arena/subjects", arena_subjects)
     app.router.add_get("/api/arena", arena_list)
     app.router.add_post("/api/arena/matches", arena_create)
     app.router.add_post("/api/arena/join", arena_join)
