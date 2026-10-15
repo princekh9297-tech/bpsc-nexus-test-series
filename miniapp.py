@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -525,8 +526,12 @@ async def payment_schema(conn):
 
 async def membership_page(request):
     page = ROOT / "static" / "membership.html"
+    if not page.is_file() and (ROOT / "membership.html").is_file():
+        page = ROOT / "membership.html"
     if not page.is_file(): raise web.HTTPNotFound()
-    return web.FileResponse(page)
+    response = web.FileResponse(page)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
 
 async def payment_options(request):
     uid=request["telegram_user"]["id"]
@@ -678,6 +683,7 @@ async def ensure_test_series_schema(conn):
         PRIMARY KEY(series_id, quiz_id)
     )""")
     await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_nexus_test_series_public_idx ON bpsc_nexus_test_series(is_published,exam_type,sort_order,id)")
+    await conn.execute("ALTER TABLE bpsc_nexus_test_series ADD COLUMN IF NOT EXISTS access_type VARCHAR(12) NOT NULL DEFAULT 'paid'")
     await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_test_series_entitlements (
         series_id BIGINT NOT NULL REFERENCES bpsc_nexus_test_series(id) ON DELETE CASCADE,
         telegram_id BIGINT NOT NULL,
@@ -694,6 +700,219 @@ def _is_series_admin(user):
     return int(user.get('id', 0)) in ADMIN_TELEGRAM_IDS
 
 
+async def _write_admin_audit(conn, admin_id: int, action: str, target: str, details: dict):
+    await conn.execute("INSERT INTO bpsc_nexus_admin_audit(admin_telegram_id,action,target,details) VALUES(%s,%s,%s,%s::jsonb)",
+        (admin_id,action,str(target)[:250],json.dumps(details,ensure_ascii=False)))
+
+
+async def ensure_access_schema(conn):
+    """Additive demo and paywall migrations; does not reset existing content."""
+    await conn.execute("ALTER TABLE bank_quizzes ADD COLUMN IF NOT EXISTS access_type VARCHAR(12) NOT NULL DEFAULT 'inherit'")
+    await conn.execute("ALTER TABLE question_bank_subjects ADD COLUMN IF NOT EXISTS access_type VARCHAR(12) NOT NULL DEFAULT 'free'")
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_demo_config (
+        singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK(singleton=TRUE),
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        duration_hours INTEGER NOT NULL DEFAULT 48 CHECK(duration_hours BETWEEN 1 AND 720),
+        updated_by BIGINT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""")
+    await conn.execute("INSERT INTO bpsc_nexus_demo_config(singleton,enabled,duration_hours) VALUES(TRUE,TRUE,48) ON CONFLICT(singleton) DO NOTHING")
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_demo_trials (
+        telegram_id BIGINT PRIMARY KEY,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        reset_by BIGINT,
+        reset_note TEXT NOT NULL DEFAULT ''
+    )""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_nexus_demo_trials_expiry_idx ON bpsc_nexus_demo_trials(expires_at)")
+
+
+async def _ensure_trial(conn, telegram_id: int):
+    """Start the demo on the first authenticated Mini App visit, once per account."""
+    await conn.execute("""INSERT INTO bpsc_nexus_demo_trials(telegram_id,started_at,expires_at)
+        SELECT %s,NOW(),NOW() + (duration_hours * INTERVAL '1 hour')
+        FROM bpsc_nexus_demo_config WHERE singleton=TRUE AND enabled=TRUE
+        ON CONFLICT(telegram_id) DO NOTHING""", (telegram_id,))
+    # Return both the row and whether it was created during this request.
+    cur = await conn.execute("SELECT telegram_id,started_at,expires_at FROM bpsc_nexus_demo_trials WHERE telegram_id=%s", (telegram_id,))
+    trial = await cur.fetchone()
+    cur = await conn.execute("SELECT enabled,duration_hours FROM bpsc_nexus_demo_config WHERE singleton=TRUE")
+    config = await cur.fetchone()
+    return trial, config
+
+
+async def _has_all_access_pass(conn, telegram_id: int) -> bool:
+    cur = await conn.execute("SELECT to_regclass('public.premium_passes') AS p, to_regclass('public.app_users') AS u")
+    tables = await cur.fetchone()
+    if not tables or not tables['p'] or not tables['u']:
+        return False
+    cur = await conn.execute("""SELECT EXISTS(
+        SELECT 1 FROM app_users u JOIN premium_passes pp ON pp.user_id=u.id
+        WHERE u.telegram_id=%s AND pp.revoked_at IS NULL
+          AND (pp.expires_at IS NULL OR pp.expires_at>NOW())
+          AND (pp.pass_code IN ('all_access','legacy') OR pp.vault_keys @> ARRAY['*']::TEXT[])
+    ) AS ok""", (telegram_id,))
+    return bool((await cur.fetchone())['ok'])
+
+
+async def _access_state(conn, telegram_id: int, is_admin: bool = False, create_trial: bool = True):
+    if create_trial and not is_admin:
+        trial, config = await _ensure_trial(conn, telegram_id)
+    else:
+        cur=await conn.execute("SELECT telegram_id,started_at,expires_at FROM bpsc_nexus_demo_trials WHERE telegram_id=%s",(telegram_id,)); trial=await cur.fetchone()
+        cur=await conn.execute("SELECT enabled,duration_hours FROM bpsc_nexus_demo_config WHERE singleton=TRUE"); config=await cur.fetchone()
+    has_pass = await _has_all_access_pass(conn, telegram_id)
+    active = bool(trial and trial['expires_at'] > datetime.now(timezone.utc))
+    return {
+        'is_admin': bool(is_admin), 'demo_enabled': bool(config and config['enabled']),
+        'demo_duration_hours': int(config['duration_hours']) if config else 48,
+        'demo_started_at': trial['started_at'].isoformat() if trial else None,
+        'demo_expires_at': trial['expires_at'].isoformat() if trial else None,
+        'demo_active': active, 'demo_expired': bool(trial and not active),
+        'seconds_remaining': max(0, int((trial['expires_at']-datetime.now(timezone.utc)).total_seconds())) if active else 0,
+        'has_paid_access': bool(is_admin or active or has_pass), 'has_all_access_pass': has_pass,
+    }
+
+
+async def access_status(request):
+    user=request['telegram_user']; is_admin=_is_series_admin(user)
+    async with request.app['pool'].connection() as conn:
+        trial_before=await conn.execute("SELECT 1 FROM bpsc_nexus_demo_trials WHERE telegram_id=%s",(user['id'],))
+        existed=bool(await trial_before.fetchone())
+        state=await _access_state(conn,user['id'],is_admin,True)
+    state['trial_started_now']=bool(state['demo_started_at'] and not existed and state['demo_active'])
+    state['demo_message_title']=f"Your {state['demo_duration_hours']}-hour BPSC Nexus Demo is live" if state['demo_active'] else ('Your demo has ended' if state['demo_expired'] else 'Explore BPSC Nexus')
+    return json_response(state)
+
+
+async def admin_overview(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        state=await _access_state(conn,user['id'],True,False)
+        cur=await conn.execute("SELECT (SELECT COUNT(*) FROM question_bank WHERE status='ready') AS questions,(SELECT COUNT(*) FROM bank_quizzes WHERE is_published=TRUE) AS quizzes,(SELECT COUNT(*) FROM bpsc_nexus_test_series) AS series,(SELECT COUNT(*) FROM bpsc_nexus_demo_trials WHERE expires_at>NOW()) AS active_demos,(SELECT COUNT(*) FROM bpsc_nexus_demo_trials WHERE expires_at<=NOW()) AS expired_demos,(SELECT COUNT(DISTINCT telegram_id) FROM bank_quiz_attempts) AS quiz_users")
+        stats=dict(await cur.fetchone())
+        cur=await conn.execute("SELECT enabled,duration_hours FROM bpsc_nexus_demo_config WHERE singleton=TRUE")
+        config=dict(await cur.fetchone())
+    return json_response({'stats':stats,'demo':config,'is_admin':True})
+
+
+async def admin_banks(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("""SELECT qb.subject AS name,COUNT(*) AS question_count,
+            COALESCE(MAX(s.subject_type),'subject') AS subject_type,
+            COALESCE(MAX(s.access_type),'free') AS access_type
+            FROM question_bank qb LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) AND s.archived_at IS NULL
+            GROUP BY qb.subject ORDER BY LOWER(qb.subject) LIMIT 500""")
+        rows=[dict(r) for r in await cur.fetchall()]
+    return json_response({'banks':rows})
+
+
+async def admin_set_bank_access(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try:
+        body=await request.json(); name=str(body.get('name','')).strip(); access=str(body.get('access_type','')).lower()
+        if not name or len(name)>180 or access not in ('free','paid'): raise ValueError()
+    except Exception: return json_response({'error':'Provide a valid bank name and free/paid access type.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("SELECT id FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) LIMIT 1",(name,)); existing=await cur.fetchone()
+        if existing:
+            await conn.execute("UPDATE question_bank_subjects SET access_type=%s,archived_at=NULL WHERE id=%s",(access,existing['id']))
+        else:
+            await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id,subject_type,access_type) VALUES(%s,%s,'subject',%s)",(name,user['id'],access))
+        await _write_admin_audit(conn,user['id'],'bank_access',name,{'access_type':access})
+    return json_response({'name':name,'access_type':access,'updated':True})
+
+
+async def admin_quizzes(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.is_published,q.access_type,COUNT(qq.question_id) AS total_questions
+            FROM bank_quizzes q LEFT JOIN bank_quiz_questions qq ON qq.quiz_id=q.id
+            GROUP BY q.id ORDER BY q.id DESC LIMIT 300""")
+        rows=[dict(r) for r in await cur.fetchall()]
+    return json_response({'quizzes':rows})
+
+
+async def admin_set_quiz_access(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try: qid=int(request.match_info['quiz_id']); body=await request.json(); access=str(body.get('access_type','')).lower()
+    except Exception: return json_response({'error':'Invalid quiz access update.'},400)
+    if access not in ('inherit','free','paid'): return json_response({'error':'Access must be inherit, free or paid.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("UPDATE bank_quizzes SET access_type=%s WHERE id=%s RETURNING id,title,access_type",(access,qid)); row=await cur.fetchone()
+        if not row:return json_response({'error':'Quiz not found.'},404)
+        await _write_admin_audit(conn,user['id'],'quiz_access',str(qid),{'access_type':access})
+    return json_response({'quiz':dict(row),'updated':True})
+
+
+async def admin_set_series_access(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try: sid=int(request.match_info['series_id']); body=await request.json(); access=str(body.get('access_type','')).lower()
+    except Exception: return json_response({'error':'Invalid series access update.'},400)
+    if access not in ('free','paid'): return json_response({'error':'Access must be free or paid.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("UPDATE bpsc_nexus_test_series SET access_type=%s,updated_at=NOW() WHERE id=%s RETURNING id,title,access_type",(access,sid)); row=await cur.fetchone()
+        if not row:return json_response({'error':'Series not found.'},404)
+        await _write_admin_audit(conn,user['id'],'series_access',str(sid),{'access_type':access})
+    return json_response({'series':dict(row),'updated':True})
+
+
+async def admin_demo_settings(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try:
+        body=await request.json(); enabled=bool(body.get('enabled')); hours=max(1,min(720,int(body.get('duration_hours',48))) )
+    except Exception: return json_response({'error':'Provide valid demo settings.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        await conn.execute("UPDATE bpsc_nexus_demo_config SET enabled=%s,duration_hours=%s,updated_by=%s,updated_at=NOW() WHERE singleton=TRUE",(enabled,hours,user['id']))
+        await _write_admin_audit(conn,user['id'],'demo_settings','global',{'enabled':enabled,'duration_hours':hours})
+    return json_response({'enabled':enabled,'duration_hours':hours,'updated':True})
+
+
+async def admin_demo_grant(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try:
+        body=await request.json(); target=int(body.get('telegram_id')); hours=max(1,min(720,int(body.get('duration_hours',48)))); note=str(body.get('note','Admin demo grant'))[:500]
+        if target<=0: raise ValueError()
+    except Exception: return json_response({'error':'Provide a valid Telegram user ID and duration.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        await conn.execute("""INSERT INTO bpsc_nexus_demo_trials(telegram_id,started_at,expires_at,reset_by,reset_note)
+            VALUES(%s,NOW(),NOW()+(%s*INTERVAL '1 hour'),%s,%s)
+            ON CONFLICT(telegram_id) DO UPDATE SET started_at=NOW(),expires_at=NOW()+(EXCLUDED.expires_at-EXCLUDED.started_at),reset_by=EXCLUDED.reset_by,reset_note=EXCLUDED.reset_note""",(target,hours,user['id'],note))
+        await _write_admin_audit(conn,user['id'],'demo_grant',str(target),{'duration_hours':hours,'note':note})
+    return json_response({'telegram_id':target,'duration_hours':hours,'granted':True})
+
+
+async def admin_series(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("""SELECT s.id,s.title,s.exam_type,s.series_type,s.subject,s.access_type,s.is_published,
+            COUNT(st.quiz_id) AS test_count FROM bpsc_nexus_test_series s
+            LEFT JOIN bpsc_nexus_test_series_tests st ON st.series_id=s.id
+            GROUP BY s.id ORDER BY s.id DESC LIMIT 200""")
+        rows=[dict(r) for r in await cur.fetchall()]
+    return json_response({'series':rows})
+
+
 async def list_test_series(request):
     user_id = request['telegram_user']['id']
     exam = request.query.get('exam', '').upper()
@@ -705,6 +924,8 @@ async def list_test_series(request):
     if kind in ('full_length', 'sectional', 'subject_wise'):
         clauses.append('s.series_type=%s'); params.append(kind)
     async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        access_state=await _access_state(conn,user_id,user_id in ADMIN_TELEGRAM_IDS,True)
         cur = await conn.execute(f"""SELECT s.id,s.title,s.description,s.exam_type,s.series_type,s.subject,s.difficulty,s.access_type,
             COUNT(st.quiz_id) AS test_count,
             BOOL_OR(e.telegram_id IS NOT NULL AND e.revoked_at IS NULL AND (e.expires_at IS NULL OR e.expires_at>NOW())) AS entitled
@@ -716,7 +937,7 @@ async def list_test_series(request):
         series_rows = await cur.fetchall()
         out=[]
         for s in series_rows:
-            entitled = s['access_type']=='free' or bool(s['entitled'])
+            entitled = s['access_type']=='free' or bool(s['entitled']) or bool(access_state['has_paid_access'])
             tc = await conn.execute("""SELECT q.id,q.title,q.description,q.subject,q.duration_minutes,q.positive_marks,q.negative_marks,
                 COUNT(qq.question_id) AS total_questions, st.position
                 FROM bpsc_nexus_test_series_tests st JOIN bank_quizzes q ON q.id=st.quiz_id
@@ -807,18 +1028,33 @@ async def admin_series_entitlement(request):
 async def list_quizzes(request):
     pool = request.app["pool"]
     user_id = request["telegram_user"]["id"]
+    is_admin = user_id in ADMIN_TELEGRAM_IDS
     async with pool.connection() as conn:
+        await ensure_access_schema(conn)
+        access = await _access_state(conn,user_id,is_admin,True)
         cur = await conn.execute("""SELECT q.id,q.title,q.description,q.subject,q.duration_minutes,q.positive_marks,q.negative_marks,
-            q.question_time_seconds, q.shuffle_options, q.is_custom, COUNT(qq.question_id) AS total_questions FROM bank_quizzes q
+            q.question_time_seconds,q.shuffle_options,q.is_custom,q.access_type,COUNT(qq.question_id) AS total_questions,
+            BOOL_OR(COALESCE(s.access_type,'free')='paid') AS bank_paid,
+            EXISTS(SELECT 1 FROM bpsc_nexus_test_series_tests st JOIN bpsc_nexus_test_series_entitlements e ON e.series_id=st.series_id
+                WHERE st.quiz_id=q.id AND e.telegram_id=%s AND e.revoked_at IS NULL AND (e.expires_at IS NULL OR e.expires_at>NOW())) AS series_entitled
+            FROM bank_quizzes q
             JOIN bank_quiz_questions qq ON qq.quiz_id=q.id
             JOIN question_bank qb ON qb.id=qq.question_id AND qb.status='ready'
+            LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) AND s.archived_at IS NULL
             WHERE q.is_published=TRUE AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s)
-            GROUP BY q.id ORDER BY q.is_custom ASC,q.id DESC LIMIT 100""", (user_id,))
+            GROUP BY q.id ORDER BY q.is_custom ASC,q.id DESC LIMIT 100""", (user_id,user_id))
         rows = await cur.fetchall()
-    return json_response({"quizzes": [{"id": int(r["id"]), "title": r["title"], "description": r["description"], "subject": r["subject"],
-        "duration_minutes": int(r["duration_minutes"]), "positive_marks": float(r["positive_marks"]), "negative_marks": float(r["negative_marks"]),
-        "question_time_seconds": int(r["question_time_seconds"] or 0), "shuffle_options": bool(r["shuffle_options"]), "is_custom": bool(r["is_custom"]),
-        "total_questions": int(r["total_questions"])} for r in rows]})
+    quizzes=[]
+    for r in rows:
+        mode=str(r['access_type'] or 'inherit')
+        effective='paid' if mode=='paid' or (mode=='inherit' and bool(r['bank_paid'])) else 'free'
+        locked=effective=='paid' and not (access['has_paid_access'] or bool(r['series_entitled']))
+        quizzes.append({"id":int(r["id"]),"title":r["title"],"description":r["description"],"subject":r["subject"],
+            "duration_minutes":int(r["duration_minutes"]),"positive_marks":float(r["positive_marks"]),"negative_marks":float(r["negative_marks"]),
+            "question_time_seconds":int(r["question_time_seconds"] or 0),"shuffle_options":True,"shuffle_questions":True,"is_custom":bool(r["is_custom"]),
+            "access_type":mode,"effective_access":effective,"locked":locked,"total_questions":int(r["total_questions"]),
+            "demo_active":bool(access['demo_active']),"demo_expires_at":access['demo_expires_at']})
+    return json_response({"quizzes":quizzes,"access":access})
 
 
 async def attempt_history(request):
@@ -959,33 +1195,70 @@ async def start_attempt(request):
     except Exception:
         return json_response({"error": "Provide a valid quiz_id and mode."}, 400)
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT id,title,duration_minutes,question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)", (quiz_id, user["id"]))
+        await ensure_access_schema(conn)
+        access_state=await _access_state(conn,user['id'],user['id'] in ADMIN_TELEGRAM_IDS,True)
+        cur = await conn.execute("SELECT id,title,duration_minutes,question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,access_type FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)", (quiz_id, user["id"]))
         quiz = await cur.fetchone()
         if not quiz:
             return json_response({"error": "Quiz is unavailable."}, 404)
+        cur = await conn.execute("""SELECT COUNT(*) FILTER (WHERE COALESCE(s.access_type,'free')='paid') AS paid_banks
+            FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
+            LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) AND s.archived_at IS NULL
+            WHERE qq.quiz_id=%s AND qb.status='ready'""",(quiz_id,))
+        bank_gate=bool((await cur.fetchone())['paid_banks'])
+        quiz_access=str(quiz['access_type'] or 'inherit')
+        quiz_paid=quiz_access=='paid' or (quiz_access=='inherit' and bank_gate)
+        series_entitled=False
+        cur=await conn.execute("""SELECT EXISTS(SELECT 1 FROM bpsc_nexus_test_series_tests st
+            JOIN bpsc_nexus_test_series_entitlements e ON e.series_id=st.series_id
+            WHERE st.quiz_id=%s AND e.telegram_id=%s AND e.revoked_at IS NULL
+              AND (e.expires_at IS NULL OR e.expires_at>NOW())) AS ok""",(quiz_id,user['id']))
+        series_entitled=bool((await cur.fetchone())['ok'])
+        if quiz_paid and not (access_state['has_paid_access'] or series_entitled):
+            return json_response({"error":"This question bank is locked. Your demo may have ended; activate a membership to continue.","code":"PAID_ACCESS_REQUIRED","demo_expires_at":access_state['demo_expires_at']},403)
         cur = await conn.execute("""SELECT s.id,s.access_type FROM bpsc_nexus_test_series_tests st
             JOIN bpsc_nexus_test_series s ON s.id=st.series_id
             WHERE st.quiz_id=%s AND s.is_published=TRUE AND s.access_type='paid'
             ORDER BY s.id LIMIT 1""", (quiz_id,))
         paid_series = await cur.fetchone()
-        if paid_series:
-            ent = await conn.execute("""SELECT 1 FROM bpsc_nexus_test_series_entitlements
-                WHERE series_id=%s AND telegram_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>NOW())""",
-                (paid_series['id'], user['id']))
-            if not await ent.fetchone():
-                return json_response({"error": "This test belongs to a paid series. Access is not active for your account yet."}, 403)
+        if paid_series and quiz_access!='free' and not (access_state['has_paid_access'] or series_entitled):
+            return json_response({"error": "This test belongs to a paid series. Access is not active for your account yet."}, 403)
         cur = await conn.execute("""SELECT qb.id FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
             WHERE qq.quiz_id=%s AND qb.status='ready' ORDER BY qq.position""", (quiz_id,))
-        ids = await cur.fetchall()
-        if not ids:
+        question_ids = [int(r['id']) for r in await cur.fetchall()]
+        if not question_ids:
             return json_response({"error": "This quiz has no verified questions."}, 400)
-        cur = await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions,question_time_seconds,quiz_settings) VALUES(%s,%s,%s,%s,%s,%s::jsonb) RETURNING id,started_at", (quiz_id, user["id"], mode, len(ids), int(quiz["question_time_seconds"] or 0), json.dumps({"custom": bool(quiz["is_custom"]), "mode_label": requested_mode})))
+        random.SystemRandom().shuffle(question_ids)
+        cur = await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions,question_time_seconds,quiz_settings) VALUES(%s,%s,%s,%s,%s,%s::jsonb) RETURNING id,started_at", (quiz_id, user["id"], mode, len(question_ids), int(quiz["question_time_seconds"] or 0), json.dumps({"custom": bool(quiz["is_custom"]), "mode_label": requested_mode, "shuffle_questions": True, "shuffle_options": True})))
         attempt = await cur.fetchone()
-        await conn.execute("""INSERT INTO bank_quiz_attempt_question_snapshots(attempt_id,position,question_id,subject,question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi)
-            SELECT %s,qq.position,qb.id,qb.subject,qb.question_en,qb.question_hi,qb.question_type,qb.question_structure,qb.question_flags,qb.options,qb.correct_option, qb.explanation_en,qb.explanation_hi
-            FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
-            WHERE qq.quiz_id=%s AND qb.status='ready' ORDER BY qq.position""", (attempt["id"], quiz_id))
-    return json_response({"attempt_id": int(attempt["id"]), "quiz_id": int(quiz_id), "started_at": attempt["started_at"].isoformat(), "duration_minutes": int(quiz["duration_minutes"]), "question_time_seconds": int(quiz["question_time_seconds"] or 0), "shuffle_options": bool(quiz["shuffle_options"]), "mode": mode, "mode_label": requested_mode})
+        async with conn.cursor() as snapshot_cur:
+            for position, question_id in enumerate(question_ids, start=1):
+                src_cur=await conn.execute("SELECT id,subject,question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi FROM question_bank WHERE id=%s AND status='ready'",(question_id,))
+                qrow=await src_cur.fetchone()
+                if not qrow: continue
+                opts=qrow['options'] if isinstance(qrow['options'],dict) else json.loads(qrow['options'] or '{}')
+                original=list(opts.items())
+                # Keep a dedicated E=Not Attempted sentinel in place; shuffle actual answer options.
+                sentinel=None
+                if 'E' in opts and (str(opts['E']).strip().lower().startswith('not attempted') or str(opts['E']).strip().startswith('प्रयास नहीं किया')):
+                    sentinel=('E',opts['E']); original=[item for item in original if item[0]!='E']
+                random.SystemRandom().shuffle(original)
+                remapped={}
+                correct_new=None
+                for idx,(old_key,value) in enumerate(original):
+                    new_key='ABCDE'[idx]
+                    remapped[new_key]=value
+                    if old_key==qrow['correct_option']: correct_new=new_key
+                if sentinel:
+                    remapped['E']=sentinel[1]
+                elif 'E' in opts and len(original)<5:
+                    # Preserve any non-sentinel fifth option if present.
+                    pass
+                if correct_new is None and sentinel and qrow['correct_option']=='E': correct_new='E'
+                await snapshot_cur.execute("""INSERT INTO bank_quiz_attempt_question_snapshots(attempt_id,position,question_id,subject,question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s)""",
+                    (attempt['id'],position,qrow['id'],qrow['subject'],qrow['question_en'],qrow['question_hi'],qrow['question_type'],json.dumps(qrow['question_structure'] or {}),json.dumps(qrow['question_flags'] or {}),json.dumps(remapped,ensure_ascii=False),correct_new or qrow['correct_option'],qrow['explanation_en'],qrow['explanation_hi']))
+    return json_response({"attempt_id": int(attempt["id"]), "quiz_id": int(quiz_id), "started_at": attempt["started_at"].isoformat(), "duration_minutes": int(quiz["duration_minutes"]), "question_time_seconds": int(quiz["question_time_seconds"] or 0), "shuffle_options": False, "shuffle_questions": True, "server_shuffled": True, "mode": mode, "mode_label": requested_mode})
 
 
 async def get_attempt(request):
@@ -1025,7 +1298,7 @@ async def get_attempt(request):
         questions.append(item)
     settings = attempt["quiz_settings"] if isinstance(attempt["quiz_settings"], dict) else json.loads(attempt["quiz_settings"] or "{}")
     return json_response({"submitted": False, "attempt_id": attempt_id, "quiz_id": int(attempt["quiz_id"]), "title": attempt["title"], "subject": attempt["subject"], "mode": attempt["mode"], "mode_label": settings.get("mode_label", attempt["mode"]),
-                          "duration_minutes": int(attempt["duration_minutes"]), "question_time_seconds": int(attempt["question_time_seconds"] or 0), "shuffle_options": bool(attempt["shuffle_options"]), "started_at": attempt["started_at"].isoformat(), "deadline": datetime.fromtimestamp(deadline, timezone.utc).isoformat() if deadline is not None else None,
+                          "duration_minutes": int(attempt["duration_minutes"]), "question_time_seconds": int(attempt["question_time_seconds"] or 0), "shuffle_options": False, "server_shuffled": True, "started_at": attempt["started_at"].isoformat(), "deadline": datetime.fromtimestamp(deadline, timezone.utc).isoformat() if deadline is not None else None,
                           "positive_marks": float(attempt["positive_marks"]), "negative_marks": float(attempt["negative_marks"]), "questions": questions})
 
 
@@ -1169,6 +1442,10 @@ async def startup(app):
     async with pool.connection() as conn:
         await payment_schema(conn)
         await ensure_test_series_schema(conn)
+        await ensure_access_schema(conn)
+        await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_admin_audit (
+            id BIGSERIAL PRIMARY KEY, admin_telegram_id BIGINT NOT NULL, action TEXT NOT NULL,
+            target TEXT NOT NULL, details JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
         await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_user_preferences (
             telegram_id BIGINT NOT NULL, preference_key TEXT NOT NULL, preference_value TEXT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (telegram_id, preference_key))""")
@@ -1238,6 +1515,16 @@ def make_app():
     app.router.add_post("/api/admin/test-series/{series_id}/tests", admin_link_series_test)
     app.router.add_post("/api/admin/test-series/{series_id}/publish", admin_publish_test_series)
     app.router.add_post("/api/admin/test-series/{series_id}/entitlement", admin_series_entitlement)
+    app.router.add_get("/api/access", access_status)
+    app.router.add_get("/api/admin/overview", admin_overview)
+    app.router.add_get("/api/admin/banks", admin_banks)
+    app.router.add_post("/api/admin/banks/access", admin_set_bank_access)
+    app.router.add_get("/api/admin/quizzes", admin_quizzes)
+    app.router.add_get("/api/admin/series", admin_series)
+    app.router.add_post("/api/admin/quizzes/{quiz_id}/access", admin_set_quiz_access)
+    app.router.add_post("/api/admin/test-series/{series_id}/access", admin_set_series_access)
+    app.router.add_post("/api/admin/demo/settings", admin_demo_settings)
+    app.router.add_post("/api/admin/demo/grant", admin_demo_grant)
     app.router.add_get("/api/quizzes", list_quizzes)
     app.router.add_get("/api/history", attempt_history)
     app.router.add_get("/api/revision", list_revision)
