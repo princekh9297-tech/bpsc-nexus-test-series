@@ -1681,7 +1681,7 @@ $('admin-logout')?.addEventListener('click',logoutAdmin);
 
 async function loadAccess(){
   if(!tg||!tg.initData){updateAdminPanelAuthView();return null;}
-  const d=await api('/api/access');accessInfo=d;
+  const d=await api('/api/access/status');accessInfo=d;
   if(d.is_admin)adminSessionActive=true;
   updateAdminPanelAuthView();
   // Promo banner
