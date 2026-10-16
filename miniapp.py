@@ -1952,6 +1952,27 @@ async def all_quizzes_alias(request):
     return json_response({"quizzes": quizzes, "access": state})
 
 
+async def access_alias(request):
+    return await access_status(request)
+
+
+async def test_series_alias(request):
+    return await list_series(request)
+
+
+async def admin_series_list(request):
+    user = request['telegram_user']
+    if not _is_series_admin(user):
+        return json_response({'error': 'Admin access required.'}, 403)
+    async with request.app['pool'].connection() as conn:
+        await ensure_test_series_schema(conn)
+        cur = await conn.execute("""SELECT s.id,s.title,s.description,s.exam_type,s.series_type,s.subject,s.difficulty,s.access_type,s.is_published,s.sort_order,
+            COUNT(DISTINCT st.quiz_id) AS test_count FROM bpsc_nexus_test_series s
+            LEFT JOIN bpsc_nexus_test_series_tests st ON st.series_id=s.id GROUP BY s.id ORDER BY s.sort_order,s.id DESC LIMIT 300""")
+        rows = [dict(r) for r in await cur.fetchall()]
+    return json_response({'series': rows})
+
+
 async def debug_env(request):
     """Admin-only, non-secret deployment diagnostics."""
     user = request["telegram_user"]
@@ -1967,43 +1988,122 @@ async def debug_env(request):
     })
 
 
-async def quiz_start(request):
-    user=request['telegram_user']
-    try: qid=int(request.match_info['quiz_id'])
-    except ValueError: return json_response({'error':'Invalid quiz ID.'},400)
-    pool=request.app['pool']
+async def _create_quiz_attempt(request, qid: int, mode: str):
+    user = request['telegram_user']
+    mode = str(mode or 'exam').strip().lower()
+    if mode not in ('practice', 'exam'):
+        return json_response({'error': 'Mode must be practice or exam.'}, 400)
+    pool = request.app['pool']
     async with pool.connection() as conn:
         await qb.ensure_schema(pool)
-        cur=await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks,question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,is_published FROM bank_quizzes WHERE id=%s",(qid,))
-        quiz=await cur.fetchone()
-        if not quiz: return json_response({'error':'Quiz not found.'},404)
-        if quiz['is_custom'] and int(quiz['custom_owner_telegram_id'] or 0)!=user['id'] and not _is_series_admin(user):
-            return json_response({'error':'This is a private quiz.'},403)
-        if not quiz['is_published'] and not _is_series_admin(user): return json_response({'error':'This quiz is not published.'},403)
-        cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quizzes WHERE id=%s",(qid,))
-        cur=await conn.execute("""SELECT qq.question_id FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id
-            WHERE qq.quiz_id=%s AND qb.status='ready' ORDER BY qq.position,qq.question_id""",(qid,))
-        qids=[int(r['question_id']) for r in await cur.fetchall()]
-        if not qids: return json_response({'error':'This quiz has no verified questions yet.'},503)
-        cur=await conn.execute("""INSERT INTO bank_quiz_attempts(telegram_id,quiz_id,mode,quiz_settings,total_questions,started_at)
-            VALUES(%s,%s,'bank',%s::jsonb,%s,NOW()) RETURNING id,started_at""",
-            (user['id'],qid,json.dumps({'mode_label':'Quiz','negative_marks':float(quiz['negative_marks'])},ensure_ascii=False),len(qids)))
-        attempt=await cur.fetchone()
-        attempt_id=int(attempt['id'])
-        for pos,qid_item in enumerate(qids,1):
-            cur=await conn.execute("""SELECT id,subject,question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi
-                FROM question_bank WHERE id=%s""",(qid_item,))
-            q=await cur.fetchone()
-            opts=q['options'] if isinstance(q['options'],dict) else json.loads(q['options'] or '{}')
+        await ensure_access_schema(conn)
+        cur = await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks,question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,is_published,access_type FROM bank_quizzes WHERE id=%s", (qid,))
+        quiz = await cur.fetchone()
+        if not quiz:
+            return json_response({'error': 'Quiz not found.'}, 404)
+        if quiz['is_custom'] and int(quiz['custom_owner_telegram_id'] or 0) != user['id'] and not _is_series_admin(user):
+            return json_response({'error': 'This is a private quiz.'}, 403)
+        if not quiz['is_published'] and not _is_series_admin(user):
+            return json_response({'error': 'This quiz is not published.'}, 403)
+        cur = await conn.execute("SELECT qq.question_id FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id WHERE qq.quiz_id=%s AND qb.status='ready' ORDER BY qq.position,qq.question_id", (qid,))
+        qids = [int(r['question_id']) for r in await cur.fetchall()]
+        if not qids:
+            return json_response({'error': 'This quiz has no verified questions yet.'}, 503)
+        # Enforce paid access unless the Telegram user is an admin.
+        cur = await conn.execute("SELECT access_type FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) AND archived_at IS NULL LIMIT 1", (quiz['subject'],))
+        bank_row = await cur.fetchone()
+        effective_access = quiz['access_type'] if quiz['access_type'] in ('free', 'paid') else (bank_row['access_type'] if bank_row else 'free')
+        access = await _access_state(conn, user['id'], _is_series_admin(user), True)
+        if effective_access == 'paid' and not access['has_paid_access']:
+            return json_response({'error': 'This quiz requires paid access. Open membership options to continue.'}, 403)
+        settings = {'mode_label': 'Practice' if mode == 'practice' else 'Exam', 'negative_marks': float(quiz['negative_marks'])}
+        cur = await conn.execute("""INSERT INTO bank_quiz_attempts(telegram_id,quiz_id,mode,quiz_settings,total_questions,started_at,question_time_seconds)
+            VALUES(%s,%s,%s,%s::jsonb,%s,NOW(),%s) RETURNING id,started_at""",
+            (user['id'], qid, mode, json.dumps(settings, ensure_ascii=False), len(qids), int(quiz['question_time_seconds'] or 0)))
+        attempt = await cur.fetchone()
+        attempt_id = int(attempt['id'])
+        for pos, question_id in enumerate(qids, 1):
+            cur = await conn.execute("SELECT id,subject,question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi FROM question_bank WHERE id=%s", (question_id,))
+            q = await cur.fetchone()
+            if not q:
+                continue
+            opts = q['options'] if isinstance(q['options'], (dict, list)) else json.loads(q['options'] or '{}')
             await conn.execute("""INSERT INTO bank_quiz_attempt_question_snapshots(attempt_id,position,question_id,subject,question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s)""",
-                (attempt_id,pos,qid_item,q['subject'],q['question_en'],q['question_hi'],q['question_type'],
-                 json.dumps(q['question_structure'] or {},ensure_ascii=False),json.dumps(q['question_flags'] or {},ensure_ascii=False),
-                 json.dumps(opts,ensure_ascii=False),q['correct_option'],q['explanation_en'],q['explanation_hi']))
-    return json_response({'attempt_id':attempt_id,'quiz_id':qid,'title':quiz['title'],'subject':quiz['subject'],
-        'total_questions':len(qids),'duration_minutes':quiz['duration_minutes'],'question_time_seconds':int(quiz['question_time_seconds'] or 60),
-        'positive_marks':float(quiz['positive_marks']),'negative_marks':float(quiz['negative_marks']),
-        'shuffle_options':bool(quiz['shuffle_options']),'started_at':attempt['started_at'].isoformat()},201)
+                (attempt_id, pos, question_id, q['subject'], q['question_en'], q['question_hi'], q['question_type'],
+                 json.dumps(q['question_structure'] or {}, ensure_ascii=False), json.dumps(q['question_flags'] or {}, ensure_ascii=False),
+                 json.dumps(opts, ensure_ascii=False), q['correct_option'], q['explanation_en'], q['explanation_hi']))
+    return json_response({'attempt_id': attempt_id, 'quiz_id': qid, 'title': quiz['title'], 'subject': quiz['subject'],
+        'mode': mode, 'mode_label': settings['mode_label'], 'total_questions': len(qids), 'duration_minutes': quiz['duration_minutes'],
+        'question_time_seconds': int(quiz['question_time_seconds'] or 0), 'positive_marks': float(quiz['positive_marks']),
+        'negative_marks': float(quiz['negative_marks']), 'shuffle_options': bool(quiz['shuffle_options']),
+        'started_at': attempt['started_at'].isoformat()}, 201)
+
+
+async def quiz_start(request):
+    try:
+        qid = int(request.match_info['quiz_id'])
+    except (ValueError, KeyError):
+        return json_response({'error': 'Invalid quiz ID.'}, 400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return await _create_quiz_attempt(request, qid, body.get('mode', 'exam'))
+
+
+async def create_attempt_compat(request):
+    try:
+        body = await request.json()
+        qid = int(body.get('quiz_id'))
+    except Exception:
+        return json_response({'error': 'Provide a valid quiz_id.'}, 400)
+    return await _create_quiz_attempt(request, qid, body.get('mode', 'exam'))
+
+
+async def attempt_history_compat(request):
+    user_id = request['telegram_user']['id']
+    try:
+        limit = max(1, min(100, int(request.query.get('limit', '12'))))
+    except ValueError:
+        limit = 12
+    async with request.app['pool'].connection() as conn:
+        cur = await conn.execute("""SELECT a.id,a.quiz_id,a.mode,a.total_questions,a.correct_count,a.incorrect_count,a.skipped_count,a.score,a.started_at,a.submitted_at,q.title,q.subject,q.positive_marks
+            FROM bank_quiz_attempts a JOIN bank_quizzes q ON q.id=a.quiz_id
+            WHERE a.telegram_id=%s AND a.submitted_at IS NOT NULL ORDER BY a.submitted_at DESC LIMIT %s""", (user_id, limit))
+        rows = []
+        for r in await cur.fetchall():
+            attempted = int(r['correct_count'] or 0) + int(r['incorrect_count'] or 0)
+            rows.append({'attempt_id': int(r['id']), 'id': int(r['id']), 'quiz_id': int(r['quiz_id']), 'mode': r['mode'],
+                         'total_questions': int(r['total_questions']), 'correct': int(r['correct_count'] or 0),
+                         'incorrect': int(r['incorrect_count'] or 0), 'skipped': int(r['skipped_count'] or 0),
+                         'score': float(r['score'] or 0), 'max_score': float(r['total_questions']) * float(r['positive_marks']),
+                         'accuracy': round(int(r['correct_count'] or 0) / attempted * 100, 1) if attempted else 0,
+                         'started_at': r['started_at'].isoformat() if r['started_at'] else None,
+                         'submitted_at': r['submitted_at'].isoformat() if r['submitted_at'] else None,
+                         'title': r['title'], 'subject': r['subject']})
+    return json_response({'attempts': rows})
+
+
+async def attempt_review(request):
+    user = request['telegram_user']
+    try:
+        aid = int(request.match_info['attempt_id'])
+        body = await request.json()
+        qid = int(body.get('question_id'))
+        marked = bool(body.get('marked_for_review', False))
+    except Exception:
+        return json_response({'error': 'Invalid review payload.'}, 400)
+    async with request.app['pool'].connection() as conn:
+        cur = await conn.execute("SELECT a.submitted_at FROM bank_quiz_attempts a JOIN bank_quiz_attempt_question_snapshots s ON s.attempt_id=a.id AND s.question_id=%s WHERE a.id=%s AND a.telegram_id=%s", (qid, aid, user['id']))
+        row = await cur.fetchone()
+        if not row:
+            return json_response({'error': 'Question not part of this attempt.'}, 404)
+        if row['submitted_at']:
+            return json_response({'error': 'Attempt already submitted.'}, 409)
+        await conn.execute("""INSERT INTO bank_quiz_attempt_answers(attempt_id,question_id,selected_option,is_marked_review)
+            VALUES(%s,%s,NULL,%s) ON CONFLICT(attempt_id,question_id) DO UPDATE SET is_marked_review=EXCLUDED.is_marked_review""", (aid, qid, marked))
+    return json_response({'saved': True, 'question_id': qid, 'marked_for_review': marked})
 
 
 async def attempt_state(request):
@@ -2017,7 +2117,7 @@ async def attempt_state(request):
         if attempt['submitted_at']:
             payload=await _result_payload(conn,aid,user['id'])
             return json_response(payload or {'error':'Result unavailable.'},404 if not payload else 200)
-        cur=await conn.execute("""SELECT s.position,s.question_id AS id,s.subject,s.question_en,s.question_hi,s.question_type,s.question_structure,s.question_flags,s.options,aa.selected_option
+        cur=await conn.execute("""SELECT s.position,s.question_id AS id,s.subject,s.question_en,s.question_hi,s.question_type,s.question_structure,s.question_flags,s.options,aa.selected_option,COALESCE(aa.is_marked_review,FALSE) AS is_marked_review
             FROM bank_quiz_attempt_question_snapshots s
             LEFT JOIN bank_quiz_attempt_answers aa ON aa.attempt_id=s.attempt_id AND aa.question_id=s.question_id
             WHERE s.attempt_id=%s ORDER BY s.position""",(aid,))
@@ -2028,8 +2128,10 @@ async def attempt_state(request):
                 'question_type':r['question_type'],
                 'question_structure':r['question_structure'] if isinstance(r['question_structure'],dict) else json.loads(r['question_structure'] or '{}'),
                 'question_flags':r['question_flags'] if isinstance(r['question_flags'],dict) else json.loads(r['question_flags'] or '{}'),
-                'options':opts,'selected_option':r['selected_option']})
-    return json_response({'attempt_id':aid,'quiz_id':int(attempt['quiz_id']),'title':attempt['title'],'subject':attempt['subject'],
+                'options':opts,'selected_option':r['selected_option'],'marked_review':bool(r['is_marked_review'])})
+    deadline = (attempt['started_at'] + timedelta(minutes=int(attempt['duration_minutes'] or 60))).isoformat() if attempt['mode'] == 'exam' else None
+    settings = attempt['quiz_settings'] if isinstance(attempt['quiz_settings'], dict) else json.loads(attempt['quiz_settings'] or '{}')
+    return json_response({'attempt_id':aid,'quiz_id':int(attempt['quiz_id']),'title':attempt['title'],'subject':attempt['subject'],'mode':attempt['mode'],'mode_label':settings.get('mode_label', attempt['mode']),'deadline':deadline,
         'total_questions':int(attempt['total_questions']),'duration_minutes':attempt['duration_minutes'],
         'question_time_seconds':int(attempt['question_time_seconds'] or 60),
         'positive_marks':float(attempt['positive_marks']),'negative_marks':float(attempt['negative_marks']),
@@ -2037,21 +2139,32 @@ async def attempt_state(request):
 
 
 async def attempt_answer(request):
-    user=request['telegram_user']
+    user = request['telegram_user']
     try:
-        aid=int(request.match_info['attempt_id']); body=await request.json(); qid=int(body.get('question_id')); selected=str(body.get('selected_option') or '').strip().upper() or None
-    except Exception: return json_response({'error':'Invalid answer payload.'},400)
-    if selected and selected not in {'A','B','C','D','E'}: return json_response({'error':'Choose A, B, C, D or E.'},400)
+        aid = int(request.match_info['attempt_id'])
+        body = await request.json()
+        qid = int(body.get('question_id'))
+        selected = str(body.get('selected_option') or '').strip().upper() or None
+    except Exception:
+        return json_response({'error': 'Invalid answer payload.'}, 400)
+    if selected and selected not in {'A', 'B', 'C', 'D', 'E'}:
+        return json_response({'error': 'Choose A, B, C, D or E.'}, 400)
     async with request.app['pool'].connection() as conn:
-        cur=await conn.execute("""SELECT a.id,a.submitted_at,s.correct_option FROM bank_quiz_attempts a
-            JOIN bank_quiz_attempt_question_snapshots s ON s.attempt_id=a.id AND s.question_id=%s
-            WHERE a.id=%s AND a.telegram_id=%s""",(qid,aid,user['id']))
-        row=await cur.fetchone()
-        if not row: return json_response({'error':'Question not part of this attempt.'},404)
-        if row['submitted_at']: return json_response({'error':'Attempt already submitted.'},409)
+        cur = await conn.execute("""SELECT a.id,a.mode,a.submitted_at,s.correct_option,s.explanation_en,s.explanation_hi
+            FROM bank_quiz_attempts a JOIN bank_quiz_attempt_question_snapshots s ON s.attempt_id=a.id AND s.question_id=%s
+            WHERE a.id=%s AND a.telegram_id=%s""", (qid, aid, user['id']))
+        row = await cur.fetchone()
+        if not row:
+            return json_response({'error': 'Question not part of this attempt.'}, 404)
+        if row['submitted_at']:
+            return json_response({'error': 'Attempt already submitted.'}, 409)
         await conn.execute("""INSERT INTO bank_quiz_attempt_answers(attempt_id,question_id,selected_option)
-            VALUES(%s,%s,%s) ON CONFLICT(attempt_id,question_id) DO UPDATE SET selected_option=EXCLUDED.selected_option,answered_at=NOW()""",(aid,qid,selected))
-    return json_response({'saved':True,'question_id':qid,'selected_option':selected})
+            VALUES(%s,%s,%s) ON CONFLICT(attempt_id,question_id) DO UPDATE SET selected_option=EXCLUDED.selected_option""", (aid, qid, selected))
+        result = {'saved': True, 'question_id': qid, 'selected_option': selected}
+        if row['mode'] == 'practice':
+            result['feedback'] = {'correct_option': row['correct_option'], 'is_correct': bool(selected and selected == row['correct_option']),
+                                  'explanation_en': row['explanation_en'] or '', 'explanation_hi': row['explanation_hi'] or ''}
+    return json_response(result)
 
 
 async def attempt_submit(request):
@@ -2120,6 +2233,7 @@ def build_app() -> web.Application:
         web.get('/api/me', app_me),
         web.post('/api/register', register_user),
         web.get('/api/access/status', access_status),
+        web.get('/api/access', access_alias),
         web.post('/api/access/register-demo', register_demo),
 
         web.get('/api/leaderboard', leaderboard_data),
@@ -2135,8 +2249,12 @@ def build_app() -> web.Application:
 
         web.get('/api/admin/overview', admin_overview),
         web.get('/api/admin/banks', admin_banks),
+        web.post('/api/admin/banks/access', admin_set_bank_access),
         web.post('/api/admin/bank-access', admin_set_bank_access),
         web.get('/api/admin/quizzes', admin_quizzes),
+        web.get('/api/admin/series', admin_series_list),
+        web.get('/api/admin/cleanup', admin_cleanup_catalog),
+        web.post('/api/admin/test-series/{series_id}/access', admin_set_series_access),
         web.post('/api/admin/quizzes/{quiz_id}/access', admin_set_quiz_access),
         web.post('/api/admin/series/{series_id}/access', admin_set_series_access),
         web.get('/api/admin/cleanup-catalog', admin_cleanup_catalog),
@@ -2162,9 +2280,12 @@ def build_app() -> web.Application:
         web.get('/api/admin/subjects', admin_subjects_list),
         web.get('/api/admin/import-subjects', admin_import_subjects),
         web.post('/api/admin/import-subjects', admin_create_import_subject),
+        web.get('/api/admin/import/subjects', admin_import_subjects),
+        web.post('/api/admin/import/subjects', admin_create_import_subject),
         web.post('/api/admin/bulk-import', admin_bulk_import),
 
         web.get('/api/admin/questions/search', admin_questions_search),
+        web.get('/api/admin/questions', admin_questions_search),
         web.get('/api/admin/questions/{question_id}', admin_question_detail),
         web.post('/api/admin/questions/{question_id}', admin_question_update),
         web.delete('/api/admin/questions/{question_id}', admin_question_delete),
@@ -2174,12 +2295,15 @@ def build_app() -> web.Application:
         web.delete('/api/admin/notifications/{notification_id}', admin_notification_delete),
         web.get('/api/admin/promo', admin_get_promo),
         web.post('/api/admin/promo', admin_set_promo),
+        web.get('/api/admin/banner', admin_get_promo),
+        web.post('/api/admin/banner', admin_set_promo),
         web.post('/api/admin/maintenance', admin_set_maintenance),
 
         web.get('/api/notifications', notifications_list),
         web.post('/api/notifications/{notification_id}/read', notification_mark_read),
 
         web.get('/api/series', list_series),
+        web.get('/api/test-series', test_series_alias),
         web.get('/api/series/{series_id}', series_detail),
 
         web.get('/api/quizzes', all_quizzes_alias),
@@ -2191,9 +2315,17 @@ def build_app() -> web.Application:
         web.post('/api/attempt/{attempt_id}/submit', attempt_submit),
         web.get('/api/attempt/{attempt_id}/result', attempt_result),
         web.get('/api/attempts', my_attempts),
+        web.post('/api/attempts', create_attempt_compat),
+        web.get('/api/attempts/{attempt_id}', attempt_state),
+        web.post('/api/attempts/{attempt_id}/answer', attempt_answer),
+        web.post('/api/attempts/{attempt_id}/review', attempt_review),
+        web.post('/api/attempts/{attempt_id}/submit', attempt_submit),
+        web.get('/api/history', attempt_history_compat),
 
         web.get('/api/theme', get_theme_preference),
         web.post('/api/theme', save_theme_preference),
+        web.get('/api/preferences/theme', get_theme_preference),
+        web.put('/api/preferences/theme', save_theme_preference),
 
         web.get('/api/tasks', list_tasks),
         web.post('/api/tasks', create_task),
