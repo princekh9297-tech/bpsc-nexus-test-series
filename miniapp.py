@@ -1910,6 +1910,63 @@ async def browse_quizzes(request):
     return json_response({'subject':subject,'quizzes':quizzes,'access':state})
 
 
+async def all_quizzes_alias(request):
+    """Compatibility endpoint used by the current frontend quiz catalog."""
+    user = request["telegram_user"]
+    is_admin = _is_series_admin(user)
+    async with request.app["pool"].connection() as conn:
+        await ensure_access_schema(conn)
+        cur = await conn.execute("""
+            SELECT q.id, q.title, '' AS description,
+                   q.subject, q.duration_minutes,
+                   COALESCE((SELECT COUNT(*) FROM bank_quiz_questions qq
+                             JOIN question_bank qb ON qb.id = qq.question_id
+                             WHERE qq.quiz_id = q.id AND qb.status = 'ready'), 0) AS total_questions,
+                   q.positive_marks, q.negative_marks, q.access_type, q.is_custom,
+                   COALESCE((SELECT COUNT(*) FROM bank_quiz_questions qq
+                             JOIN question_bank qb ON qb.id = qq.question_id
+                             WHERE qq.quiz_id = q.id AND qb.status = 'ready'), 0) AS ready_count
+            FROM bank_quizzes q
+            WHERE q.is_published = TRUE
+              AND COALESCE(q.admin_hidden, FALSE) = FALSE
+              AND (q.is_custom = FALSE OR q.custom_owner_telegram_id = %s)
+            ORDER BY q.id DESC
+            LIMIT 200
+        """, (user["id"],))
+        quizzes = [dict(row) for row in await cur.fetchall()]
+        state = await _access_state(conn, user["id"], is_admin, True)
+        for quiz in quizzes:
+            if quiz["access_type"] == "inherit":
+                cur2 = await conn.execute(
+                    "SELECT access_type FROM question_bank_subjects "
+                    "WHERE LOWER(BTRIM(name)) = LOWER(BTRIM(%s)) "
+                    "AND archived_at IS NULL LIMIT 1",
+                    (quiz["subject"],),
+                )
+                row2 = await cur2.fetchone()
+                effective = row2["access_type"] if row2 else "free"
+            else:
+                effective = quiz["access_type"]
+            quiz["effective_access"] = effective
+            quiz["locked"] = effective == "paid" and not state["has_paid_access"]
+    return json_response({"quizzes": quizzes, "access": state})
+
+
+async def debug_env(request):
+    """Admin-only, non-secret deployment diagnostics."""
+    user = request["telegram_user"]
+    if int(user.get("id", 0)) not in ADMIN_TELEGRAM_IDS:
+        return json_response({"error": "Administrator access required."}, 403)
+    return json_response({
+        "ADMIN_LOGIN_ID_set": bool(ADMIN_LOGIN_ID),
+        "ADMIN_LOGIN_PASSWORD_set": bool(ADMIN_LOGIN_PASSWORD),
+        "ADMIN_LOGIN_TELEGRAM_ID_configured": ADMIN_LOGIN_TELEGRAM_ID > 0,
+        "ADMIN_TELEGRAM_IDS_count": len(ADMIN_TELEGRAM_IDS),
+        "BOT_TOKEN_set": bool(BOT_TOKEN),
+        "DATABASE_URL_set": bool(DATABASE_URL),
+    })
+
+
 async def quiz_start(request):
     user=request['telegram_user']
     try: qid=int(request.match_info['quiz_id'])
@@ -2058,6 +2115,7 @@ def build_app() -> web.Application:
         web.get('/', index),
         web.get('/membership', membership_page),
         web.get('/health', health),
+        web.get('/api/debug/env', debug_env),
 
         web.get('/api/me', app_me),
         web.post('/api/register', register_user),
@@ -2124,6 +2182,7 @@ def build_app() -> web.Application:
         web.get('/api/series', list_series),
         web.get('/api/series/{series_id}', series_detail),
 
+        web.get('/api/quizzes', all_quizzes_alias),
         web.get('/api/browse/banks', browse_banks),
         web.get('/api/browse/quizzes', browse_quizzes),
         web.post('/api/quiz/{quiz_id}/start', quiz_start),
