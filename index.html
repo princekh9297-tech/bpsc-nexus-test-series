@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#fdf2dd" id="meta-theme-color">
+<meta name="theme-color" content="#050711" id="meta-theme-color">
 <title>BPSC Nexus — Study Workspace</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
@@ -561,6 +561,236 @@ body.theme-arghya #brand-splash .splash-tag{color:#c8532b!important}
 body.theme-arghya .promo-banner,body.theme-arghya .admin-banner-preview{background:linear-gradient(115deg,#1e2a54,#4a2560 70%,#8b3a1e)!important;border:2px solid var(--brand-gold)!important}
 body.theme-arghya .notif-bell{background:#fffaf0!important;border:1.5px solid #e4cfa8!important;color:#1e2a54!important}
 
+/* ============================================================
+   THEME 3 — NUCLEAR CORE (reactor control panel, dark industrial)
+   ============================================================ */
+body.theme-nuclear-core{
+  color-scheme:dark;
+  --navy:#071b32;--blue:#32dcff;--ink:#f2f9ff;--muted:#afc4d8;--line:#29445d;
+  --paper:#0d1b2b;--bg:#050b14;--soft:#14283a;--green:#74f2ba;--amber:#ff985c;--red:#ff687c;
+  --nav-active:#17334a;--brand-gold:#c5a35c;
+  background-color:#050b14;
+  background-image:
+    radial-gradient(ellipse at 50% -15%,#164a6555 0,transparent 42%),
+    radial-gradient(ellipse at 100% 40%,#5a241733 0,transparent 32%),
+    radial-gradient(circle at 25% 35%,#32dcff08 0,transparent 22%),
+    linear-gradient(#071323dd,#071323dd);
+  background-attachment:fixed;
+}
+body.theme-nuclear-core::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+    repeating-linear-gradient(180deg,transparent 0 3px,#32dcff06 3px 4px);
+  opacity:.6;
+}
+body.theme-nuclear-core .topbar{
+  background:linear-gradient(180deg,#0a1520,#071323)!important;
+  border-bottom:1px solid #32dcff55!important;
+  box-shadow:0 4px 0 -2px #32dcff22,0 0 22px #32dcff18 inset!important;
+}
+body.theme-nuclear-core .topbar::before{
+  content:"";position:absolute;bottom:-3px;left:0;right:0;height:3px;
+  background:repeating-linear-gradient(90deg,#ff985c 0 8px,#050b14 8px 16px);
+  opacity:.85;
+}
+body.theme-nuclear-core .hero{
+  background:radial-gradient(circle at 88% 10%,#32dcff2e,transparent 42%),radial-gradient(circle at 10% 90%,#ff985c22,transparent 45%),linear-gradient(125deg,#071b32 0%,#0c3b53 55%,#4b2118 100%)!important;
+  border:1px solid #32dcff!important;
+  box-shadow:0 0 0 1px #32dcff20,0 0 42px #32dcff18,inset 0 0 44px #32dcff10!important;
+}
+body.theme-nuclear-core .hero::before{
+  content:"";position:absolute;right:-40px;top:-40px;width:160px;height:160px;border-radius:50%;pointer-events:none;
+  background:repeating-radial-gradient(circle at center,transparent 0 14px,#32dcff33 14px 15px,transparent 15px 28px);
+}
+body.theme-nuclear-core .hero::after{
+  content:"";position:absolute;left:18px;bottom:12px;width:56px;height:6px;pointer-events:none;
+  background:repeating-linear-gradient(90deg,#ff985c 0 6px,#050b14 6px 12px);opacity:.85;
+}
+body.theme-nuclear-core .hero .eyebrow{color:#ffad77!important;letter-spacing:.22em}
+body.theme-nuclear-core .hero h1{color:#f7fbff!important;text-shadow:0 0 18px #32dcff55}
+body.theme-nuclear-core .hero p{color:#c5dbf0!important}
+body.theme-nuclear-core .section-head h2{color:#f2f9ff!important;position:relative;padding-left:14px;text-shadow:0 0 14px #32dcff44}
+body.theme-nuclear-core .section-head h2::before{content:"◉";position:absolute;left:0;top:-1px;color:#32dcff;font-size:13px;animation:nuclearPulse 2.4s ease-in-out infinite}
+@keyframes nuclearPulse{0%,100%{opacity:1;text-shadow:0 0 8px #32dcff}50%{opacity:.45;text-shadow:none}}
+body.theme-nuclear-core .panel,body.theme-nuclear-core .quiz-card,body.theme-nuclear-core .shortcut,body.theme-nuclear-core .admin-panel-card,body.theme-nuclear-core .question-card,body.theme-nuclear-core .series-card,body.theme-nuclear-core .stat,body.theme-nuclear-core .admin-stat,body.theme-nuclear-core .theme-choice,body.theme-nuclear-core .notif-item{
+  background:linear-gradient(145deg,#0d1c2e,#081422)!important;
+  border:1px solid #29445d!important;
+  box-shadow:0 0 0 1px #32dcff0e,0 10px 28px #0009,inset 0 1px #ffffff08!important;
+  position:relative;
+}
+body.theme-nuclear-core .panel::before,body.theme-nuclear-core .quiz-card::before,body.theme-nuclear-core .admin-panel-card::before{
+  content:"";position:absolute;top:0;left:0;right:0;height:3px;border-radius:16px 16px 0 0;
+  background:repeating-linear-gradient(90deg,#ff985c 0 6px,#0d1c2e 6px 12px,#32dcff 12px 18px,#0d1c2e 18px 24px);
+  opacity:.85;
+}
+body.theme-nuclear-core .panel::after,body.theme-nuclear-core .admin-panel-card::after{
+  content:"";position:absolute;top:8px;right:10px;width:6px;height:6px;border-radius:50%;
+  background:#74f2ba;box-shadow:0 0 8px #74f2ba;animation:nuclearBlink 2.5s ease-in-out infinite;
+}
+@keyframes nuclearBlink{0%,85%,100%{opacity:1}90%,95%{opacity:.2}}
+body.theme-nuclear-core .primary{
+  background:linear-gradient(105deg,#087da5,#32dcff 55%,#ff985c)!important;
+  color:#04121d!important;border:1px solid #69e9ff!important;
+  box-shadow:0 0 22px #32dcff26,0 4px 14px #0005!important;font-weight:900;letter-spacing:.02em;
+}
+body.theme-nuclear-core .secondary{background:#0d1c2e!important;color:#c5dbf0!important;border:1px solid #29445d!important}
+body.theme-nuclear-core .secondary:hover{border-color:#32dcff!important;color:#32dcff!important}
+body.theme-nuclear-core .danger{background:#2a0e15!important;color:#ff8b9a!important;border:1px solid #ff687c!important}
+body.theme-nuclear-core .bottom-nav{
+  background:rgba(7,11,20,.95)!important;
+  border:1px solid #29445d!important;
+  box-shadow:0 0 0 1px #32dcff1a,0 -6px 30px #32dcff14,inset 0 1px #ffffff0a!important;
+  backdrop-filter:blur(18px);
+}
+body.theme-nuclear-core .bottom-nav::before{
+  content:"";position:absolute;top:-1px;left:14px;right:14px;height:2px;
+  background:repeating-linear-gradient(90deg,#32dcff 0 6px,transparent 6px 12px);opacity:.6;
+}
+body.theme-nuclear-core .tab-btn.active{
+  background:linear-gradient(135deg,#12314a,#1a4761)!important;
+  color:#32dcff!important;
+  box-shadow:inset 0 -3px 0 #ff985c,0 0 14px #32dcff28!important;
+}
+body.theme-nuclear-core .tab-btn{color:#8fa8c0!important}
+body.theme-nuclear-core .option{background:#0b1929!important;color:#eaf5ff!important;border:1px solid #29445d!important}
+body.theme-nuclear-core .option.selected{background:#12324c!important;border-color:#32dcff!important;box-shadow:0 0 0 1px #32dcff66,0 0 18px #32dcff30,inset 0 0 12px #32dcff14!important}
+body.theme-nuclear-core .letter{background:#14283a!important;color:#32dcff!important;border:1px solid #29445d!important}
+body.theme-nuclear-core .option.selected .letter{background:#32dcff!important;color:#04121d!important;border-color:#32dcff!important}
+body.theme-nuclear-core input,body.theme-nuclear-core select,body.theme-nuclear-core textarea{background:#091321!important;color:#f2f9ff!important;border:1px solid #29445d!important}
+body.theme-nuclear-core input:focus,body.theme-nuclear-core select:focus,body.theme-nuclear-core textarea:focus{border-color:#32dcff!important;box-shadow:0 0 0 3px #32dcff22,0 0 20px #32dcff14!important;outline:none}
+body.theme-nuclear-core .arena-hero{background:radial-gradient(circle at 90% 8%,#ff985c33,transparent 45%),radial-gradient(circle at 10% 90%,#32dcff26,transparent 50%),linear-gradient(125deg,#071b32,#0c3b53 60%,#4b2118)!important;border:1px solid #32dcff!important;box-shadow:0 0 0 1px #32dcff20,0 0 34px #32dcff18!important}
+body.theme-nuclear-core .arena-hero-stats>div{background:rgba(50,220,255,.08);border-color:#32dcff40}
+body.theme-nuclear-core .arena-hero-stats strong{color:#32dcff!important;text-shadow:0 0 8px #32dcff88}
+body.theme-nuclear-core .admin-nav-btn{background:#0b1929;border:1px solid #29445d;color:#8fa8c0}
+body.theme-nuclear-core .admin-nav-btn.active{background:#17334a;color:#32dcff;border-color:#32dcff;box-shadow:0 0 0 1px #32dcff33,0 0 12px #32dcff1a}
+body.theme-nuclear-core .stat strong,body.theme-nuclear-core .admin-stat strong{color:#32dcff!important;text-shadow:0 0 10px #32dcff55}
+body.theme-nuclear-core .timer{background:linear-gradient(135deg,#0d2438,#1a4761)!important;border:1px solid #32dcff!important;color:#8ff0ff!important;text-shadow:0 0 8px #32dcff88;box-shadow:0 0 14px #32dcff33!important}
+body.theme-nuclear-core .count{background:#14283a!important;color:#32dcff!important}
+body.theme-nuclear-core .subject{color:#ff985c!important}
+body.theme-nuclear-core .theme-choice.active{border-color:#32dcff!important;box-shadow:0 0 0 3px #32dcff22,0 0 20px #32dcff1a!important}
+body.theme-nuclear-core #brand-splash{background:radial-gradient(ellipse at 50% 30%,#0c3b53 0,#050b14 65%)!important}
+body.theme-nuclear-core #brand-splash .splash-mark{border:2px solid #32dcff!important;box-shadow:0 0 0 8px #32dcff1c,0 0 30px #32dcff4d!important;background:#050b14!important}
+body.theme-nuclear-core #brand-splash h1{color:#f2f9ff!important;text-shadow:0 0 16px #32dcff}
+body.theme-nuclear-core #brand-splash .splash-tag{color:#ff985c!important;text-shadow:0 0 10px #ff985c66}
+body.theme-nuclear-core .promo-banner,body.theme-nuclear-core .admin-banner-preview{background:linear-gradient(115deg,#071b32,#0c3b53 60%,#4b2118)!important;border:1px solid #32dcff!important}
+body.theme-nuclear-core .notif-bell{background:#0b1929!important;border:1px solid #29445d!important;color:#32dcff!important}
+@media(prefers-reduced-motion:reduce){body.theme-nuclear-core .section-head h2::before,body.theme-nuclear-core .panel::after{animation:none!important}}
+
+/* ============================================================
+   THEME 4 — ALCHEMY X (chemistry lab, deep purple, emerald+gold, mystic)
+   ============================================================ */
+body.theme-alchemy-x{
+  color-scheme:dark;
+  --navy:#1a1032;--blue:#42e59b;--ink:#f4fff6;--muted:#b5d3bf;--line:#3a2560;
+  --paper:#150c2b;--bg:#0a0618;--soft:#251841;--green:#64f0a6;--amber:#f4c35e;--red:#ff7584;
+  --nav-active:#2d1c52;--brand-gold:#f4c35e;
+  background-color:#0a0618;
+  background-image:
+    radial-gradient(ellipse at 20% 0%,#2a1557 0,transparent 42%),
+    radial-gradient(ellipse at 88% 28%,#5b3a0c55 0,transparent 34%),
+    radial-gradient(ellipse at 50% 100%,#17472b44 0,transparent 45%),
+    linear-gradient(155deg,#0a0618,#120b26 55%,#1a1032);
+  background-attachment:fixed;
+}
+body.theme-alchemy-x::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.28;
+  background-image:
+    radial-gradient(circle at 20px 20px,#42e59b30 1px,transparent 1.5px),
+    radial-gradient(circle at 60px 60px,#f4c35e30 1px,transparent 1.5px),
+    linear-gradient(30deg,transparent 48.8%,#42e59b22 49.2%,#42e59b22 50.8%,transparent 51.2%),
+    linear-gradient(-30deg,transparent 48.8%,#f4c35e22 49.2%,#f4c35e22 50.8%,transparent 51.2%);
+  background-size:70px 70px,70px 70px,70px 70px,70px 70px;
+  animation:alchemyDrift 90s linear infinite;
+}
+@keyframes alchemyDrift{from{background-position:0 0,0 0,0 0,0 0}to{background-position:70px 70px,140px 140px,70px 70px,-70px 70px}}
+body.theme-alchemy-x .topbar{
+  background:linear-gradient(180deg,#150c2b,#0a0618)!important;
+  border-bottom:1px solid #f4c35e55!important;
+  box-shadow:0 4px 0 -2px #f4c35e22,inset 0 -1px 0 #42e59b33!important;
+}
+body.theme-alchemy-x .topbar::before{
+  content:"";position:absolute;bottom:-3px;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,#42e59b,#f4c35e 50%,#42e59b);
+  opacity:.8;
+}
+body.theme-alchemy-x .hero{
+  background:radial-gradient(circle at 88% 10%,#f4c35e2e,transparent 42%),radial-gradient(circle at 10% 90%,#42e59b22,transparent 45%),linear-gradient(125deg,#150c2b 0%,#321344 55%,#123747 100%)!important;
+  border:1px solid #42e59b!important;
+  box-shadow:0 0 0 1px #42e59b20,0 0 42px #42e59b18,inset 0 0 44px #42e59b10!important;
+}
+body.theme-alchemy-x .hero::before{
+  content:"";position:absolute;right:-30px;top:-30px;width:140px;height:140px;pointer-events:none;
+  background:repeating-linear-gradient(60deg,transparent 0 12px,#f4c35e33 12px 13px,transparent 13px 24px);
+  transform:rotate(15deg);
+}
+body.theme-alchemy-x .hero .eyebrow{color:#f4c35e!important;letter-spacing:.22em}
+body.theme-alchemy-x .hero h1{color:#f4fff6!important;text-shadow:0 0 18px #42e59b55}
+body.theme-alchemy-x .hero p{color:#cbe9d5!important}
+body.theme-alchemy-x .section-head h2{color:#f4fff6!important;position:relative;padding-left:16px;text-shadow:0 0 14px #42e59b44}
+body.theme-alchemy-x .section-head h2::before{content:"⚗";position:absolute;left:0;top:-2px;color:#f4c35e;font-size:14px;animation:alchemySpark 3s ease-in-out infinite}
+@keyframes alchemySpark{0%,100%{transform:rotate(0) scale(1);opacity:1}50%{transform:rotate(10deg) scale(1.1);opacity:.7}}
+body.theme-alchemy-x .panel,body.theme-alchemy-x .quiz-card,body.theme-alchemy-x .shortcut,body.theme-alchemy-x .admin-panel-card,body.theme-alchemy-x .question-card,body.theme-alchemy-x .series-card,body.theme-alchemy-x .stat,body.theme-alchemy-x .admin-stat,body.theme-alchemy-x .theme-choice,body.theme-alchemy-x .notif-item{
+  background:linear-gradient(145deg,#1a1030,#0f0820)!important;
+  border:1px solid #3a2560!important;
+  box-shadow:0 0 0 1px #42e59b0e,0 10px 28px #0009,inset 0 1px #ffffff08!important;
+  position:relative;
+}
+body.theme-alchemy-x .panel::before,body.theme-alchemy-x .quiz-card::before,body.theme-alchemy-x .admin-panel-card::before{
+  content:"";position:absolute;top:0;left:0;right:0;height:3px;border-radius:16px 16px 0 0;
+  background:linear-gradient(90deg,#42e59b,#f4c35e 50%,#42e59b);
+  opacity:.85;
+}
+body.theme-alchemy-x .panel::after,body.theme-alchemy-x .admin-panel-card::after{
+  content:"✧";position:absolute;top:6px;right:10px;color:#f4c35e;font-size:13px;text-shadow:0 0 8px #f4c35e;animation:alchemySpark 2.8s ease-in-out infinite;
+}
+body.theme-alchemy-x .primary{
+  background:linear-gradient(105deg,#1a9d60,#42e59b 50%,#f4c35e)!important;
+  color:#06170c!important;border:1px solid #83f2b8!important;
+  box-shadow:0 0 22px #42e59b26,0 4px 14px #0005!important;font-weight:850;
+}
+body.theme-alchemy-x .secondary{background:#150c2b!important;color:#cbe9d5!important;border:1px solid #3a2560!important}
+body.theme-alchemy-x .secondary:hover{border-color:#42e59b!important;color:#42e59b!important}
+body.theme-alchemy-x .danger{background:#2a0f1c!important;color:#ff97a3!important;border:1px solid #ff7584!important}
+body.theme-alchemy-x .bottom-nav{
+  background:rgba(21,12,43,.94)!important;
+  border:1px solid #3a2560!important;
+  box-shadow:0 0 0 1px #f4c35e1a,0 -6px 30px #42e59b18,inset 0 1px #ffffff0a!important;
+  backdrop-filter:blur(18px);
+}
+body.theme-alchemy-x .bottom-nav::before{
+  content:"";position:absolute;top:-1px;left:14px;right:14px;height:2px;
+  background:linear-gradient(90deg,#42e59b,#f4c35e,#42e59b);opacity:.7;
+}
+body.theme-alchemy-x .tab-btn.active{
+  background:linear-gradient(135deg,#2d1c52,#3f2468)!important;
+  color:#42e59b!important;
+  box-shadow:inset 0 -3px 0 #f4c35e,0 0 14px #42e59b28!important;
+}
+body.theme-alchemy-x .tab-btn{color:#a69bc4!important}
+body.theme-alchemy-x .option{background:#150c2b!important;color:#eafcef!important;border:1px solid #3a2560!important}
+body.theme-alchemy-x .option.selected{background:#251841!important;border-color:#42e59b!important;box-shadow:0 0 0 1px #42e59b66,0 0 18px #42e59b30,inset 0 0 12px #42e59b14!important}
+body.theme-alchemy-x .letter{background:#251841!important;color:#42e59b!important;border:1px solid #3a2560!important}
+body.theme-alchemy-x .option.selected .letter{background:#42e59b!important;color:#06170c!important;border-color:#42e59b!important}
+body.theme-alchemy-x input,body.theme-alchemy-x select,body.theme-alchemy-x textarea{background:#0f0820!important;color:#f4fff6!important;border:1px solid #3a2560!important}
+body.theme-alchemy-x input:focus,body.theme-alchemy-x select:focus,body.theme-alchemy-x textarea:focus{border-color:#42e59b!important;box-shadow:0 0 0 3px #42e59b22,0 0 20px #42e59b14!important;outline:none}
+body.theme-alchemy-x .arena-hero{background:radial-gradient(circle at 90% 8%,#f4c35e33,transparent 45%),radial-gradient(circle at 10% 90%,#42e59b26,transparent 50%),linear-gradient(125deg,#150c2b,#321344 60%,#123747)!important;border:1px solid #42e59b!important}
+body.theme-alchemy-x .arena-hero-stats>div{background:rgba(66,229,155,.08);border-color:#42e59b40}
+body.theme-alchemy-x .arena-hero-stats strong{color:#42e59b!important;text-shadow:0 0 8px #42e59b88}
+body.theme-alchemy-x .admin-nav-btn{background:#150c2b;border:1px solid #3a2560;color:#a69bc4}
+body.theme-alchemy-x .admin-nav-btn.active{background:#2d1c52;color:#42e59b;border-color:#42e59b;box-shadow:0 0 0 1px #42e59b33,0 0 12px #42e59b1a}
+body.theme-alchemy-x .stat strong,body.theme-alchemy-x .admin-stat strong{color:#42e59b!important;text-shadow:0 0 10px #42e59b55}
+body.theme-alchemy-x .timer{background:linear-gradient(135deg,#1a1032,#321344)!important;border:1px solid #42e59b!important;color:#a2f5c8!important;text-shadow:0 0 8px #42e59b88;box-shadow:0 0 14px #42e59b33!important}
+body.theme-alchemy-x .count{background:#251841!important;color:#42e59b!important}
+body.theme-alchemy-x .subject{color:#f4c35e!important}
+body.theme-alchemy-x .theme-choice.active{border-color:#42e59b!important;box-shadow:0 0 0 3px #42e59b22,0 0 20px #42e59b1a!important}
+body.theme-alchemy-x #brand-splash{background:radial-gradient(ellipse at 50% 30%,#321344 0,#0a0618 65%)!important}
+body.theme-alchemy-x #brand-splash .splash-mark{border:2px solid #42e59b!important;box-shadow:0 0 0 8px #42e59b1c,0 0 30px #42e59b4d!important;background:#0a0618!important}
+body.theme-alchemy-x #brand-splash h1{color:#f4fff6!important;text-shadow:0 0 16px #42e59b}
+body.theme-alchemy-x #brand-splash .splash-tag{color:#f4c35e!important;text-shadow:0 0 10px #f4c35e66}
+body.theme-alchemy-x .promo-banner,body.theme-alchemy-x .admin-banner-preview{background:linear-gradient(115deg,#150c2b,#321344 60%,#123747)!important;border:1px solid #42e59b!important}
+body.theme-alchemy-x .notif-bell{background:#150c2b!important;border:1px solid #3a2560!important;color:#42e59b!important}
+@media(prefers-reduced-motion:reduce){body.theme-alchemy-x::before,body.theme-alchemy-x .section-head h2::before,body.theme-alchemy-x .panel::after{animation:none!important}}
+
 /* ==================== DEPLOYMENT UI PATCH ==================== */
 /* Keep every navigation item on one row; allow horizontal scrolling on narrow screens. */
 .bottom-nav{
@@ -752,7 +982,7 @@ button.promo-close{
 .arsenal-note{font-size:11px;color:var(--muted);margin-top:10px;line-height:1.5}
 
 
-
+/* ==================== ADDED PREMIUM THEMES ==================== */
 /* ============================================================
    THEME 5 — RAJWADA (Rajasthan · maroon · gold leaf · ivory)
    ============================================================ */
@@ -787,6 +1017,21 @@ body.theme-bodhi .hero .eyebrow{color:#ffe4b3!important;letter-spacing:.2em}body
 body.theme-bodhi .primary{background:linear-gradient(105deg,#8a4a1d,#c77817 55%,#e09a2a)!important;color:#fff8ec!important;border:1.5px solid #8a4a1d!important;box-shadow:0 3px 0 #5a2f0f,inset 0 1px #ffffff33!important;font-weight:850}body.theme-bodhi .secondary{background:#fff8ec!important;color:#8a4a1d!important;border:1.5px solid #c77817!important;box-shadow:0 2px 0 #f0dcb8!important}body.theme-bodhi .danger{background:#fdf0e6!important;color:#b8412a!important;border:1.5px solid #d97a5e!important}body.theme-bodhi .tab-btn{color:#8a7358!important}body.theme-bodhi .tab-btn.active{background:linear-gradient(135deg,#f3e2c4,#efd9b0)!important;color:#8a4a1d!important;box-shadow:inset 0 -3px 0 #c77817!important}
 body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;border:1.5px solid #e6d2b3!important}body.theme-bodhi .option.selected{background:#fdf0d8!important;border-color:#c77817!important;box-shadow:0 0 0 1px #c7781744!important}body.theme-bodhi .letter{background:#f3e2c4!important;color:#8a4a1d!important;border-color:#e6d2b3!important}body.theme-bodhi .option.selected .letter{background:#c77817!important;color:#fff8ec!important;border-color:#c77817!important}body.theme-bodhi input,body.theme-bodhi select,body.theme-bodhi textarea{background:#fff8ec!important;color:#3a2412!important;border:1.5px solid #e6d2b3!important}body.theme-bodhi input:focus,body.theme-bodhi select:focus,body.theme-bodhi textarea:focus{border-color:#c77817!important;box-shadow:0 0 0 3px #c7781722!important;outline:none}body.theme-bodhi .stat strong,body.theme-bodhi .admin-stat strong,body.theme-bodhi .subject{color:#8a4a1d!important}body.theme-bodhi .timer{background:#8a4a1d!important;color:#fff8ec!important;border:1.5px solid #c77817!important}body.theme-bodhi .count{background:#f3e2c4!important;color:#8a7358!important}body.theme-bodhi .notif-bell{background:#fff8ec!important;border:1.5px solid #e6d2b3!important;color:#8a4a1d!important}body.theme-bodhi #brand-splash{background:radial-gradient(ellipse at 50% 26%,#f3e2c4 0,#fbf1de 62%)!important;color:#3a2412!important}body.theme-bodhi #brand-splash .splash-mark{background:#fff8ec!important;border:2px solid #c77817!important;box-shadow:0 0 0 8px #c7781722,0 0 30px #c7781733!important}body.theme-bodhi #brand-splash h1{color:#3a2412!important;text-shadow:none!important}body.theme-bodhi #brand-splash .splash-tag{color:#c77817!important}body.theme-bodhi .admin-nav-btn{background:#fff8ec;border:1.5px solid #e6d2b3;color:#8a7358}body.theme-bodhi .admin-nav-btn.active{background:#f3e2c4;color:#8a4a1d;border-color:#c77817}body.theme-bodhi .promo-banner,body.theme-bodhi .admin-banner-preview{background:linear-gradient(115deg,#8a4a1d,#c77817 70%,#a04a15)!important;border:1.5px solid #f0dcb8!important}
 
+/* ==================== DEMO HARD GATE ==================== */
+#demo-register-modal .reg-lock-note{display:flex;align-items:center;gap:8px;padding:11px 12px;border-radius:12px;background:color-mix(in srgb,var(--red) 10%,transparent);border:1px solid color-mix(in srgb,var(--red) 40%,var(--line));color:var(--red);font-size:11.5px;font-weight:700;line-height:1.5;margin-bottom:14px}
+#demo-register-modal.locked #reg-cancel{display:none}
+#demo-register-modal.locked .reg-actions{grid-template-columns:1fr}
+#demo-register-modal.locked .reg-actions button{width:100%}
+.quiz-gated{position:relative;overflow:hidden}
+.quiz-gated::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,transparent 40%,color-mix(in srgb,var(--bg) 92%,transparent) 100%);pointer-events:none}
+.quiz-gate-chip{display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border-radius:8px;font-size:9.5px;font-weight:900;letter-spacing:.07em;background:color-mix(in srgb,var(--amber) 14%,var(--paper));color:var(--amber);border:1px solid color-mix(in srgb,var(--amber) 45%,var(--line))}
+.quiz-gate-chip.danger{background:color-mix(in srgb,var(--red) 12%,var(--paper));color:var(--red);border-color:color-mix(in srgb,var(--red) 45%,var(--line))}
+.demo-countdown-bar{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:11px 13px;border-radius:14px;margin:0 0 14px;background:linear-gradient(115deg,#0e2a16,#123a1e 60%,#0a2412);border:1px solid color-mix(in srgb,var(--green) 55%,var(--line));color:#d8ffe6;font-size:12px;font-weight:700}
+.demo-countdown-bar .dcd-icon{font-size:20px;line-height:1}.demo-countdown-bar .dcd-time{font:900 15px Manrope,Inter,sans-serif;font-variant-numeric:tabular-nums;color:#8fffc6;padding:4px 9px;border-radius:8px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15)}
+.demo-countdown-bar.warn{background:linear-gradient(115deg,#2a1408,#3a1c0a);border-color:color-mix(in srgb,var(--amber) 55%,var(--line));color:#ffe4b3}.demo-countdown-bar.warn .dcd-time{color:#ffce7c}
+.demo-countdown-bar.danger{background:linear-gradient(115deg,#2a0a12,#3a0e18);border-color:color-mix(in srgb,var(--red) 55%,var(--line));color:#ffc4d0}.demo-countdown-bar.danger .dcd-time{color:#ff95ab}
+.demo-expired-gate{padding:22px 18px;border-radius:18px;margin:14px 0;background:radial-gradient(circle at 85% 10%,#d5a83c30,transparent 45%),linear-gradient(135deg,var(--paper),var(--bg));border:1.5px solid color-mix(in srgb,var(--brand-gold) 55%,var(--line));text-align:center}
+.demo-expired-gate .deg-mark{font-size:48px;line-height:1;margin-bottom:8px}.demo-expired-gate h3{margin:0 0 6px;font:850 20px Manrope,Inter,sans-serif;letter-spacing:-.03em;color:var(--ink)}.demo-expired-gate p{margin:0 0 14px;font-size:12.5px;color:var(--muted);line-height:1.55}.demo-expired-gate .deg-actions{display:flex;gap:9px;justify-content:center;flex-wrap:wrap}.demo-expired-gate .deg-actions button{min-width:130px}
 
 </style>
 </head>
@@ -1017,7 +1262,7 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
   <div class="panel">
     <div class="section-head" style="margin-top:0"><h2>Choose your theme</h2><small>4 premium themes</small></div>
     <div class="theme-grid" id="theme-grid">
-      <button class="theme-choice" data-theme-choice="arghya" aria-pressed="false"><span class="theme-dots"><i style="background:#fdf2dd"></i><i style="background:#c8532b"></i><i style="background:#1e2a54"></i></span><strong>ARGHYA</strong><small>Bihar festival · cream &amp; saffron</small><span class="theme-selected">✓ Selected</span></button>
+      <button class="theme-choice" data-theme-choice="arghya" aria-pressed="false"><span class="theme-dots"><i style="background:#fdf2dd"></i><i style="background:#c8532b"></i><i style="background:#1e2a54"></i></span><strong>ARGHYA</strong><small>Bihar festival · cream & saffron</small><span class="theme-selected">✓ Selected</span></button>
       <button class="theme-choice" data-theme-choice="rajwada" aria-pressed="false"><span class="theme-dots"><i style="background:#2b1216"></i><i style="background:#c89b3c"></i><i style="background:#f5ead3"></i></span><strong>RAJWADA</strong><small>Royal palace · maroon &amp; gold leaf</small><span class="theme-selected">✓ Selected</span></button>
       <button class="theme-choice" data-theme-choice="kashi" aria-pressed="false"><span class="theme-dots"><i style="background:#0d1030"></i><i style="background:#b6323c"></i><i style="background:#d4a84a"></i></span><strong>KASHI</strong><small>Banarasi silk · indigo &amp; zari</small><span class="theme-selected">✓ Selected</span></button>
       <button class="theme-choice" data-theme-choice="bodhi" aria-pressed="false"><span class="theme-dots"><i style="background:#fff8ec"></i><i style="background:#c77817"></i><i style="background:#8a4a1d"></i></span><strong>BODHI</strong><small>Bodh Gaya · saffron &amp; ochre</small><span class="theme-selected">✓ Selected</span></button>
@@ -1464,20 +1709,15 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
 <div id="demo-register-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="reg-title">
   <div class="reg-card">
     <div class="reg-mark">🛡️</div>
-    <div class="reg-kicker">VERIFY YOUR TELEGRAM TO START DEMO</div>
+    <div class="reg-kicker" id="reg-kicker">VERIFY YOUR TELEGRAM TO START DEMO</div>
     <h2 id="reg-title">Confirm your identity</h2>
-    <p>Enter <b>your own</b> Telegram user ID or @username. We match it against Telegram's signed launch data — so nobody can start a demo as someone else.</p>
-    <div class="reg-tip">
-      <span style="font-size:18px">💡</span>
-      <span>Don't know your Telegram ID? Open <b>@userinfobot</b> in Telegram — it shows your numeric ID in one tap.</span>
-    </div>
+    <p id="reg-lead">Enter <b>your own</b> Telegram user ID or @username. We match it against Telegram's signed launch data — so nobody can start a demo as someone else.</p>
+    <div class="reg-lock-note hidden" id="reg-lock-note"><span style="font-size:16px">🔒</span><span>You must register to attempt any quiz. This is a one-time step and takes 10 seconds.</span></div>
+    <div class="reg-tip"><span style="font-size:18px">💡</span><span>Don't know your Telegram ID? Open <b>@userinfobot</b> in Telegram — it shows your numeric ID in one tap.</span></div>
     <label style="display:block;font-size:11px;font-weight:800;color:var(--muted);letter-spacing:.05em;margin-bottom:6px">TELEGRAM ID OR @USERNAME</label>
     <input id="reg-contact" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="e.g. 123456789 or @yourhandle" maxlength="64">
     <div id="reg-error" class="reg-error"></div>
-    <div class="reg-actions">
-      <button class="secondary" id="reg-cancel" type="button">Later</button>
-      <button class="primary" id="reg-submit" type="button">Verify &amp; Start demo →</button>
-    </div>
+    <div class="reg-actions"><button class="secondary" id="reg-cancel" type="button">Later</button><button class="primary" id="reg-submit" type="button">Verify &amp; Start demo →</button></div>
     <div id="reg-verified" class="reg-verified hidden" style="margin-top:12px">✓ Verified — starting your demo…</div>
   </div>
 </div>
@@ -1563,7 +1803,7 @@ const THEME_COLORS={arghya:'#fdf2dd',rajwada:'#1c0d10',kashi:'#0a0d28',bodhi:'#f
 let themeSyncHandle=null;
 function applyTheme(name,save=true){
   if(!THEME_CLASSES[name])name='arghya';
-  document.body.classList.remove('theme-arcade','theme-arghya','theme-nuclear-core','theme-alchemy-x','theme-aaroh','theme-vasant','theme-rajwada','theme-kashi','theme-bodhi');
+  document.body.classList.remove('theme-arcade','theme-arghya','theme-nuclear-core','theme-alchemy-x','theme-rajwada','theme-kashi','theme-bodhi');
   document.body.classList.add(THEME_CLASSES[name]);
   document.documentElement.dataset.theme=name;
   const meta=$('meta-theme-color');if(meta)meta.setAttribute('content',THEME_COLORS[name]);
@@ -1579,9 +1819,9 @@ function applyTheme(name,save=true){
 }
 async function loadThemePreference(){
   let local='arghya';try{local=localStorage.getItem(THEME_KEY)||'arghya'}catch(e){}
-  const aliases={'arcade':'arghya','cobalt':'arghya','amethyst':'arghya','midnight':'arghya','nuclear-core':'arghya','alchemy-x':'arghya','frost':'arghya','obsidian':'arghya','graphite':'arghya','classic':'arghya','emerald':'arghya','ivory':'arghya','aaroh':'arghya','vasant':'arghya','royal':'rajwada','banaras':'kashi','saffron':'bodhi'};
+  const aliases={'obsidian':'arghya','graphite':'arghya','classic':'arghya','emerald':'arghya','ivory':'arghya','cobalt':'arghya','amethyst':'arghya','midnight':'arghya','frost':'arghya','arcade':'arghya','nuclear-core':'arghya','alchemy-x':'arghya','royal':'rajwada','banaras':'kashi','saffron':'bodhi'};
   local=aliases[local]||local;
-  if(!THEME_CLASSES[local])local='arghya';
+  if(!THEME_CLASSES[local])local='arcade';
   applyTheme(local,false);
   if(tg&&tg.initData){try{const d=await api('/api/preferences/theme');if(d.theme){const remote=aliases[d.theme]||d.theme;if(THEME_CLASSES[remote])applyTheme(remote,false);}}catch(e){}}
 }
@@ -1634,20 +1874,10 @@ async function loadAccess(){
       slot.querySelector('.promo-close')?.addEventListener('click',()=>{slot.innerHTML='';slot.dataset.dismissed='1';});
     }
   }
-  // Demo banner
-  const banner=$('demo-banner');
-  if(banner){
-    if(d.demo_active){
-      const h=Math.floor(d.seconds_remaining/3600),m=Math.floor((d.seconds_remaining%3600)/60);
-      banner.classList.remove('hidden');
-      banner.innerHTML=`<div class="demo-kicker">COMPLIMENTARY · ACTIVE</div><h2>${esc(d.demo_message_title||'Your demo is live')}</h2><p>Explore paid banks during your demo window.</p><div class="demo-meta"><span>◷ ${h}h ${m}m remaining</span><span>${Number(d.demo_duration_hours||48)}-hour window</span></div>`;
-    } else if(d.demo_expired&&!d.has_paid_access){
-      banner.classList.remove('hidden');
-      banner.innerHTML=`<div class="demo-kicker">DEMO ENDED</div><h2>Your demo window has closed.</h2><p>Free banks still work. Paid banks need a pass.</p>`;
-    } else {banner.classList.add('hidden');}
-  }
+  // Demo banner + authoritative gate state
+  renderDemoBanner(d);
   if(d.trial_started_now){const modal=$('demo-welcome');if(modal)modal.classList.remove('hidden');}
-  if(d.registration_required){showRegisterModal(d);}
+  if(d.registration_required || d.demo_gate==='register'){showRegisterModal(d,true);}
   if(d.maintenance_mode)maintenanceOn=true;
   return d;
 }
@@ -2069,9 +2299,15 @@ async function loadQuizzes(){
     const data=await api('/api/quizzes');quizzes=data.quizzes||[];
     if($('quiz-count'))$('quiz-count').textContent=quizzes.length+' available';
     if(!quizzes.length){if($('quiz-list'))$('quiz-list').innerHTML='<div class="empty">No published quizzes.</div>';return;}
-    if($('quiz-list'))$('quiz-list').innerHTML=quizzes.map(q=>`<article class="quiz-card ${q.locked?'locked-card':''}"><div class="card-top"><span class="subject">${esc(q.subject)}</span><span class="${q.locked?'locked-chip':'count'}">${q.locked?'🔒 PAID':(q.effective_access==='paid'?'✦ DEMO':'FREE')} · ${q.total_questions} Q</span></div><h3>${esc(q.title)}</h3><p>${esc(q.description||'')}</p><div class="meta"><span>◷ ${q.duration_minutes} min</span><span>+${q.positive_marks} / −${q.negative_marks}</span></div>${q.locked?`<button class="secondary full" data-membership-open>View access options</button>`:`<div class="mode-row"><button class="secondary" data-start="${q.id}" data-mode="practice">Practice</button><button class="primary" data-start="${q.id}" data-mode="exam">Exam</button></div>`}</article>`).join('');
+    const gate=accessInfo?.demo_gate;
+    const gated=(gate==='register'||gate==='expired'||gate==='no_trial')&&!hasAdminAccess();
+    if($('quiz-list'))$('quiz-list').innerHTML=quizzes.map(q=>{
+      const isGated=gated;
+      return `<article class="quiz-card ${q.locked||isGated?'locked-card quiz-gated':''}"><div class="card-top"><span class="subject">${esc(q.subject)}</span>${isGated?`<span class="quiz-gate-chip danger">🔒 ${gate==='expired'?'DEMO ENDED':'REGISTER FIRST'}</span>`:`<span class="${q.locked?'locked-chip':'count'}">${q.locked?'🔒 PAID':(q.effective_access==='paid'?'✦ DEMO':'FREE')} · ${q.total_questions} Q</span>`}</div><h3>${esc(q.title)}</h3><p>${esc(q.description||'')}</p><div class="meta"><span>◷ ${q.duration_minutes} min</span><span>+${q.positive_marks} / −${q.negative_marks}</span></div>${isGated?`<button class="secondary full" data-gate-open>${gate==='expired'?'Unlock a pass →':'Register for demo →'}</button>`:(q.locked?`<button class="secondary full" data-membership-open>View access options</button>`:`<div class="mode-row"><button class="secondary" data-start="${q.id}" data-mode="practice">Practice</button><button class="primary" data-start="${q.id}" data-mode="exam">Exam</button></div>`)}</article>`;
+    }).join('');
     document.querySelectorAll('[data-start]').forEach(b=>b.onclick=()=>startQuiz(Number(b.dataset.start),b.dataset.mode));
     document.querySelectorAll('[data-membership-open]').forEach(b=>b.onclick=()=>{window.location.href='/membership';});
+    document.querySelectorAll('[data-gate-open]').forEach(b=>b.onclick=()=>{if(accessInfo?.demo_gate==='expired'){window.location.href='/membership';}else showRegisterModal(accessInfo||{registration_required:true},true);});
   }catch(e){if($('quiz-list'))$('quiz-list').innerHTML='<div class="empty">Could not load.</div>';}
 }
 
@@ -2122,6 +2358,7 @@ async function loadBuilderMeta(){
   try{const data=await api('/api/quiz-builder/meta');if($('bank-total'))$('bank-total').textContent=Number(data.total_ready||0).toLocaleString()+' verified';if($('builder-subject'))$('builder-subject').innerHTML='<option value="All subjects">All subjects · '+data.total_ready+'</option>'+(data.subjects||[]).map(s=>`<option value="${esc(s.name)}">${esc(s.name)} · ${s.count}</option>`).join('');if($('builder-topic'))$('builder-topic').innerHTML='<option value="">All topics</option>'+(data.topics||[]).map(t=>`<option value="${esc(t)}">${esc(t)}</option>`).join('');}catch(e){if($('bank-total'))$('bank-total').textContent='Unavailable';}
 }
 async function createCustomQuiz(){
+  if(!(await ensureDemoGate('build custom quizzes')))return;
   const btn=$('build-quiz-btn'),status=$('builder-status');btn.disabled=true;status.textContent='Building…';
   try{
     const payload={subject:$('builder-subject').value,topic:$('builder-topic').value,count:Number($('builder-count').value),selection:$('builder-selection').value,duration_minutes:360,question_time_seconds:Number($('builder-qtime').value),use_all_questions:$('builder-all-questions').checked,positive_marks:Number($('builder-positive').value),negative_marks:Number($('builder-negative').value),mode:document.querySelector('input[name="builder-mode"]:checked').value,title:$('builder-title').value||'My Custom Quiz',shuffle_options:$('builder-shuffle-options').checked};
@@ -2132,6 +2369,7 @@ $('build-quiz-btn')?.addEventListener('click',createCustomQuiz);
 loadBuilderMeta();
 
 async function startQuiz(id,mode){
+  if(!(await ensureDemoGate('attempt quizzes')))return;
   if(maintenanceOn&&!hasAdminAccess()){showError('Under maintenance. New quizzes are temporarily disabled.');return;}
   try{clearError();const created=await api('/api/attempts','POST',{quiz_id:id,mode});attempt=await api('/api/attempts/'+created.attempt_id);if(attempt.submitted){showResult(attempt);return;}index=0;answers={};review=new Set();feedback={};optionOrders={};attempt.questions.forEach(q=>{answers[q.id]=q.selected_option||null;if(q.marked_review)review.add(q.id);if(q.feedback)feedback[q.id]=q.feedback;});showView('exam');renderQuestion();startTimer();}
   catch(e){showError(e.message);}
@@ -2188,7 +2426,7 @@ function showResult(r){
   if(timerHandle)clearInterval(timerHandle);if(questionTimerHandle)clearInterval(questionTimerHandle);attempt=null;showView('result');
   const html=`<div class="result-head"><div class="eyebrow">${esc(r.mode||'practice').toUpperCase()}</div><h1>${esc(r.title)}</h1><div class="score">${Number(r.score).toFixed(2)}<span style="font-size:16px;opacity:.7"> / ${Number(r.max_score).toFixed(2)}</span></div><div style="color:#d7e2f1">${esc(r.subject)} · ${r.accuracy}%</div></div><div class="stats"><div class="stat"><strong>${r.correct}</strong><span>Correct</span></div><div class="stat"><strong>${r.incorrect}</strong><span>Incorrect</span></div><div class="stat"><strong>${r.skipped}</strong><span>Skipped</span></div></div><button id="back-home" class="primary full" style="margin-top:14px">Back to home</button>`;
   if($('result-view'))$('result-view').innerHTML=html;
-  $('back-home')?.addEventListener('click',()=>{showView('home');loadQuizzes();});
+  $('back-home')?.addEventListener('click',()=>{showView('home');loadAccess().catch(()=>{});loadQuizzes();});
 }
 $('prev-btn')?.addEventListener('click',prevQ);
 $('next-btn')?.addEventListener('click',nextQ);
@@ -2228,59 +2466,75 @@ async function openArenaMatch(id){
     box.querySelectorAll('[data-arena-opt]').forEach(b=>b.onclick=async()=>{stopArenaTick();box.querySelectorAll('[data-arena-opt]').forEach(x=>x.disabled=true);b.classList.add('selected');try{await api('/api/arena/matches/'+id+'/answers','POST',{position:q.position,selected_option:b.dataset.arenaOpt});setTimeout(()=>openArenaMatch(id),250);}catch(e){arenaStatus(e.message);box.querySelectorAll('[data-arena-opt]').forEach(x=>x.disabled=false);}});
   }catch(e){box.innerHTML=`<div class="error">${esc(e.message)}</div>`;}
 }
-$('arena-quick-match')?.addEventListener('click',()=>createArena('matchmaking'));
-$('arena-create-room')?.addEventListener('click',()=>createArena('invite'));
-$('arena-join-form')?.addEventListener('submit',joinArena);
+$('arena-quick-match')?.addEventListener('click',async()=>{if(await ensureDemoGate('enter the Arena'))createArena('matchmaking');});
+$('arena-create-room')?.addEventListener('click',async()=>{if(await ensureDemoGate('enter the Arena'))createArena('invite');});
+$('arena-join-form')?.addEventListener('submit',async ev=>{ev.preventDefault();if(await ensureDemoGate('enter the Arena'))joinArena(ev);});
 $('arena-refresh')?.addEventListener('click',refreshArena);
 
 // ============================================================
-// VERIFIED DEMO REGISTRATION
+// VERIFIED DEMO REGISTRATION (server-enforced hard gate)
 // ============================================================
 let pendingRegState = null;
-function showRegisterModal(state){
-  pendingRegState = state;
-  const modal = $('demo-register-modal');
-  if(!modal) return;
-  const err = $('reg-error'); if(err) err.textContent = '';
-  const v = $('reg-verified'); if(v) v.classList.add('hidden');
-  const inp = $('reg-contact');
-  const btn = $('reg-submit');
-  if(btn){ btn.disabled = false; btn.textContent = 'Verify & Start demo →'; }
-  if(inp){
-    const own = tg?.initDataUnsafe?.user?.username;
-    inp.value = own ? ('@'+own) : '';
-  }
-  modal.classList.remove('hidden');
-  setTimeout(()=>inp?.focus(), 150);
+let demoGateLocked = false;
+let demoBannerTick = null;
+function showRegisterModal(state, locked=false){
+  pendingRegState=state;demoGateLocked=!!locked;
+  const modal=$('demo-register-modal');if(!modal)return;
+  const err=$('reg-error');if(err)err.textContent='';
+  const verified=$('reg-verified');if(verified)verified.classList.add('hidden');
+  const inp=$('reg-contact'),btn=$('reg-submit');
+  if(btn){btn.disabled=false;btn.textContent='Verify & Start demo →';}
+  modal.classList.toggle('locked',demoGateLocked);
+  $('reg-lock-note')?.classList.toggle('hidden',!demoGateLocked);
+  if($('reg-kicker'))$('reg-kicker').textContent=demoGateLocked?'ONE STEP REQUIRED · VERIFY YOUR TELEGRAM':'VERIFY YOUR TELEGRAM TO START DEMO';
+  if($('reg-lead'))$('reg-lead').innerHTML=demoGateLocked?'To attempt any quiz, confirm your Telegram identity below. This takes 10 seconds and is done only once.':'Enter <b>your own</b> Telegram user ID or @username. We match it against Telegram&#39;s signed launch data — so nobody can start a demo as someone else.';
+  if($('reg-title'))$('reg-title').textContent=demoGateLocked?'Registration required':'Confirm your identity';
+  if(inp){const own=tg?.initDataUnsafe?.user?.username;inp.value=own?('@'+own):'';}
+  modal.classList.remove('hidden');setTimeout(()=>inp?.focus(),150);
 }
-function hideRegisterModal(){ $('demo-register-modal')?.classList.add('hidden'); }
+function hideRegisterModal(){if(demoGateLocked)return;$('demo-register-modal')?.classList.add('hidden');}
+$('reg-cancel')?.addEventListener('click',()=>{if(!demoGateLocked)hideRegisterModal();});
 
-$('reg-cancel')?.addEventListener('click', hideRegisterModal);
-$('reg-submit')?.addEventListener('click', async ()=>{
-  const inp = $('reg-contact');
-  const err = $('reg-error');
-  const btn = $('reg-submit');
-  const contact = (inp?.value || '').trim();
-  if(err) err.textContent = '';
-  if(!contact){ if(err) err.textContent = 'Enter your Telegram ID or @username.'; return; }
-  btn.disabled = true; btn.textContent = 'Verifying…';
-  try{
-    const state = await api('/api/access/register-demo', 'POST', {contact});
-    const v = $('reg-verified'); if(v) v.classList.remove('hidden');
-    btn.textContent = 'Verified ✓';
-    accessInfo = state;
-    const banner = $('demo-banner');
-    if(banner && state.demo_active){
-      const h = Math.floor(state.seconds_remaining/3600);
-      const m = Math.floor((state.seconds_remaining%3600)/60);
-      banner.classList.remove('hidden');
-      banner.innerHTML = `<div class="demo-kicker">COMPLIMENTARY · ACTIVE</div><h2>${esc(state.demo_message_title||'Your demo is live')}</h2><p>Explore paid banks during your demo window.</p><div class="demo-meta"><span>◷ ${h}h ${m}m remaining</span><span>${Number(state.demo_duration_hours||48)}-hour window</span></div>`;
-    }
-    setTimeout(()=>{ hideRegisterModal(); $('demo-welcome')?.classList.remove('hidden'); }, 900);
-  } catch(exc){
-    if(err) err.textContent = exc.message || 'Verification failed.';
-    btn.disabled = false; btn.textContent = 'Verify & Start demo →';
+function renderDemoBanner(state){
+  const slot=$('demo-banner');if(!slot)return;
+  if(demoBannerTick){clearInterval(demoBannerTick);demoBannerTick=null;}
+  if(state.demo_gate==='admin'||state.demo_gate==='paid') {slot.classList.add('hidden');slot.innerHTML='';return;}
+  if(state.demo_gate==='register'||state.demo_gate==='no_trial'){
+    slot.classList.remove('hidden');slot.innerHTML=`<div class="demo-countdown-bar danger"><span class="dcd-icon">🔒</span><span>Register to unlock your free demo — no quizzes until verified.</span><button class="primary" type="button" id="dcd-register-now" style="padding:7px 11px;font-size:11.5px">Register →</button></div>`;
+    $('dcd-register-now')?.addEventListener('click',()=>showRegisterModal(state,true));return;
   }
+  if(state.demo_gate==='expired'){
+    slot.classList.remove('hidden');slot.innerHTML=`<div class="demo-countdown-bar danger"><span class="dcd-icon">⏳</span><span>Your free demo has ended. Unlock a pass to keep attempting.</span><button class="secondary" type="button" id="dcd-get-pass" style="padding:7px 11px;font-size:11.5px">Get pass →</button></div>`;
+    $('dcd-get-pass')?.addEventListener('click',()=>{window.location.href='/membership';});return;
+  }
+  if(state.demo_gate==='active'){
+    slot.classList.remove('hidden');let remaining=Math.max(0,Number(state.seconds_remaining||0));
+    const render=secs=>{const h=Math.floor(secs/3600),m=Math.floor((secs%3600)/60),s=secs%60,cls=secs<300?'danger':(secs<3600?'warn':'');slot.innerHTML=`<div class="demo-countdown-bar ${cls}"><span class="dcd-icon">✦</span><span>${esc(state.demo_message_title||'Your demo is live')} · ${state.demo_duration_hours}h window</span><span class="dcd-time">${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}</span></div>`;};
+    render(remaining);demoBannerTick=setInterval(()=>{remaining=Math.max(0,remaining-1);render(remaining);if(remaining===0){clearInterval(demoBannerTick);demoBannerTick=null;loadAccess().catch(()=>{});}},1000);return;
+  }
+  slot.classList.add('hidden');slot.innerHTML='';
+}
+async function ensureDemoGate(actionLabel='do this'){
+  if(hasAdminAccess())return true;
+  try{
+    const d=await api('/api/demo/status');
+    if(d.allowed){await loadAccess().catch(()=>{});return true;}
+    if(d.reason==='expired') {accessInfo={...(accessInfo||{}),demo_gate:'expired'};renderDemoBanner(accessInfo);showError('Your free demo has ended. Unlock a pass to '+actionLabel+'.');return false;}
+    accessInfo={...(accessInfo||{}),demo_gate:'register',registration_required:true};
+    renderDemoBanner(accessInfo);showRegisterModal(accessInfo,true);return false;
+  }catch(e){showError(e.message||'Could not verify demo status.');return false;}
+}
+
+$('reg-submit')?.addEventListener('click',async()=>{
+  const inp=$('reg-contact'),err=$('reg-error'),btn=$('reg-submit'),contact=(inp?.value||'').trim();
+  if(err)err.textContent='';if(!contact){if(err)err.textContent='Enter your Telegram ID or @username.';return;}
+  btn.disabled=true;btn.textContent='Verifying…';
+  try{
+    const state=await api('/api/access/register-demo','POST',{contact});
+    if($('reg-verified'))$('reg-verified').classList.remove('hidden');btn.textContent='Verified ✓';
+    accessInfo=state;demoGateLocked=false;renderDemoBanner(state);
+    setTimeout(()=>{ $('demo-register-modal')?.classList.add('hidden');loadQuizzes().catch(()=>{});if(state.trial_started_now)$('demo-welcome')?.classList.remove('hidden');},700);
+  }catch(exc){if(err)err.textContent=exc.message||'Verification failed.';btn.disabled=false;btn.textContent='Verify & Start demo →';}
 });
 
 // ============================================================

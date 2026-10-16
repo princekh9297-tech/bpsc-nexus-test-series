@@ -1,0 +1,8 @@
+BPSC Nexus Mini App — Demo Gate Update
+
+Changed:
+- miniapp.py: server-side demo gate for quiz attempts, Arena create/join and custom quiz creation; Telegram identity verification audit log; five failed verification attempts per hour per Telegram user; demo status endpoint; startup schema bootstrap.
+- index.html: compulsory locked registration UX, demo countdown/status banner, gated quiz cards/actions, and exactly four themes: ARGHYA, RAJWADA, KASHI, BODHI.
+
+Verification performed: Python compile; JavaScript syntax checks where Node.js is available; HTML/theme/route counts and static assertions.
+Not performed: live Render/PostgreSQL/Telegram end-to-end tests. Deploy with your existing environment variables and test on a staging service first.

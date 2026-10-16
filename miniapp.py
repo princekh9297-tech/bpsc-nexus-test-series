@@ -88,6 +88,37 @@ ADMIN_SESSION_COOKIE = "bpsc_nexus_admin_session"
 ADMIN_SESSION_SECONDS = 12 * 60 * 60
 _ADMIN_LOGIN_FAILURES = {}
 
+# ---------- Demo verification anti-brute-force ----------
+_DEMO_VERIFY_FAILURES = {}   # {telegram_id: [timestamps]}
+_DEMO_VERIFY_MAX = 5
+_DEMO_VERIFY_WINDOW = 3600   # 1 hour
+
+def _demo_verify_allowed(tid: int) -> bool:
+    now = time.time()
+    recent = [t for t in _DEMO_VERIFY_FAILURES.get(tid, []) if now - t < _DEMO_VERIFY_WINDOW]
+    _DEMO_VERIFY_FAILURES[tid] = recent
+    return len(recent) < _DEMO_VERIFY_MAX
+
+def _demo_verify_record(tid: int):
+    now = time.time()
+    attempts = _DEMO_VERIFY_FAILURES.get(tid, [])
+    attempts.append(now)
+    _DEMO_VERIFY_FAILURES[tid] = attempts[-20:]
+
+async def ensure_demo_verify_schema(conn):
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_demo_verify_log (
+        id BIGSERIAL PRIMARY KEY,
+        telegram_id BIGINT NOT NULL,
+        attempted_contact TEXT NOT NULL,
+        contact_type TEXT NOT NULL,
+        success BOOLEAN NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""")
+    await conn.execute("""CREATE INDEX IF NOT EXISTS bpsc_nexus_demo_verify_log_tid_idx
+        ON bpsc_nexus_demo_verify_log(telegram_id, created_at DESC)""")
+
+
 
 def _admin_session_sign(payload: str) -> str:
     secret = ADMIN_SESSION_SECRET or BOT_TOKEN
@@ -503,6 +534,9 @@ async def arena_create(request):
     try: body=await request.json(); mode=str(body.get("mode","invite")); mode=mode if mode in {"invite","matchmaking"} else "invite"
     except Exception: mode="invite"
     async with request.app["pool"].connection() as conn:
+        gate_ok,gate_reason=await _demo_gate(conn,int(uid),_is_series_admin(request['telegram_user']))
+        if not gate_ok:
+            return json_response({'error':('Register for the free demo to enter the Arena.' if gate_reason in ('register','no_trial') else 'Your demo has ended. Unlock a pass to keep battling.'),'demo_gate':'register' if gate_reason in ('register','no_trial') else 'expired'},403)
         if mode=="matchmaking":
             cur=await conn.execute("""SELECT m.id FROM bpsc_nexus_arena_matches m JOIN bpsc_nexus_arena_players p ON p.match_id=m.id
                 WHERE m.status='waiting' AND m.match_type='matchmaking' AND p.telegram_id<>%s ORDER BY m.created_at FOR UPDATE OF m SKIP LOCKED LIMIT 1""",(uid,))
@@ -530,6 +564,9 @@ async def arena_join(request):
     except Exception: return json_response({"error":"Invalid invite code."},400)
     if not code: return json_response({"error":"Enter an invite code."},400)
     async with request.app["pool"].connection() as conn:
+        gate_ok,gate_reason=await _demo_gate(conn,int(uid),_is_series_admin(request['telegram_user']))
+        if not gate_ok:
+            return json_response({'error':('Register for the free demo to enter the Arena.' if gate_reason in ('register','no_trial') else 'Your demo has ended. Unlock a pass to keep battling.'),'demo_gate':'register' if gate_reason in ('register','no_trial') else 'expired'},403)
         cur=await conn.execute("SELECT id,status FROM bpsc_nexus_arena_matches WHERE invite_code=%s FOR UPDATE",(code,)); m=await cur.fetchone()
         if not m: return json_response({"error":"No arena room found for that code."},404)
         if m["status"]!="waiting": return json_response({"error":"This room has already started or finished."},409)
@@ -939,6 +976,32 @@ async def _has_all_access_pass(conn, telegram_id: int) -> bool:
     return bool((await cur.fetchone())['ok'])
 
 
+async def _demo_gate(conn, telegram_id: int, is_admin: bool = False) -> tuple[bool, str]:
+    """Server-side access gate for quiz attempts, Arena, and custom quiz creation."""
+    if is_admin:
+        return True, ''
+    try:
+        if await _has_all_access_pass(conn, telegram_id):
+            return True, ''
+    except Exception:
+        log.exception('Pass check failed for %s', telegram_id)
+    await ensure_access_schema(conn)
+    cur = await conn.execute('SELECT 1 FROM bpsc_nexus_demo_registrations WHERE telegram_id=%s', (telegram_id,))
+    registered = bool(await cur.fetchone())
+    if not registered:
+        return False, 'register'
+    cur = await conn.execute('SELECT expires_at FROM bpsc_nexus_demo_trials WHERE telegram_id=%s', (telegram_id,))
+    trial = await cur.fetchone()
+    if not trial:
+        return False, 'no_trial'
+    expires_at = trial['expires_at']
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= datetime.now(timezone.utc):
+        return False, 'expired'
+    return True, ''
+
+
 async def _has_subject_entitlement(conn, telegram_id: int, subject: str) -> bool:
     normalized=re.sub(r'[^a-z0-9]+','',str(subject or '').lower())
     if not normalized: return False
@@ -976,24 +1039,11 @@ async def access_status(request):
     async with request.app['pool'].connection() as conn:
         await ensure_access_schema(conn)
         await ensure_notifications_schema(conn)
-        cur=await conn.execute("SELECT 1 FROM bpsc_nexus_demo_registrations WHERE telegram_id=%s",(user['id'],))
+        cur=await conn.execute('SELECT 1 FROM bpsc_nexus_demo_registrations WHERE telegram_id=%s',(user['id'],))
         registered=bool(await cur.fetchone())
         state=await _access_state(conn,user['id'],is_admin,False)
-        if not is_admin and state['demo_enabled'] and not registered and not state['has_paid_access']:
-            state['registration_required']=True
-            state['trial_started_now']=False
-            state['demo_message_title']='Register to unlock your demo'
-            banner = await _get_setting(conn, "promo_banner", {}) or {}
-            maint = await _get_setting(conn, "maintenance", {"enabled": False}) or {}
-            state['promo_banner'] = {
-                'enabled': bool(banner.get('enabled')), 'tag': banner.get('tag',''),
-                'title': banner.get('title',''), 'message': banner.get('message',''),
-                'link': banner.get('link',''), 'link_label': banner.get('link_label',''),
-            }
-            state['maintenance_mode'] = bool(maint.get('enabled'))
-            return json_response(state)
         if registered:
-            await conn.execute("UPDATE bpsc_nexus_demo_registrations SET last_seen_at=NOW() WHERE telegram_id=%s",(user['id'],))
+            await conn.execute('UPDATE bpsc_nexus_demo_registrations SET last_seen_at=NOW() WHERE telegram_id=%s',(user['id'],))
         existed=bool(state['demo_started_at'])
         if not is_admin and registered and state['demo_enabled'] and not existed:
             await _ensure_trial(conn,user['id'])
@@ -1002,107 +1052,129 @@ async def access_status(request):
         else:
             state['trial_started_now']=False
         state['registration_required']=False
-        banner = await _get_setting(conn, "promo_banner", {}) or {}
-        maint = await _get_setting(conn, "maintenance", {"enabled": False}) or {}
-        state['promo_banner'] = {
-            'enabled': bool(banner.get('enabled')), 'tag': banner.get('tag',''),
-            'title': banner.get('title',''), 'message': banner.get('message',''),
-            'link': banner.get('link',''), 'link_label': banner.get('link_label',''),
-        }
-        state['maintenance_mode'] = bool(maint.get('enabled'))
-    state['demo_message_title']=f"Your {state['demo_duration_hours']}-hour BPSC Nexus Demo is live" if state['demo_active'] else ('Your demo has ended' if state['demo_expired'] else 'Explore BPSC Nexus')
+        has_pass=bool(state.get('has_all_access_pass'))
+        if is_admin: state['demo_gate']='admin'
+        elif has_pass: state['demo_gate']='paid'
+        elif not registered:
+            state['demo_gate']='register'
+            state['registration_required']=True
+            state['trial_started_now']=False
+            state['demo_message_title']='Register to unlock your demo'
+        elif state.get('demo_active'): state['demo_gate']='active'
+        else: state['demo_gate']='expired' if state.get('demo_expired') else 'no_trial'
+        banner=await _get_setting(conn,'promo_banner',{}) or {}
+        maint=await _get_setting(conn,'maintenance',{'enabled':False}) or {}
+        state['promo_banner']={'enabled':bool(banner.get('enabled')),'tag':banner.get('tag',''),'title':banner.get('title',''),'message':banner.get('message',''),'link':banner.get('link',''),'link_label':banner.get('link_label','')}
+        state['maintenance_mode']=bool(maint.get('enabled'))
+    state['demo_message_title']=state.get('demo_message_title') or (f"Your {state['demo_duration_hours']}-hour BPSC Nexus Demo is live" if state.get('demo_active') else ('Your demo has ended' if state.get('demo_expired') else 'Explore BPSC Nexus'))
     return json_response(state)
 
 
 async def _verify_telegram_identity(user: dict, contact: str, contact_type: str) -> tuple[bool, str]:
-    """Ensure a submitted Telegram ID/username matches Telegram's signed launch identity."""
+    """Validate contact against Telegram's signed Mini App identity, then cross-check via Bot API when available."""
     try:
-        self_id = int(user["id"])
-    except (KeyError, TypeError, ValueError):
-        return False, "Could not verify the Telegram account opening this app."
-    self_username = (user.get("username") or "").lower().lstrip("@")
-    if contact_type == "telegram_id":
-        try:
-            entered = int(contact)
-        except (TypeError, ValueError):
-            return False, "Enter a numeric Telegram user ID."
-        if entered != self_id:
-            return False, "That is not your own Telegram ID. Open @userinfobot to get yours."
+        self_id=int(user['id'])
+    except (KeyError,TypeError,ValueError):
+        return False,'Could not verify the Telegram account opening this app.'
+    self_username=(user.get('username') or '').lower().lstrip('@')
+    if contact_type=='telegram_id':
+        try: entered=int(contact)
+        except (TypeError,ValueError): return False,'Enter a numeric Telegram user ID.'
+        if entered!=self_id:
+            return False,'That is not your own Telegram ID. Open @userinfobot to get yours, or open this Mini App from your own account.'
     else:
-        entered = contact.lower().lstrip("@")
+        entered=contact.lower().lstrip('@')
         if not self_username:
-            return False, "Your Telegram account has no public username. Enter your numeric Telegram ID instead."
-        if entered != self_username:
-            return False, "That username does not belong to the Telegram account opening this app."
-    # Signed Telegram WebApp initData is the identity source. This best-effort Bot API ping
-    # is diagnostic only and never overrides the signed identity check.
+            return False,'Your Telegram account has no public username. Please enter your numeric Telegram ID instead.'
+        if entered!=self_username:
+            return False,'That username does not belong to the account opening this app. Enter the @username shown in your own Telegram profile.'
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
-            async with session.get(url, params={"chat_id": self_id}, timeout=aiohttp.ClientTimeout(total=6)) as response:
-                payload = await response.json()
-        if not payload.get("ok"):
-            log.info("Telegram getChat could not resolve user %s: %s", self_id, payload.get("description"))
+            url=f'https://api.telegram.org/bot{BOT_TOKEN}/getChat'
+            async with session.get(url,params={'chat_id':self_id},timeout=aiohttp.ClientTimeout(total=6)) as response:
+                payload=await response.json()
+        if payload.get('ok'):
+            result=payload.get('result') or {}
+            api_id=int(result.get('id') or 0)
+            api_username=(result.get('username') or '').lower().lstrip('@')
+            if api_id and api_id!=self_id:
+                return False,'Telegram identity mismatch. Re-open the Mini App from your own Telegram account.'
+            if contact_type=='username' and api_username and api_username!=entered:
+                return False,f'Your Telegram username is @{api_username}. Please enter that exact username.'
+        else:
+            log.info('Telegram getChat could not resolve %s: %s',self_id,payload.get('description'))
     except Exception as exc:
-        log.info("Telegram identity diagnostic ping failed for %s: %s", self_id, exc)
-    return True, ""
+        # Signed initData remains authoritative during temporary Telegram API failures.
+        log.warning('Telegram verify ping failed for %s: %s',self_id,exc)
+    return True,''
 
 
 async def register_demo(request):
-    user = request['telegram_user']
+    user=request['telegram_user']; tid=int(user['id'])
+    if not _demo_verify_allowed(tid):
+        return json_response({'error':'Too many verification attempts. Wait 1 hour and try again.','retry_after_seconds':_DEMO_VERIFY_WINDOW},429)
+    async def _log_invalid_contact(attempted: str, kind: str, reason: str):
+        try:
+            async with request.app['pool'].connection() as log_conn:
+                await ensure_demo_verify_schema(log_conn)
+                await log_conn.execute('INSERT INTO bpsc_nexus_demo_verify_log (telegram_id,attempted_contact,contact_type,success,reason) VALUES(%s,%s,%s,FALSE,%s)',(tid,str(attempted)[:100],kind,reason[:500]))
+        except Exception:
+            log.exception('Could not write invalid demo verification audit for %s',tid)
     try:
-        body = await request.json()
-        contact = str(body.get('contact', '')).strip()
+        body=await request.json(); contact=str(body.get('contact','')).strip()
     except Exception:
-        return json_response({'error': 'Enter your Telegram username or Telegram user ID.'}, 400)
-    contact = contact.lstrip('@') if contact.startswith('@') else contact
-    if not contact or len(contact) > 100:
-        return json_response({'error': 'Enter a valid Telegram username or Telegram user ID.'}, 400)
+        _demo_verify_record(tid);await _log_invalid_contact('', 'unknown', 'Invalid or missing JSON contact')
+        return json_response({'error':'Enter your Telegram username or Telegram user ID.'},400)
+    contact=contact[1:] if contact.startswith('@') else contact
+    if not contact or len(contact)>100:
+        _demo_verify_record(tid);await _log_invalid_contact(contact, 'unknown', 'Contact empty or too long')
+        return json_response({'error':'Enter a valid Telegram username or Telegram user ID.'},400)
     if contact.isdigit():
-        if int(contact) <= 0:
-            return json_response({'error': 'Telegram user ID must be a positive number.'}, 400)
-        contact_type = 'telegram_id'
-    elif re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}', contact):
-        contact_type = 'username'
-        contact = '@' + contact
+        if int(contact)<=0:
+            _demo_verify_record(tid);await _log_invalid_contact(contact,'telegram_id','Telegram ID must be positive')
+            return json_response({'error':'Telegram user ID must be a positive number.'},400)
+        contact_type='telegram_id'
+    elif re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}',contact):
+        contact_type='username';contact='@'+contact
     else:
-        return json_response({'error': 'Use a Telegram username (5–32 characters) or numeric Telegram user ID.'}, 400)
-
-    ok, err = await _verify_telegram_identity(user, contact, contact_type)
-    if not ok:
-        async with request.app['pool'].connection() as conn:
-            await ensure_access_schema(conn)
-            await _write_admin_audit(conn, user['id'], 'demo_registration_rejected', str(user['id']),
-                                     {'submitted_contact': contact, 'contact_type': contact_type, 'reason': err})
-        return json_response({'error': err}, 403)
-
+        _demo_verify_record(tid);await _log_invalid_contact(contact,'unknown','Invalid username or ID format')
+        return json_response({'error':'Use a Telegram username (5–32 characters) or numeric Telegram user ID.'},400)
+    ok,err=await _verify_telegram_identity(user,contact,contact_type)
     async with request.app['pool'].connection() as conn:
+        await ensure_demo_verify_schema(conn)
         await ensure_access_schema(conn)
-        cur = await conn.execute("SELECT enabled,duration_hours FROM bpsc_nexus_demo_config WHERE singleton=TRUE")
-        config = await cur.fetchone()
+        await conn.execute('INSERT INTO bpsc_nexus_demo_verify_log (telegram_id,attempted_contact,contact_type,success,reason) VALUES(%s,%s,%s,%s,%s)',(tid,contact,contact_type,bool(ok),err or ''))
+        if not ok:
+            _demo_verify_record(tid)
+            await _write_admin_audit(conn,tid,'demo_registration_rejected',str(tid),{'submitted_contact':contact,'contact_type':contact_type,'reason':err})
+            return json_response({'error':err},403)
+        cur=await conn.execute('SELECT enabled,duration_hours FROM bpsc_nexus_demo_config WHERE singleton=TRUE')
+        config=await cur.fetchone()
         if not config or not config['enabled']:
-            return json_response({'error': 'The demo is currently closed. Please contact the BPSC Nexus team.'}, 403)
-        await conn.execute("""INSERT INTO bpsc_nexus_demo_registrations
+            return json_response({'error':'The demo is currently closed. Please contact the BPSC Nexus team.'},403)
+        await conn.execute('''INSERT INTO bpsc_nexus_demo_registrations
             (telegram_id,telegram_username,submitted_contact,contact_type,registered_at,last_seen_at,source)
             VALUES(%s,%s,%s,%s,NOW(),NOW(),'miniapp')
             ON CONFLICT(telegram_id) DO UPDATE SET
-              telegram_username=EXCLUDED.telegram_username,
-              submitted_contact=EXCLUDED.submitted_contact,
-              contact_type=EXCLUDED.contact_type,
-              last_seen_at=NOW()""",
-            (user['id'], str(user.get('username') or '')[:64], contact, contact_type))
-        await _ensure_trial(conn, user['id'])
-        await _write_admin_audit(conn, user['id'], 'demo_registration', str(user['id']),
-                                 {'submitted_contact': contact, 'contact_type': contact_type, 'verified': True})
-        state = await _access_state(conn, user['id'], _is_series_admin(user), False)
-    state.update({
-        'registration_required': False,
-        'trial_started_now': bool(state.get('demo_active')),
-        'demo_message_title': (f"Your {state['demo_duration_hours']}-hour BPSC Nexus Demo is live"
-                               if state.get('demo_active') else 'Your demo is registered'),
-    })
+              telegram_username=EXCLUDED.telegram_username,submitted_contact=EXCLUDED.submitted_contact,
+              contact_type=EXCLUDED.contact_type,last_seen_at=NOW()''',
+            (tid,str(user.get('username') or '')[:64],contact,contact_type))
+        # _ensure_trial is idempotent: re-registration never resets an existing expiry.
+        await _ensure_trial(conn,tid)
+        await _write_admin_audit(conn,tid,'demo_registration',str(tid),{'submitted_contact':contact,'contact_type':contact_type,'verified':True})
+        state=await _access_state(conn,tid,_is_series_admin(user),False)
+        state['demo_gate']='admin' if _is_series_admin(user) else ('active' if state.get('demo_active') else 'expired')
+    state.update({'registration_required':False,'trial_started_now':bool(state.get('demo_active')),'demo_message_title':(f"Your {state['demo_duration_hours']}-hour BPSC Nexus Demo is live" if state.get('demo_active') else 'Your demo is registered')})
     return json_response(state)
+
+
+async def demo_status(request):
+    """Lightweight authoritative gate check before client-side attempt actions."""
+    user=request['telegram_user']
+    async with request.app['pool'].connection() as conn:
+        allowed,reason=await _demo_gate(conn,int(user['id']),_is_series_admin(user))
+    return json_response({'allowed':allowed,'reason':reason})
 
 
 async def admin_demo_registrations(request):
@@ -2121,6 +2193,11 @@ async def _create_quiz_attempt(request, qid: int, mode: str):
     async with pool.connection() as conn:
         await qb.ensure_schema(pool)
         await ensure_access_schema(conn)
+        gate_ok,gate_reason=await _demo_gate(conn,int(user['id']),_is_series_admin(user))
+        if not gate_ok:
+            if gate_reason in ('register','no_trial'):
+                return json_response({'error':'Please register for the free demo first to attempt quizzes.','demo_gate':'register'},403)
+            return json_response({'error':'Your free demo has ended. Unlock a pass to keep attempting quizzes.','demo_gate':'expired'},403)
         cur = await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks,question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,is_published,access_type FROM bank_quizzes WHERE id=%s", (qid,))
         quiz = await cur.fetchone()
         if not quiz:
@@ -2467,6 +2544,7 @@ async def admin_export(request):
             for r in await cur.fetchall(): writer.writerow([r['telegram_id'],r['first_name'],r['username'],r['last_seen_at']])
         elif kind == 'payments':
             await payment_schema(conn)
+            await ensure_demo_verify_schema(conn)
             writer.writerow(['id','telegram_id','product_name','amount_inr','status','transaction_ref','submitted_at','reviewed_at'])
             cur = await conn.execute('SELECT id,telegram_id,product_name,amount_inr,status,transaction_ref,submitted_at,reviewed_at FROM bpsc_payment_requests ORDER BY id DESC')
             for r in await cur.fetchall(): writer.writerow([r['id'],r['telegram_id'],r['product_name'],r['amount_inr'],r['status'],r['transaction_ref'],r['submitted_at'],r['reviewed_at']])
@@ -2534,6 +2612,10 @@ async def quiz_builder_meta(request):
 
 async def quiz_builder_create(request):
     user = request['telegram_user']
+    async with request.app['pool'].connection() as _gate_conn:
+        gate_ok,gate_reason=await _demo_gate(_gate_conn,int(user['id']),_is_series_admin(user))
+    if not gate_ok:
+        return json_response({'error':('Register for the free demo first to build custom quizzes.' if gate_reason in ('register','no_trial') else 'Your demo has ended. Unlock a pass to keep building.'),'demo_gate':'register' if gate_reason in ('register','no_trial') else 'expired'},403)
     try:
         body = await request.json()
         subject = str(body.get('subject') or 'All subjects').strip()
@@ -2700,6 +2782,7 @@ def build_app() -> web.Application:
         web.get('/api/me', app_me),
         web.post('/api/register', register_user),
         web.get('/api/access/status', access_status),
+        web.get('/api/demo/status', demo_status),
         web.get('/api/access', access_alias),
         web.post('/api/access/register-demo', register_demo),
 
