@@ -1772,6 +1772,8 @@ let allAdminTests=[],selectedTests=new Set();
 let notifList=[];
 let lastUnreadCount=-1;
 let arenaTickHandle=null,arenaDeadline=0;
+let arenaPollHandle=null,arenaPollMatchId=null;
+function stopArenaPoll(){if(arenaPollHandle){clearInterval(arenaPollHandle);arenaPollHandle=null;}arenaPollMatchId=null;}
 let maintenanceOn=false;
 
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1812,10 +1814,13 @@ function switchTab(tab,scroll=true){
   if(tab==='intel'){const m=$('intel-panel');}
   if(tab==='analytics'){loadHistory();loadRevision();loadXRay().catch(()=>{});loadArsenal(false).catch(()=>{});}
   if(tab==='leaderboard')loadLeaderboard();
-  if(tab==='arena')setTimeout(refreshArena,150);
+  if(tab==='arena'){setTimeout(refreshArena,150);setTimeout(reconnectArena,250);}
   if(tab==='admin'){updateAdminPanelAuthView();if(hasAdminAccess())loadAdminPanel();}
   if(scroll)window.scrollTo({top:0,behavior:'auto'});
 }
+
+async function reconnectArena(){try{const d=await api('/api/arena');const live=(d.matches||[]).find(m=>m.status==='active'||m.status==='waiting');if(live&&$('arena-live'))openArenaMatch(live.id);}catch(e){}}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)reconnectArena();});
 
 const THEME_KEY='bpsc_nexus_theme_v5';
 const THEME_CLASSES={arghya:'theme-arghya',rajwada:'theme-rajwada',kashi:'theme-kashi',bodhi:'theme-bodhi'};
@@ -2469,10 +2474,11 @@ async function createArena(mode){
 }
 async function joinArena(ev){ev?.preventDefault();const code=($('arena-invite-code')?.value||'').trim().toUpperCase();if(!code)return;arenaStatus('Joining…');try{const d=await api('/api/arena/join','POST',{invite_code:code});arenaStatus('Joined!');await refreshArena();await openArenaMatch(d.match_id);}catch(e){arenaStatus(e.message);}}
 async function openArenaMatch(id){
-  const box=$('arena-live');if(!box)return;box.classList.remove('hidden');box.innerHTML='<div class="arena-live-card"><div class="loader">Loading…</div></div>';
+  const box=$('arena-live');if(!box)return;
+  stopArenaPoll();arenaPollMatchId=id;box.classList.remove('hidden');box.innerHTML='<div class="arena-live-card"><div class="loader">Loading…</div></div>';
   try{
     const d=await api('/api/arena/matches/'+id);
-    if(d.status==='waiting'){box.innerHTML=`<div class="arena-live-card"><div class="arena-live-head" style="grid-template-columns:1fr"><div class="arena-player"><div class="avatar">⏳</div><b>Waiting for opponent</b></div></div><div style="text-align:center;margin:14px 0"><div style="font:900 22px Manrope,sans-serif;letter-spacing:.2em;color:var(--blue)">${esc(d.invite_code||'')}</div></div><button class="primary full" id="arena-copy-wait" type="button">📋 Copy invite code</button><button class="secondary full" style="margin-top:10px" id="arena-recheck" type="button">↻ Check status</button></div>`;$('arena-copy-wait').onclick=async()=>{try{await navigator.clipboard.writeText(d.invite_code||'');arenaStatus('Copied')}catch{arenaStatus(d.invite_code||'')}};$('arena-recheck').onclick=()=>openArenaMatch(id);return;}
+    if(d.status==='waiting'){box.innerHTML=`<div class="arena-live-card"><div class="arena-live-head" style="grid-template-columns:1fr"><div class="arena-player"><div class="avatar">⏳</div><b>Waiting for opponent</b><small>Room checks automatically every 2 seconds</small></div></div><div style="text-align:center;margin:14px 0"><div style="font:900 22px Manrope,sans-serif;letter-spacing:.2em;color:var(--blue)">${esc(d.invite_code||'')}</div></div><button class="primary full" id="arena-copy-wait" type="button">📋 Copy invite code</button><button class="secondary full" style="margin-top:10px" id="arena-cancel-wait" type="button">✕ Cancel room</button></div>`;$('arena-copy-wait').onclick=async()=>{try{await navigator.clipboard.writeText(d.invite_code||'');arenaStatus('Copied')}catch{arenaStatus(d.invite_code||'')}};$('arena-cancel-wait').onclick=async()=>{if(!confirm('Cancel this waiting room?'))return;stopArenaPoll();try{await api('/api/arena/matches/'+id+'/cancel','POST',{});box.classList.add('hidden');refreshArena();}catch(e){arenaStatus(e.message)}};arenaPollHandle=setInterval(async()=>{try{const st=await api('/api/arena/matches/'+id);if(st.status==='active'){stopArenaPoll();openArenaMatch(id)}else if(st.status==='expired'||st.status==='finished'){stopArenaPoll();box.innerHTML='<div class="arena-live-card arena-result draw"><h2>Room closed</h2><p>This room expired or was cancelled.</p><button class="secondary full" id="arena-room-back">Back to Arena</button></div>';const b=$('arena-room-back');if(b)b.onclick=()=>{box.classList.add('hidden');refreshArena()}}}catch(e){}},2000);return;}
     if(d.status==='finished'){const me=(d.players||[]).find(p=>p.is_you)||{score:0};const opp=(d.players||[]).find(p=>!p.is_you)||{score:0};const outcome=me.score>opp.score?'win':(me.score<opp.score?'loss':'draw');const emoji=outcome==='win'?'🏆':(outcome==='loss'?'💔':'🤝');const label=outcome==='win'?'Victory!':(outcome==='loss'?'Defeat':'Draw');const delta=outcome==='win'?'+25':(outcome==='loss'?'-25':'0');const dcls=outcome==='win'?'up':(outcome==='loss'?'down':'same');box.innerHTML=`<div class="arena-live-card arena-result ${outcome}"><div class="arena-result-mark">${emoji}</div><h2>${label}</h2><div class="final-score">${me.score} — ${opp.score}</div><span class="rating-delta ${dcls}">Rating ${delta}</span><div style="margin-top:16px;display:grid;gap:8px"><button class="primary full" id="arena-again" type="button">⚔️ Rematch</button><button class="secondary full" id="arena-done" type="button">Done</button></div></div>`;$('arena-again').onclick=()=>{box.classList.add('hidden');refreshArena();};$('arena-done').onclick=()=>{box.classList.add('hidden');refreshArena();};return;}
     const qs=d.questions||[];const me=(d.players||[]).find(p=>p.is_you)||{};const opp=(d.players||[]).find(p=>!p.is_you)||{};
     const meName=tg?.initDataUnsafe?.user?.first_name||'You';const oppName=opp.display_name||opp.username||'Opponent';
