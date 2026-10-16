@@ -1014,36 +1014,94 @@ async def access_status(request):
     return json_response(state)
 
 
-async def register_demo(request):
-    user=request['telegram_user']
+async def _verify_telegram_identity(user: dict, contact: str, contact_type: str) -> tuple[bool, str]:
+    """Ensure a submitted Telegram ID/username matches Telegram's signed launch identity."""
     try:
-        body=await request.json(); contact=str(body.get('contact','')).strip()
-    except Exception:
-        return json_response({'error':'Enter your Telegram username or Telegram user ID.'},400)
-    if contact.startswith('@'): contact=contact[1:]
-    if not contact or len(contact)>100:
-        return json_response({'error':'Enter a valid Telegram username or Telegram user ID.'},400)
-    if contact.isdigit():
-        if int(contact)<=0: return json_response({'error':'Telegram user ID must be a positive number.'},400)
-        contact_type='telegram_id'
-    elif re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}',contact):
-        contact_type='username'; contact='@'+contact
+        self_id = int(user["id"])
+    except (KeyError, TypeError, ValueError):
+        return False, "Could not verify the Telegram account opening this app."
+    self_username = (user.get("username") or "").lower().lstrip("@")
+    if contact_type == "telegram_id":
+        try:
+            entered = int(contact)
+        except (TypeError, ValueError):
+            return False, "Enter a numeric Telegram user ID."
+        if entered != self_id:
+            return False, "That is not your own Telegram ID. Open @userinfobot to get yours."
     else:
-        return json_response({'error':'Use a Telegram username (5–32 characters) or numeric Telegram user ID.'},400)
+        entered = contact.lower().lstrip("@")
+        if not self_username:
+            return False, "Your Telegram account has no public username. Enter your numeric Telegram ID instead."
+        if entered != self_username:
+            return False, "That username does not belong to the Telegram account opening this app."
+    # Signed Telegram WebApp initData is the identity source. This best-effort Bot API ping
+    # is diagnostic only and never overrides the signed identity check.
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
+            async with session.get(url, params={"chat_id": self_id}, timeout=aiohttp.ClientTimeout(total=6)) as response:
+                payload = await response.json()
+        if not payload.get("ok"):
+            log.info("Telegram getChat could not resolve user %s: %s", self_id, payload.get("description"))
+    except Exception as exc:
+        log.info("Telegram identity diagnostic ping failed for %s: %s", self_id, exc)
+    return True, ""
+
+
+async def register_demo(request):
+    user = request['telegram_user']
+    try:
+        body = await request.json()
+        contact = str(body.get('contact', '')).strip()
+    except Exception:
+        return json_response({'error': 'Enter your Telegram username or Telegram user ID.'}, 400)
+    contact = contact.lstrip('@') if contact.startswith('@') else contact
+    if not contact or len(contact) > 100:
+        return json_response({'error': 'Enter a valid Telegram username or Telegram user ID.'}, 400)
+    if contact.isdigit():
+        if int(contact) <= 0:
+            return json_response({'error': 'Telegram user ID must be a positive number.'}, 400)
+        contact_type = 'telegram_id'
+    elif re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}', contact):
+        contact_type = 'username'
+        contact = '@' + contact
+    else:
+        return json_response({'error': 'Use a Telegram username (5–32 characters) or numeric Telegram user ID.'}, 400)
+
+    ok, err = await _verify_telegram_identity(user, contact, contact_type)
+    if not ok:
+        async with request.app['pool'].connection() as conn:
+            await ensure_access_schema(conn)
+            await _write_admin_audit(conn, user['id'], 'demo_registration_rejected', str(user['id']),
+                                     {'submitted_contact': contact, 'contact_type': contact_type, 'reason': err})
+        return json_response({'error': err}, 403)
+
     async with request.app['pool'].connection() as conn:
         await ensure_access_schema(conn)
-        cur=await conn.execute("SELECT enabled,duration_hours FROM bpsc_nexus_demo_config WHERE singleton=TRUE")
-        config=await cur.fetchone()
+        cur = await conn.execute("SELECT enabled,duration_hours FROM bpsc_nexus_demo_config WHERE singleton=TRUE")
+        config = await cur.fetchone()
         if not config or not config['enabled']:
-            return json_response({'error':'The demo is currently closed. Please contact the BPSC Nexus team.'},403)
-        await conn.execute("""INSERT INTO bpsc_nexus_demo_registrations(telegram_id,telegram_username,submitted_contact,contact_type,registered_at,last_seen_at,source)
+            return json_response({'error': 'The demo is currently closed. Please contact the BPSC Nexus team.'}, 403)
+        await conn.execute("""INSERT INTO bpsc_nexus_demo_registrations
+            (telegram_id,telegram_username,submitted_contact,contact_type,registered_at,last_seen_at,source)
             VALUES(%s,%s,%s,%s,NOW(),NOW(),'miniapp')
-            ON CONFLICT(telegram_id) DO UPDATE SET telegram_username=EXCLUDED.telegram_username,submitted_contact=EXCLUDED.submitted_contact,contact_type=EXCLUDED.contact_type,last_seen_at=NOW()""",
-            (user['id'],str(user.get('username') or '')[:64],contact,contact_type))
-        trial, _=await _ensure_trial(conn,user['id'])
-        await _write_admin_audit(conn,user['id'],'demo_registration',str(user['id']),{'submitted_contact':contact,'contact_type':contact_type})
-        state=await _access_state(conn,user['id'],_is_series_admin(user),False)
-    state.update({'registration_required':False,'trial_started_now':bool(state['demo_active']),'demo_message_title':f"Your {state['demo_duration_hours']}-hour BPSC Nexus Demo is live" if state['demo_active'] else 'Your demo is registered'})
+            ON CONFLICT(telegram_id) DO UPDATE SET
+              telegram_username=EXCLUDED.telegram_username,
+              submitted_contact=EXCLUDED.submitted_contact,
+              contact_type=EXCLUDED.contact_type,
+              last_seen_at=NOW()""",
+            (user['id'], str(user.get('username') or '')[:64], contact, contact_type))
+        await _ensure_trial(conn, user['id'])
+        await _write_admin_audit(conn, user['id'], 'demo_registration', str(user['id']),
+                                 {'submitted_contact': contact, 'contact_type': contact_type, 'verified': True})
+        state = await _access_state(conn, user['id'], _is_series_admin(user), False)
+    state.update({
+        'registration_required': False,
+        'trial_started_now': bool(state.get('demo_active')),
+        'demo_message_title': (f"Your {state['demo_duration_hours']}-hour BPSC Nexus Demo is live"
+                               if state.get('demo_active') else 'Your demo is registered'),
+    })
     return json_response(state)
 
 
@@ -1742,23 +1800,54 @@ async def admin_notifications_list(request):
 
 
 async def admin_notification_create(request):
-    admin=request['telegram_user']
-    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    admin = request['telegram_user']
+    if not _is_series_admin(admin):
+        return json_response({'error': 'Admin access required.'}, 403)
     try:
-        body=await request.json(); title=str(body.get('title','')).strip()[:180]; message=str(body.get('message','')).strip()[:2000]
-        link=str(body.get('link','')).strip()[:500] or None; link_label=str(body.get('link_label','')).strip()[:80] or None
-        segment=str(body.get('segment','all')).lower(); is_pinned=bool(body.get('is_pinned')); silent=bool(body.get('silent'))
-        if not title or not message: raise ValueError('Title and message are required.')
-        if segment not in ('all','demo','paid','admin'): segment='all'
-    except (ValueError,TypeError): return json_response({'error':'Provide a title and message.'},400)
+        body = await request.json()
+        title = str(body.get('title', '')).strip()[:180]
+        message = str(body.get('message', '')).strip()[:2000]
+        link = str(body.get('link', '')).strip()[:500] or None
+        link_label = str(body.get('link_label', '')).strip()[:80] or None
+        segment = str(body.get('segment', 'all')).lower()
+        is_pinned = bool(body.get('is_pinned'))
+        silent = bool(body.get('silent'))
+        if not title or not message:
+            raise ValueError('Title and message are required.')
+        if segment not in ('all', 'demo', 'paid', 'admin'):
+            segment = 'all'
+    except (ValueError, TypeError):
+        return json_response({'error': 'Provide a title and message.'}, 400)
     async with request.app['pool'].connection() as conn:
         await ensure_notifications_schema(conn)
-        cur=await conn.execute("""INSERT INTO bpsc_nexus_notifications(title,message,link,link_label,segment,is_pinned,silent,created_by)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,created_at""",(title,message,link,link_label,segment,is_pinned,silent,admin['id']))
-        row=await cur.fetchone()
-        await _write_admin_audit(conn,admin['id'],'notification_create',str(row['id']),{'segment':segment,'title':title})
-    return json_response({'id':int(row['id']),'created_at':row['created_at'].isoformat(),'created':True},201)
-
+        await ensure_access_schema(conn)
+        cur = await conn.execute("""INSERT INTO bpsc_nexus_notifications
+            (title,message,link,link_label,segment,is_pinned,silent,created_by)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,created_at""",
+            (title, message, link, link_label, segment, is_pinned, silent, admin['id']))
+        row = await cur.fetchone()
+        recipients = 0
+        try:
+            if segment == 'demo':
+                cur = await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_demo_registrations")
+            elif segment == 'paid':
+                cur = await conn.execute("""SELECT COUNT(DISTINCT u.telegram_id) AS n
+                    FROM app_users u JOIN premium_passes pp ON pp.user_id=u.id
+                    WHERE pp.revoked_at IS NULL AND (pp.expires_at IS NULL OR pp.expires_at>NOW())""")
+            elif segment == 'admin':
+                recipients = len(ADMIN_TELEGRAM_IDS)
+                cur = None
+            else:
+                cur = await conn.execute("SELECT COUNT(*) AS n FROM app_users")
+            if cur is not None:
+                recipients = int((await cur.fetchone())['n'] or 0)
+            await conn.execute("UPDATE bpsc_nexus_notifications SET recipients=%s WHERE id=%s", (recipients, row['id']))
+        except Exception:
+            log.exception('Could not compute notification recipients for %s', row['id'])
+        await _write_admin_audit(conn, admin['id'], 'notification_create', str(row['id']),
+                                 {'segment': segment, 'title': title, 'recipients': recipients})
+    return json_response({'id': int(row['id']), 'created_at': row['created_at'].isoformat(),
+                          'created': True, 'recipients': recipients}, 201)
 
 async def admin_notification_delete(request):
     admin=request['telegram_user']
@@ -1774,19 +1863,50 @@ async def admin_notification_delete(request):
 
 
 async def notifications_list(request):
-    uid=request['telegram_user']['id']
+    uid = int(request['telegram_user']['id'])
     async with request.app['pool'].connection() as conn:
         await ensure_notifications_schema(conn)
-        cur=await conn.execute("""SELECT n.id,n.title,n.message,n.link,n.link_label,n.segment,n.is_pinned,n.silent,n.created_at,
-            (r.telegram_id IS NOT NULL) AS is_read
-            FROM bpsc_nexus_notifications n LEFT JOIN bpsc_nexus_notification_reads r ON r.notification_id=n.id AND r.telegram_id=%s
-            WHERE n.segment='all' OR (n.segment='admin' AND %s=ANY(%s)) ORDER BY n.is_pinned DESC,n.created_at DESC LIMIT 60""",
-            (uid,uid,list(ADMIN_TELEGRAM_IDS)))
-        rows=[dict(r) for r in await cur.fetchall()]
-    for r in rows:
-        if r.get('created_at'): r['created_at']=r['created_at'].isoformat()
-    return json_response({'notifications':rows})
+        cur = await conn.execute("""SELECT n.id,n.title,n.message,n.link,n.link_label,n.segment,
+                n.is_pinned,n.silent,n.created_at,
+                (r.telegram_id IS NOT NULL) AS is_read
+            FROM bpsc_nexus_notifications n
+            LEFT JOIN bpsc_nexus_notification_reads r
+              ON r.notification_id=n.id AND r.telegram_id=%s
+            WHERE n.segment='all'
+              OR (n.segment='admin' AND %s=ANY(%s))
+              OR (n.segment='demo' AND EXISTS (SELECT 1 FROM bpsc_nexus_demo_registrations dr WHERE dr.telegram_id=%s))
+              OR (n.segment='paid' AND EXISTS (SELECT 1 FROM app_users u JOIN premium_passes pp ON pp.user_id=u.id
+                    WHERE u.telegram_id=%s AND pp.revoked_at IS NULL AND (pp.expires_at IS NULL OR pp.expires_at>NOW())))
+            ORDER BY n.is_pinned DESC,n.created_at DESC LIMIT 60""",
+            (uid, uid, list(ADMIN_TELEGRAM_IDS), uid, uid))
+        rows = [dict(r) for r in await cur.fetchall()]
+    for row in rows:
+        if row.get('created_at'):
+            row['created_at'] = row['created_at'].isoformat()
+    unread = sum(1 for row in rows if not row.get('is_read'))
+    return json_response({'notifications': rows, 'unread_count': unread})
 
+
+async def notifications_mark_all_read(request):
+    uid = int(request['telegram_user']['id'])
+    async with request.app['pool'].connection() as conn:
+        await ensure_notifications_schema(conn)
+        cur = await conn.execute("""SELECT n.id FROM bpsc_nexus_notifications n
+            LEFT JOIN bpsc_nexus_notification_reads r
+              ON r.notification_id=n.id AND r.telegram_id=%s
+            WHERE r.telegram_id IS NULL AND (
+                n.segment='all'
+                OR (n.segment='admin' AND %s=ANY(%s))
+                OR (n.segment='demo' AND EXISTS (SELECT 1 FROM bpsc_nexus_demo_registrations dr WHERE dr.telegram_id=%s))
+                OR (n.segment='paid' AND EXISTS (SELECT 1 FROM app_users u JOIN premium_passes pp ON pp.user_id=u.id
+                      WHERE u.telegram_id=%s AND pp.revoked_at IS NULL AND (pp.expires_at IS NULL OR pp.expires_at>NOW())))
+              )""",
+            (uid, uid, list(ADMIN_TELEGRAM_IDS), uid, uid))
+        ids = [int(row['id']) for row in await cur.fetchall()]
+        for nid in ids:
+            await conn.execute("""INSERT INTO bpsc_nexus_notification_reads(notification_id,telegram_id)
+                VALUES(%s,%s) ON CONFLICT DO NOTHING""", (nid, uid))
+    return json_response({'marked': len(ids)})
 
 async def notification_mark_read(request):
     uid=request['telegram_user']['id']
@@ -1858,7 +1978,9 @@ async def series_detail(request):
         cur=await conn.execute("SELECT id,title,description,exam_type,series_type,subject,difficulty,access_type FROM bpsc_nexus_test_series WHERE id=%s AND is_published=TRUE",(sid,))
         series=await cur.fetchone()
         if not series: return json_response({'error':'Test series not found.'},404)
-        cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.duration_minutes,q.total_questions,q.is_published,st.position
+        cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.duration_minutes,
+                (SELECT COUNT(*) FROM bank_quiz_questions qq WHERE qq.quiz_id=q.id) AS total_questions,
+                q.is_published,st.position
             FROM bpsc_nexus_test_series_tests st JOIN bank_quizzes q ON q.id=st.quiz_id
             WHERE st.series_id=%s ORDER BY st.position ASC,q.id ASC""",(sid,))
         tests=[dict(r) for r in await cur.fetchall()]
@@ -1894,7 +2016,9 @@ async def browse_quizzes(request):
             cur=await conn.execute("SELECT DISTINCT subject FROM bank_quizzes WHERE is_published=TRUE AND is_custom=FALSE AND COALESCE(admin_hidden,FALSE)=FALSE ORDER BY subject")
             subjects=[r['subject'] for r in await cur.fetchall() if r['subject']]
             return json_response({'subjects':subjects,'quizzes':[]})
-        cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.duration_minutes,q.total_questions,q.access_type,q.is_custom,
+        cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.duration_minutes,
+            COALESCE((SELECT COUNT(*) FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id WHERE qq.quiz_id=q.id AND qb.status='ready'),0) AS total_questions,
+            q.access_type,q.is_custom,
             COALESCE((SELECT COUNT(*) FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id WHERE qq.quiz_id=q.id AND qb.status='ready'),0) AS ready_count
             FROM bank_quizzes q WHERE q.is_published=TRUE AND q.subject=%s AND COALESCE(q.admin_hidden,FALSE)=FALSE
             AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s) ORDER BY q.id DESC LIMIT 200""",(subject,user['id']))
@@ -2222,6 +2346,349 @@ async def register_user(request):
     return json_response({'registered':True})
 
 
+
+async def admin_bulk_delete_quizzes(request):
+    admin = request['telegram_user']
+    if not _is_series_admin(admin):
+        return json_response({'error': 'Admin access required.'}, 403)
+    try:
+        body = await request.json()
+        quiz_ids = sorted({int(x) for x in (body.get('quiz_ids') or []) if int(x) > 0})
+    except Exception:
+        return json_response({'error': 'Provide a quiz_ids array.'}, 400)
+    if not quiz_ids:
+        return json_response({'error': 'No quizzes selected.'}, 400)
+    deleted = archived = errors = 0
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        await ensure_test_series_schema(conn)
+        await lb.ensure_schema(request.app['pool'])
+        for qid in quiz_ids:
+            try:
+                cur = await conn.execute('SELECT id,title FROM bank_quizzes WHERE id=%s', (qid,))
+                quiz = await cur.fetchone()
+                if not quiz:
+                    errors += 1
+                    continue
+                cur = await conn.execute('SELECT COUNT(*) AS n FROM bank_quiz_attempts WHERE quiz_id=%s', (qid,))
+                attempts = int((await cur.fetchone())['n'] or 0)
+                cur = await conn.execute('SELECT COUNT(*) AS n FROM bpsc_leaderboard_daily_challenges WHERE quiz_id=%s', (qid,))
+                challenges = int((await cur.fetchone())['n'] or 0)
+                cur = await conn.execute("SELECT to_regclass('public.group_quiz_sessions') AS t")
+                group_table = await cur.fetchone()
+                group_sessions = 0
+                if group_table and group_table['t']:
+                    cur = await conn.execute('SELECT COUNT(*) AS n FROM group_quiz_sessions WHERE quiz_id=%s', (qid,))
+                    group_sessions = int((await cur.fetchone())['n'] or 0)
+                if attempts or challenges or group_sessions:
+                    await conn.execute('UPDATE bank_quizzes SET admin_hidden=TRUE,is_published=FALSE WHERE id=%s', (qid,))
+                    archived += 1
+                else:
+                    await conn.execute('DELETE FROM bpsc_nexus_test_series_tests WHERE quiz_id=%s', (qid,))
+                    await conn.execute('DELETE FROM bank_quiz_questions WHERE quiz_id=%s', (qid,))
+                    await conn.execute('DELETE FROM bank_quizzes WHERE id=%s', (qid,))
+                    deleted += 1
+            except Exception:
+                log.exception('Bulk quiz delete failed for %s', qid)
+                errors += 1
+        await _write_admin_audit(conn, admin['id'], 'bulk_quiz_delete', 'bulk',
+                                 {'deleted': deleted, 'archived': archived, 'errors': errors})
+    return json_response({'deleted': deleted, 'archived': archived, 'errors': errors})
+
+
+async def admin_activity(request):
+    if not _is_series_admin(request['telegram_user']):
+        return json_response({'error': 'Admin access required.'}, 403)
+    async with request.app['pool'].connection() as conn:
+        cur = await conn.execute("""SELECT
+            COUNT(DISTINCT telegram_id) FILTER (WHERE last_seen_at>NOW()-INTERVAL '5 minutes') AS active_5min,
+            COUNT(DISTINCT telegram_id) FILTER (WHERE last_seen_at>NOW()-INTERVAL '1 hour') AS active_hour
+            FROM app_users""")
+        user_stats = dict(await cur.fetchone() or {})
+        cur = await conn.execute("""SELECT COUNT(*) AS n FROM bank_quiz_attempts
+            WHERE started_at>=date_trunc('day',NOW())""")
+        attempts_today = int((await cur.fetchone())['n'] or 0)
+        cur = await conn.execute("""SELECT COUNT(*) AS n FROM app_users
+            WHERE last_seen_at>=NOW()-INTERVAL '1 day'""")
+        seen_today = int((await cur.fetchone())['n'] or 0)
+        cur = await conn.execute("""SELECT telegram_id,first_name,username,last_seen_at
+            FROM app_users ORDER BY last_seen_at DESC NULLS LAST LIMIT 15""")
+        feed = []
+        for row in await cur.fetchall():
+            feed.append({'icon': '👤', 'title': row['first_name'] or 'Student',
+                         'subtitle': ('@' + row['username']) if row['username'] else ('TG ' + str(row['telegram_id'])),
+                         'time': row['last_seen_at'].strftime('%H:%M') if row['last_seen_at'] else ''})
+    return json_response({'active_5min': int(user_stats.get('active_5min') or 0),
+                          'active_hour': int(user_stats.get('active_hour') or 0),
+                          'attempts_today': attempts_today, 'new_users_today': seen_today, 'feed': feed})
+
+
+async def admin_revenue(request):
+    if not _is_series_admin(request['telegram_user']):
+        return json_response({'error': 'Admin access required.'}, 403)
+    async with request.app['pool'].connection() as conn:
+        await payment_schema(conn)
+        cur = await conn.execute("""SELECT
+            COALESCE(SUM(amount_inr) FILTER (WHERE status='approved'),0) AS total,
+            COUNT(*) FILTER (WHERE status='approved') AS approvals,
+            COALESCE(SUM(amount_inr) FILTER (WHERE status='approved' AND reviewed_at>=date_trunc('month',NOW())),0) AS this_month,
+            COALESCE(SUM(amount_inr) FILTER (WHERE status='approved' AND reviewed_at>=date_trunc('day',NOW())),0) AS today,
+            COALESCE(SUM(amount_inr) FILTER (WHERE status='pending'),0) AS pending_value
+            FROM bpsc_payment_requests""")
+        row = dict(await cur.fetchone())
+        cur = await conn.execute("""SELECT DATE(reviewed_at) AS d,SUM(amount_inr) AS amount
+            FROM bpsc_payment_requests WHERE status='approved' AND reviewed_at>=NOW()-INTERVAL '7 days'
+            GROUP BY DATE(reviewed_at) ORDER BY d""")
+        daily = [{'label': r['d'].strftime('%a'), 'amount': float(r['amount'] or 0)} for r in await cur.fetchall()]
+        cur = await conn.execute("""SELECT product_name AS name,COUNT(*) AS count,SUM(amount_inr) AS amount
+            FROM bpsc_payment_requests WHERE status='approved' GROUP BY product_name ORDER BY amount DESC LIMIT 5""")
+        top = [{'name': r['name'], 'count': int(r['count']), 'amount': float(r['amount'] or 0)} for r in await cur.fetchall()]
+    for key in ('total','this_month','today','pending_value'):
+        row[key] = float(row.get(key) or 0)
+    row['approvals'] = int(row.get('approvals') or 0)
+    row['daily'] = daily
+    row['top_products'] = top
+    return json_response(row)
+
+
+async def admin_export(request):
+    if not _is_series_admin(request['telegram_user']):
+        return json_response({'error': 'Admin access required.'}, 403)
+    kind = request.match_info['kind']
+    allowed = {'users','payments','attempts','demo','notifications','all'}
+    if kind not in allowed:
+        return json_response({'error': 'Unknown export type.'}, 400)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    async with request.app['pool'].connection() as conn:
+        if kind == 'users':
+            writer.writerow(['telegram_id','first_name','username','last_seen_at'])
+            cur = await conn.execute('SELECT telegram_id,first_name,username,last_seen_at FROM app_users ORDER BY telegram_id')
+            for r in await cur.fetchall(): writer.writerow([r['telegram_id'],r['first_name'],r['username'],r['last_seen_at']])
+        elif kind == 'payments':
+            await payment_schema(conn)
+            writer.writerow(['id','telegram_id','product_name','amount_inr','status','transaction_ref','submitted_at','reviewed_at'])
+            cur = await conn.execute('SELECT id,telegram_id,product_name,amount_inr,status,transaction_ref,submitted_at,reviewed_at FROM bpsc_payment_requests ORDER BY id DESC')
+            for r in await cur.fetchall(): writer.writerow([r['id'],r['telegram_id'],r['product_name'],r['amount_inr'],r['status'],r['transaction_ref'],r['submitted_at'],r['reviewed_at']])
+        elif kind == 'attempts':
+            writer.writerow(['id','telegram_id','quiz_id','mode','score','correct','incorrect','skipped','submitted_at'])
+            cur = await conn.execute('SELECT id,telegram_id,quiz_id,mode,score,correct_count,incorrect_count,skipped_count,submitted_at FROM bank_quiz_attempts WHERE submitted_at IS NOT NULL ORDER BY id DESC LIMIT 50000')
+            for r in await cur.fetchall(): writer.writerow([r['id'],r['telegram_id'],r['quiz_id'],r['mode'],r['score'],r['correct_count'],r['incorrect_count'],r['skipped_count'],r['submitted_at']])
+        elif kind == 'demo':
+            await ensure_access_schema(conn)
+            writer.writerow(['telegram_id','username','contact','contact_type','registered_at','demo_started','expires_at'])
+            cur = await conn.execute("SELECT r.telegram_id,r.telegram_username,r.submitted_contact,r.contact_type,r.registered_at,t.started_at,t.expires_at FROM bpsc_nexus_demo_registrations r LEFT JOIN bpsc_nexus_demo_trials t ON t.telegram_id=r.telegram_id ORDER BY r.registered_at DESC")
+            for r in await cur.fetchall(): writer.writerow([r['telegram_id'],r['telegram_username'],r['submitted_contact'],r['contact_type'],r['registered_at'],r['started_at'],r['expires_at']])
+        elif kind == 'notifications':
+            await ensure_notifications_schema(conn)
+            writer.writerow(['id','title','segment','recipients','created_at'])
+            cur = await conn.execute('SELECT id,title,segment,recipients,created_at FROM bpsc_nexus_notifications ORDER BY id DESC')
+            for r in await cur.fetchall(): writer.writerow([r['id'],r['title'],r['segment'],r['recipients'],r['created_at']])
+        else:
+            writer.writerow(['section','count'])
+            for table in ('app_users','bank_quiz_attempts','bpsc_payment_requests','bpsc_nexus_demo_registrations','bpsc_nexus_notifications'):
+                cur = await conn.execute('SELECT to_regclass(%s) AS table_name', (table,))
+                exists = await cur.fetchone()
+                if not exists or not exists['table_name']:
+                    writer.writerow([table, 'unavailable'])
+                else:
+                    cur = await conn.execute(f'SELECT COUNT(*) AS n FROM {table}')
+                    writer.writerow([table, int((await cur.fetchone())['n'])])
+    return web.Response(body=buf.getvalue().encode('utf-8'), content_type='text/csv',
+                        headers={'Content-Disposition': f'attachment; filename="bpsc_nexus_{kind}.csv"'})
+
+
+async def admin_get_banner_flat(request):
+    if not _is_series_admin(request['telegram_user']):
+        return json_response({'error': 'Admin access required.'}, 403)
+    async with request.app['pool'].connection() as conn:
+        banner = await _get_setting(conn, 'promo_banner', {}) or {}
+    return json_response({'enabled': bool(banner.get('enabled')), 'tag': banner.get('tag',''),
+                          'title': banner.get('title',''), 'message': banner.get('message',''),
+                          'link': banner.get('link',''), 'link_label': banner.get('link_label','')})
+
+
+async def admin_get_maintenance(request):
+    if not _is_series_admin(request['telegram_user']):
+        return json_response({'error': 'Admin access required.'}, 403)
+    async with request.app['pool'].connection() as conn:
+        value = await _get_setting(conn, 'maintenance', {'enabled': False}) or {}
+    return json_response({'enabled': bool(value.get('enabled')), 'message': value.get('message','')})
+
+
+async def admin_members_search_alias(request):
+    return await admin_members_search(request)
+
+
+async def quiz_builder_meta(request):
+    await qb.ensure_schema(request.app['pool'])
+    async with request.app['pool'].connection() as conn:
+        cur = await conn.execute("SELECT subject AS name,COUNT(*) AS count FROM question_bank WHERE status='ready' GROUP BY subject ORDER BY subject")
+        subjects = [{'name': r['name'], 'count': int(r['count'])} for r in await cur.fetchall() if r['name']]
+        cur = await conn.execute("SELECT DISTINCT topic FROM question_bank WHERE status='ready' AND topic IS NOT NULL ORDER BY topic LIMIT 200")
+        topics = [r['topic'] for r in await cur.fetchall() if r['topic']]
+        cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status='ready'")
+        total = int((await cur.fetchone())['n'] or 0)
+    return json_response({'subjects': subjects, 'topics': topics, 'total_ready': total})
+
+
+async def quiz_builder_create(request):
+    user = request['telegram_user']
+    try:
+        body = await request.json()
+        subject = str(body.get('subject') or 'All subjects').strip()
+        topic = str(body.get('topic') or '').strip()
+        count = max(1, min(20000, int(body.get('count', 10))))
+        selection = str(body.get('selection') or 'random').lower()
+        mode = str(body.get('mode') or 'practice').lower()
+        title = str(body.get('title') or 'My Custom Quiz').strip()[:180]
+        positive = max(0.0, min(100.0, float(body.get('positive_marks', 1))))
+        negative = max(0.0, min(100.0, float(body.get('negative_marks', 0.33))))
+        qtime = max(0, min(3600, int(body.get('question_time_seconds', 0))))
+        duration_minutes = max(1, min(720, int(body.get('duration_minutes', 360))))
+        shuffle = bool(body.get('shuffle_options', True))
+        use_all = bool(body.get('use_all_questions', False))
+        if mode not in ('practice','exam'): mode = 'practice'
+    except Exception:
+        return json_response({'error': 'Invalid quiz builder settings.'}, 400)
+    await qb.ensure_schema(request.app['pool'])
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        clauses = ["status='ready'"]
+        params = []
+        if subject and subject != 'All subjects':
+            clauses.append('subject=%s'); params.append(subject)
+        if topic:
+            clauses.append('topic=%s'); params.append(topic)
+        order = 'ORDER BY RANDOM()' if selection == 'random' else 'ORDER BY id'
+        limit = '' if use_all else f' LIMIT {count}'
+        cur = await conn.execute(f"SELECT id FROM question_bank WHERE {' AND '.join(clauses)} {order}{limit}", tuple(params))
+        ids = [int(r['id']) for r in await cur.fetchall()]
+        if not ids:
+            return json_response({'error': 'No matching questions found.'}, 404)
+        cur = await conn.execute("""INSERT INTO bank_quizzes
+            (title,description,subject,created_by_telegram_id,duration_minutes,positive_marks,negative_marks,
+             question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,is_published,access_type)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,TRUE,'free') RETURNING id""",
+            (title, f'Custom quiz with {len(ids)} questions', subject if subject != 'All subjects' else 'Custom',
+             user['id'], duration_minutes, positive, negative, qtime, shuffle, user['id']))
+        qid = int((await cur.fetchone())['id'])
+        for pos, question_id in enumerate(ids, 1):
+            await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,question_id,position) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING", (qid, question_id, pos))
+    return json_response({'quiz_id': qid, 'count': len(ids), 'mode': mode})
+
+
+async def arena_matches_compat(request):
+    if request.method == 'POST':
+        return await arena_create(request)
+    return await arena_list(request)
+
+
+async def arena_match_compat(request):
+    return await arena_match(request)
+
+
+async def arena_answer_compat(request):
+    return await arena_answer(request)
+
+
+async def cutoff_xray(request):
+    user = request['telegram_user']
+    await lb.ensure_schema(request.app['pool'])
+    async with request.app['pool'].connection() as conn:
+        cur = await conn.execute("""WITH ranked AS (
+            SELECT telegram_id,normalized_points,
+                   PERCENT_RANK() OVER (ORDER BY normalized_points ASC)*100 AS pct
+            FROM bpsc_leaderboard_period_totals
+            WHERE period_type='lifetime' AND period_key='all' AND subject='All subjects'
+        )
+        SELECT pct,normalized_points,
+               (SELECT COUNT(*) FROM ranked) AS total_users,
+               (SELECT COUNT(*) FROM ranked r2 WHERE r2.normalized_points>ranked.normalized_points)+1 AS rank
+        FROM ranked WHERE telegram_id=%s""", (user['id'],))
+        row = await cur.fetchone()
+        if not row:
+            return json_response({'available': False, 'message': 'Complete at least one full test to unlock your Cut-Off X-Ray.'})
+        percentile = round(float(row['pct'] or 0), 1)
+        cutoff = 85.0
+        gap = round(cutoff-percentile, 1)
+        cur = await conn.execute("""SELECT subject,
+            SUM(correct_count)::float/NULLIF(SUM(correct_count+incorrect_count),0)*100 AS accuracy,
+            SUM(correct_count+incorrect_count) AS attempted
+            FROM bpsc_leaderboard_period_totals
+            WHERE telegram_id=%s AND period_type='lifetime' AND subject<>'All subjects'
+            GROUP BY subject HAVING SUM(correct_count+incorrect_count)>=5
+            ORDER BY accuracy ASC LIMIT 3""", (user['id'],))
+        weak = [{'subject': r['subject'], 'accuracy': round(float(r['accuracy'] or 0), 1),
+                 'attempted': int(r['attempted'] or 0)} for r in await cur.fetchall()]
+    eligible = percentile >= cutoff
+    headline = "You're inside the qualifying band." if eligible else f"You're {gap:.1f} percentile points below cut-off."
+    subline = 'Push your weakest subject up 5% to lock your place.' if eligible else 'Close the gap with a targeted 30-day plan.'
+    return json_response({'available': True, 'percentile': percentile, 'cutoff_percentile': cutoff,
+                          'gap': gap, 'rank': int(row['rank'] or 0), 'total_users': int(row['total_users'] or 0),
+                          'weak_subjects': weak, 'is_eligible': eligible, 'headline': headline, 'subline': subline,
+                          'share_text': f"I scored {percentile} percentile on BPSC Nexus — {gap:+.1f} from cut-off zone. Beat me 👉 t.me/BPSCNexusBot"})
+
+
+async def weakness_arsenal(request):
+    user = request['telegram_user']
+    try:
+        body = await request.json() if request.can_read_body else {}
+    except Exception:
+        body = {}
+    generate = bool(body.get('generate'))
+    try:
+        total_questions = max(10, min(100, int(body.get('count', 50))))
+    except Exception:
+        total_questions = 50
+    await qb.ensure_schema(request.app['pool'])
+    async with request.app['pool'].connection() as conn:
+        cur = await conn.execute("""WITH recent AS (
+            SELECT id FROM bank_quiz_attempts WHERE telegram_id=%s AND submitted_at IS NOT NULL
+            ORDER BY submitted_at DESC LIMIT 10
+        )
+        SELECT s.subject,COUNT(*) AS total,
+               SUM(CASE WHEN aa.selected_option=s.correct_option THEN 1 ELSE 0 END) AS correct
+        FROM bank_quiz_attempt_question_snapshots s JOIN recent r ON r.id=s.attempt_id
+        LEFT JOIN bank_quiz_attempt_answers aa ON aa.attempt_id=s.attempt_id AND aa.question_id=s.question_id
+        WHERE NULLIF(BTRIM(s.subject),'') IS NOT NULL
+        GROUP BY s.subject HAVING COUNT(*)>=3
+        ORDER BY (SUM(CASE WHEN aa.selected_option=s.correct_option THEN 1 ELSE 0 END)::float/NULLIF(COUNT(*),0)) ASC""", (user['id'],))
+        rows = await cur.fetchall()
+        if not rows:
+            return json_response({'available': False, 'message': 'Complete 3 tests first so we can learn your weak areas.'})
+        subjects = []
+        for row in rows:
+            total = max(1, int(row['total'] or 0))
+            accuracy = (int(row['correct'] or 0) / total) * 100
+            subjects.append({'subject': row['subject'], 'accuracy': round(accuracy, 1), 'weight': max(0.15, 1-accuracy/100)})
+        # Keep at most one subject per 3 questions so the requested count remains exact.
+        subjects = sorted(subjects, key=lambda x: x['accuracy'])[:max(1, total_questions // 3)]
+        total_weight = sum(s['weight'] for s in subjects) or 1
+        raw = [(s['weight']/total_weight)*total_questions for s in subjects]
+        allocated = [int(v) for v in raw]
+        for i in sorted(range(len(raw)), key=lambda i: raw[i]-allocated[i], reverse=True)[:total_questions-sum(allocated)]:
+            allocated[i] += 1
+        for item, n in zip(subjects, allocated): item['allocated'] = n
+        subjects_sorted = sorted(subjects, key=lambda x: x['accuracy'])
+        if not generate:
+            return json_response({'available': True, 'preview_only': True, 'mix': subjects_sorted, 'total': total_questions})
+        selected_ids = []
+        for subject in subjects:
+            cur = await conn.execute("SELECT id FROM question_bank WHERE status='ready' AND subject=%s ORDER BY RANDOM() LIMIT %s", (subject['subject'], subject['allocated']))
+            selected_ids.extend(int(r['id']) for r in await cur.fetchall())
+        if len(selected_ids) < 5:
+            return json_response({'error': 'Not enough verified questions in your weak subjects yet. Try again after more banks are added.'}, 503)
+        cur = await conn.execute("""INSERT INTO bank_quizzes
+            (title,description,subject,created_by_telegram_id,duration_minutes,positive_marks,negative_marks,
+             question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,is_published,access_type)
+            VALUES(%s,%s,%s,%s,%s,1,0.33,60,TRUE,TRUE,%s,TRUE,'free') RETURNING id""",
+            (f'Weakness Arsenal · {len(selected_ids)} Q', 'Personalised weighted practice test', 'Arsenal', user['id'], max(30, len(selected_ids)), user['id']))
+        qid = int((await cur.fetchone())['id'])
+        for pos, question_id in enumerate(selected_ids, 1):
+            await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,question_id,position) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING", (qid, question_id, pos))
+    return json_response({'available': True, 'generated': True, 'quiz_id': qid, 'count': len(selected_ids), 'mix': subjects_sorted})
+
 def build_app() -> web.Application:
     app=web.Application(middlewares=[telegram_auth], client_max_size=25*1024*1024)
     app.add_routes([
@@ -2271,6 +2738,7 @@ def build_app() -> web.Application:
         web.get('/api/admin/payments/{request_id}', admin_payment_detail),
         web.post('/api/admin/payments/{request_id}/review', admin_review_payment),
 
+        web.get('/api/admin/members', admin_members_search_alias),
         web.get('/api/admin/members/search', admin_members_search),
         web.get('/api/admin/members/{telegram_id}', admin_member_detail),
         web.post('/api/admin/members/grant', admin_member_grant),
@@ -2282,6 +2750,7 @@ def build_app() -> web.Application:
         web.post('/api/admin/import-subjects', admin_create_import_subject),
         web.get('/api/admin/import/subjects', admin_import_subjects),
         web.post('/api/admin/import/subjects', admin_create_import_subject),
+        web.post('/api/admin/import/questions', admin_bulk_import),
         web.post('/api/admin/bulk-import', admin_bulk_import),
 
         web.get('/api/admin/questions/search', admin_questions_search),
@@ -2295,11 +2764,17 @@ def build_app() -> web.Application:
         web.delete('/api/admin/notifications/{notification_id}', admin_notification_delete),
         web.get('/api/admin/promo', admin_get_promo),
         web.post('/api/admin/promo', admin_set_promo),
-        web.get('/api/admin/banner', admin_get_promo),
+        web.get('/api/admin/banner', admin_get_banner_flat),
         web.post('/api/admin/banner', admin_set_promo),
+        web.get('/api/admin/maintenance', admin_get_maintenance),
+        web.get('/api/admin/activity', admin_activity),
+        web.get('/api/admin/revenue', admin_revenue),
+        web.get('/api/admin/export/{kind}', admin_export),
+        web.post('/api/admin/quizzes/bulk-delete', admin_bulk_delete_quizzes),
         web.post('/api/admin/maintenance', admin_set_maintenance),
 
         web.get('/api/notifications', notifications_list),
+        web.post('/api/notifications/read-all', notifications_mark_all_read),
         web.post('/api/notifications/{notification_id}/read', notification_mark_read),
 
         web.get('/api/series', list_series),
@@ -2320,6 +2795,11 @@ def build_app() -> web.Application:
         web.post('/api/attempts/{attempt_id}/answer', attempt_answer),
         web.post('/api/attempts/{attempt_id}/review', attempt_review),
         web.post('/api/attempts/{attempt_id}/submit', attempt_submit),
+        web.get('/api/quiz-builder/meta', quiz_builder_meta),
+        web.post('/api/quiz-builder/create', quiz_builder_create),
+        web.get('/api/xray', cutoff_xray),
+        web.get('/api/arsenal', weakness_arsenal),
+        web.post('/api/arsenal', weakness_arsenal),
         web.get('/api/history', attempt_history_compat),
 
         web.get('/api/theme', get_theme_preference),
@@ -2339,6 +2819,10 @@ def build_app() -> web.Application:
         web.get('/api/arena', arena_list),
         web.post('/api/arena/create', arena_create),
         web.post('/api/arena/join', arena_join),
+        web.get('/api/arena/matches', arena_matches_compat),
+        web.post('/api/arena/matches', arena_matches_compat),
+        web.get('/api/arena/matches/{match_id}', arena_match_compat),
+        web.post('/api/arena/matches/{match_id}/answers', arena_answer_compat),
         web.get('/api/arena/{match_id}', arena_match),
         web.post('/api/arena/{match_id}/answer', arena_answer),
 
