@@ -65,7 +65,24 @@ def validate_init_data(init_data: str) -> dict:
 
 ADMIN_LOGIN_ID = os.environ.get("ADMIN_LOGIN_ID", "").strip()
 ADMIN_LOGIN_PASSWORD = os.environ.get("ADMIN_LOGIN_PASSWORD", "")
-ADMIN_LOGIN_TELEGRAM_ID = int(os.environ.get("ADMIN_LOGIN_TELEGRAM_ID", "0") or 0)
+def _resolve_admin_login_tid() -> int:
+    raw = os.environ.get("ADMIN_LOGIN_TELEGRAM_ID", "").strip()
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            log.warning("ADMIN_LOGIN_TELEGRAM_ID is not a valid integer: %r", raw)
+    # Fallback: first admin ID from ADMIN_TELEGRAM_IDS (legacy auto-detect behavior)
+    if ADMIN_TELEGRAM_IDS:
+        return sorted(ADMIN_TELEGRAM_IDS)[0]
+    return 0
+
+ADMIN_LOGIN_TELEGRAM_ID = _resolve_admin_login_tid()
+# Ensure the resolved login ID is included in the approved admin IDs.
+if ADMIN_LOGIN_TELEGRAM_ID > 0:
+    ADMIN_TELEGRAM_IDS.add(ADMIN_LOGIN_TELEGRAM_ID)
 ADMIN_SESSION_SECRET = os.environ.get("ADMIN_SESSION_SECRET", "")
 ADMIN_SESSION_COOKIE = "bpsc_nexus_admin_session"
 ADMIN_SESSION_SECONDS = 12 * 60 * 60
