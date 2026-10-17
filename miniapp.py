@@ -2688,7 +2688,9 @@ async def attempt_answer(request):
     if selected and selected not in {'A', 'B', 'C', 'D', 'E'}:
         return json_response({'error': 'Choose A, B, C, D or E.'}, 400)
     async with request.app['pool'].connection() as conn:
-        cur = await conn.execute("""SELECT a.id,a.mode,a.submitted_at,s.correct_option,s.explanation_en,s.explanation_hi
+        cur = await conn.execute("""SELECT a.id,a.mode,a.submitted_at,s.correct_option,s.explanation_en,s.explanation_hi,
+            EXISTS(SELECT 1 FROM bpsc_nexus_live_quiz_participants lp JOIN bpsc_nexus_live_quiz_sessions ls ON ls.id=lp.session_id WHERE lp.attempt_id=a.id AND lp.telegram_id=a.telegram_id AND ls.status='paused') AS live_paused,
+            EXISTS(SELECT 1 FROM bpsc_nexus_live_quiz_participants lp JOIN bpsc_nexus_live_quiz_sessions ls ON ls.id=lp.session_id WHERE lp.attempt_id=a.id AND lp.telegram_id=a.telegram_id AND ls.status IN ('ended','cancelled')) AS live_ended
             FROM bank_quiz_attempts a JOIN bank_quiz_attempt_question_snapshots s ON s.attempt_id=a.id AND s.question_id=%s
             WHERE a.id=%s AND a.telegram_id=%s""", (qid, aid, user['id']))
         row = await cur.fetchone()
@@ -2696,6 +2698,10 @@ async def attempt_answer(request):
             return json_response({'error': 'Question not part of this attempt.'}, 404)
         if row['submitted_at']:
             return json_response({'error': 'Attempt already submitted.'}, 409)
+        if row.get('live_paused'):
+            return json_response({'error':'The live quiz is paused by the administrator. Your progress is saved; wait for it to resume.'},409)
+        if row.get('live_ended'):
+            return json_response({'error':'This live quiz has ended.'},409)
         await conn.execute("""INSERT INTO bank_quiz_attempt_answers(attempt_id,question_id,selected_option)
             VALUES(%s,%s,%s) ON CONFLICT(attempt_id,question_id) DO UPDATE SET selected_option=EXCLUDED.selected_option""", (aid, qid, selected))
         result = {'saved': True, 'question_id': qid, 'selected_option': selected}
@@ -2881,6 +2887,7 @@ async def admin_export(request):
             for r in await cur.fetchall(): writer.writerow([r['telegram_id'],r['first_name'],r['username'],r['last_seen_at']])
         elif kind == 'payments':
             await payment_schema(conn)
+            await ensure_live_quiz_schema(conn)
             await ensure_demo_verify_schema(conn)
             writer.writerow(['id','telegram_id','product_name','amount_inr','status','transaction_ref','submitted_at','reviewed_at'])
             cur = await conn.execute('SELECT id,telegram_id,product_name,amount_inr,status,transaction_ref,submitted_at,reviewed_at FROM bpsc_payment_requests ORDER BY id DESC')
@@ -3108,6 +3115,159 @@ async def weakness_arsenal(request):
             await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,question_id,position) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING", (qid, question_id, pos))
     return json_response({'available': True, 'generated': True, 'quiz_id': qid, 'count': len(selected_ids), 'mix': subjects_sorted})
 
+
+# ---------- Admin-scheduled live quizzes ----------
+async def ensure_live_quiz_schema(conn):
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_live_quiz_sessions (
+        id BIGSERIAL PRIMARY KEY,
+        quiz_id BIGINT NOT NULL REFERENCES bank_quizzes(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        starts_at TIMESTAMPTZ,
+        duration_minutes INTEGER NOT NULL DEFAULT 60 CHECK (duration_minutes BETWEEN 1 AND 600),
+        status TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled','open','live','ended','cancelled')),
+        created_by_telegram_id BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""")
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_live_quiz_participants (
+        session_id BIGINT NOT NULL REFERENCES bpsc_nexus_live_quiz_sessions(id) ON DELETE CASCADE,
+        telegram_id BIGINT NOT NULL,
+        joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        attempt_id BIGINT,
+        PRIMARY KEY(session_id, telegram_id)
+    )""")
+    # Additive migrations keep existing live sessions and participant records intact.
+    await conn.execute("ALTER TABLE bpsc_nexus_live_quiz_sessions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ")
+    await conn.execute("ALTER TABLE bpsc_nexus_live_quiz_sessions ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ")
+    await conn.execute("ALTER TABLE bpsc_nexus_live_quiz_sessions ADD COLUMN IF NOT EXISTS paused_seconds INTEGER NOT NULL DEFAULT 0")
+    await conn.execute("ALTER TABLE bpsc_nexus_live_quiz_participants ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+    await conn.execute("ALTER TABLE bpsc_nexus_live_quiz_sessions DROP CONSTRAINT IF EXISTS bpsc_nexus_live_quiz_sessions_status_check")
+    await conn.execute("ALTER TABLE bpsc_nexus_live_quiz_sessions ADD CONSTRAINT bpsc_nexus_live_quiz_sessions_status_check CHECK (status IN ('scheduled','open','live','paused','ended','cancelled'))")
+    await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_nexus_live_quiz_status_idx ON bpsc_nexus_live_quiz_sessions(status, starts_at)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_nexus_live_quiz_presence_idx ON bpsc_nexus_live_quiz_participants(session_id,last_seen_at)")
+
+async def live_quizzes_public(request):
+    uid=int(request['telegram_user']['id'])
+    async with request.app['pool'].connection() as conn:
+        await ensure_live_quiz_schema(conn)
+        cur=await conn.execute("""SELECT s.id,s.quiz_id,s.title,s.description,s.starts_at,s.duration_minutes,s.status,
+            q.subject, (SELECT COUNT(*) FROM bpsc_nexus_live_quiz_participants p WHERE p.session_id=s.id) AS participants,
+            (SELECT COUNT(*) FROM bpsc_nexus_live_quiz_participants p WHERE p.session_id=s.id AND p.last_seen_at>NOW()-INTERVAL '90 seconds') AS live_users,
+            CASE WHEN s.started_at IS NULL THEN s.duration_minutes*60 ELSE GREATEST(0,s.duration_minutes*60-EXTRACT(EPOCH FROM (NOW()-s.started_at))+s.paused_seconds+CASE WHEN s.status='paused' AND s.paused_at IS NOT NULL THEN EXTRACT(EPOCH FROM (NOW()-s.paused_at)) ELSE 0 END)::INTEGER END AS remaining_seconds,
+            EXISTS(SELECT 1 FROM bpsc_nexus_live_quiz_participants p WHERE p.session_id=s.id AND p.telegram_id=%s) AS joined
+            FROM bpsc_nexus_live_quiz_sessions s JOIN bank_quizzes q ON q.id=s.quiz_id
+            WHERE s.status IN ('scheduled','open','live','paused') OR (s.status='ended' AND s.updated_at>NOW()-INTERVAL '24 hours')
+            ORDER BY CASE s.status WHEN 'live' THEN 0 WHEN 'open' THEN 1 WHEN 'scheduled' THEN 2 ELSE 3 END,
+            s.starts_at NULLS LAST,s.created_at DESC LIMIT 100""",(uid,))
+        rows=[]
+        for r in await cur.fetchall():
+            rows.append({**dict(r),'id':int(r['id']),'quiz_id':int(r['quiz_id']),'duration_minutes':int(r['duration_minutes']),
+                'participants':int(r['participants'] or 0),'live_users':int(r['live_users'] or 0),'remaining_seconds':int(r['remaining_seconds'] or 0),'joined':bool(r['joined']),
+                'starts_at':r['starts_at'].isoformat() if r['starts_at'] else None})
+    return json_response({'sessions':rows})
+
+async def live_quiz_join(request):
+    uid=int(request['telegram_user']['id'])
+    try: sid=int(request.match_info['session_id'])
+    except Exception: return json_response({'error':'Invalid live quiz.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_live_quiz_schema(conn)
+        cur=await conn.execute("""SELECT s.id,s.quiz_id,s.status,s.title,s.duration_minutes,s.started_at,s.paused_at,s.paused_seconds, CASE WHEN s.started_at IS NULL THEN s.duration_minutes*60 ELSE GREATEST(0,s.duration_minutes*60-EXTRACT(EPOCH FROM (NOW()-s.started_at))+s.paused_seconds+CASE WHEN s.status='paused' AND s.paused_at IS NOT NULL THEN EXTRACT(EPOCH FROM (NOW()-s.paused_at)) ELSE 0 END)::INTEGER END AS remaining_seconds FROM bpsc_nexus_live_quiz_sessions s WHERE s.id=%s FOR UPDATE""",(sid,)); row=await cur.fetchone()
+        if not row: return json_response({'error':'Live quiz not found.'},404)
+        if row['status']=='live' and int(row['remaining_seconds'] or 0)<=0:
+            await conn.execute("UPDATE bpsc_nexus_live_quiz_sessions SET status='ended',updated_at=NOW() WHERE id=%s",(sid,))
+            return json_response({'error':'This live quiz has reached its end time.'},409)
+        if row['status'] not in ('open','live','paused'): return json_response({'error':'This quiz is not open for joining yet.'},409)
+        await conn.execute("INSERT INTO bpsc_nexus_live_quiz_participants(session_id,telegram_id,last_seen_at) VALUES(%s,%s,NOW()) ON CONFLICT(session_id,telegram_id) DO UPDATE SET last_seen_at=NOW()",(sid,uid))
+        cur=await conn.execute("SELECT attempt_id FROM bpsc_nexus_live_quiz_participants WHERE session_id=%s AND telegram_id=%s",(sid,uid)); prow=await cur.fetchone()
+    return json_response({'joined':True,'session_id':sid,'quiz_id':int(row['quiz_id']),'title':row['title'],'status':row['status'],'attempt_id':int(prow['attempt_id']) if prow and prow['attempt_id'] else None})
+
+async def admin_live_quizzes(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Administrator access required.'},403)
+    pool=request.app['pool']
+    async with pool.connection() as conn:
+        await ensure_live_quiz_schema(conn)
+        if request.method=='GET':
+            cur=await conn.execute("""SELECT s.id,s.quiz_id,s.title,s.description,s.starts_at,s.started_at,s.paused_at,s.duration_minutes,s.status,s.created_at,q.subject,
+                (SELECT COUNT(*) FROM bpsc_nexus_live_quiz_participants p WHERE p.session_id=s.id) AS participants,
+                (SELECT COUNT(*) FROM bpsc_nexus_live_quiz_participants p WHERE p.session_id=s.id AND p.last_seen_at>NOW()-INTERVAL '90 seconds') AS live_users,
+                CASE WHEN s.started_at IS NULL THEN s.duration_minutes*60 ELSE GREATEST(0,s.duration_minutes*60-EXTRACT(EPOCH FROM (NOW()-s.started_at))+s.paused_seconds+CASE WHEN s.status='paused' AND s.paused_at IS NOT NULL THEN EXTRACT(EPOCH FROM (NOW()-s.paused_at)) ELSE 0 END)::INTEGER END AS remaining_seconds
+                FROM bpsc_nexus_live_quiz_sessions s JOIN bank_quizzes q ON q.id=s.quiz_id ORDER BY s.created_at DESC LIMIT 100""")
+            sessions=[]
+            for r in await cur.fetchall(): sessions.append({**dict(r),'id':int(r['id']),'quiz_id':int(r['quiz_id']),'duration_minutes':int(r['duration_minutes']),'participants':int(r['participants'] or 0),'live_users':int(r['live_users'] or 0),'remaining_seconds':int(r['remaining_seconds'] or 0),'started_at':r['started_at'].isoformat() if r.get('started_at') else None,'paused_at':r['paused_at'].isoformat() if r.get('paused_at') else None,'starts_at':r['starts_at'].isoformat() if r['starts_at'] else None,'created_at':r['created_at'].isoformat()})
+            cur=await conn.execute("SELECT q.id,q.title,q.subject,COUNT(qq.question_id) AS total_questions FROM bank_quizzes q LEFT JOIN bank_quiz_questions qq ON qq.quiz_id=q.id WHERE q.is_published=TRUE AND COALESCE(q.admin_hidden,FALSE)=FALSE GROUP BY q.id ORDER BY q.id DESC LIMIT 500")
+            quizzes=[{**dict(r),'id':int(r['id']),'total_questions':int(r['total_questions'] or 0)} for r in await cur.fetchall()]
+            return json_response({'sessions':sessions,'quizzes':quizzes})
+        try:
+            body=await request.json(); quiz_id=int(body.get('quiz_id')); title=str(body.get('title') or '').strip()[:180]
+            description=str(body.get('description') or '').strip()[:1000]; duration=max(1,min(600,int(body.get('duration_minutes',60))))
+            status=str(body.get('status','scheduled')).lower()
+            if not title or status not in ('scheduled','open','live'): raise ValueError()
+            raw_start=str(body.get('starts_at') or '').strip()
+            starts_at=datetime.fromisoformat(raw_start.replace('Z','+00:00')) if raw_start else None
+            if starts_at and starts_at.tzinfo is None: starts_at=starts_at.replace(tzinfo=timezone.utc)
+        except Exception: return json_response({'error':'Provide a title, published quiz, valid schedule, duration and status.'},400)
+        cur=await conn.execute("SELECT id FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND COALESCE(admin_hidden,FALSE)=FALSE",(quiz_id,))
+        if not await cur.fetchone(): return json_response({'error':'Choose a published quiz.'},400)
+        cur=await conn.execute("INSERT INTO bpsc_nexus_live_quiz_sessions(quiz_id,title,description,starts_at,duration_minutes,status,created_by_telegram_id) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id",(quiz_id,title,description,starts_at,duration,status,int(user['id'])))
+        sid=int((await cur.fetchone())['id'])
+    return json_response({'created':True,'id':sid},201)
+
+async def admin_live_quiz_status(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Administrator access required.'},403)
+    try: sid=int(request.match_info['session_id']); body=await request.json(); status=str(body.get('status','')).lower()
+    except Exception: return json_response({'error':'Invalid live quiz status update.'},400)
+    if status not in ('scheduled','open','live','paused','ended','cancelled'): return json_response({'error':'Unsupported status.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_live_quiz_schema(conn)
+        cur=await conn.execute("SELECT id,status,started_at,paused_at,paused_seconds FROM bpsc_nexus_live_quiz_sessions WHERE id=%s FOR UPDATE",(sid,)); old=await cur.fetchone()
+        if not old:return json_response({'error':'Live quiz not found.'},404)
+        if status=='live':
+            if old['status']=='paused' and old['paused_at']:
+                await conn.execute("UPDATE bpsc_nexus_live_quiz_sessions SET status='live',paused_seconds=paused_seconds+GREATEST(0,EXTRACT(EPOCH FROM (NOW()-paused_at))::INTEGER),paused_at=NULL,started_at=COALESCE(started_at,NOW()),updated_at=NOW() WHERE id=%s",(sid,))
+            else:
+                await conn.execute("UPDATE bpsc_nexus_live_quiz_sessions SET status='live',started_at=COALESCE(started_at,NOW()),updated_at=NOW() WHERE id=%s",(sid,))
+        elif status=='paused':
+            await conn.execute("UPDATE bpsc_nexus_live_quiz_sessions SET status='paused',paused_at=COALESCE(paused_at,NOW()),updated_at=NOW() WHERE id=%s",(sid,))
+        else:
+            await conn.execute("UPDATE bpsc_nexus_live_quiz_sessions SET status=%s,updated_at=NOW() WHERE id=%s",(status,sid))
+        cur=await conn.execute("SELECT id,status FROM bpsc_nexus_live_quiz_sessions WHERE id=%s",(sid,)); row=await cur.fetchone()
+    return json_response({'updated':True,'id':int(row['id']),'status':row['status']})
+
+
+async def live_quiz_state(request):
+    uid=int(request['telegram_user']['id'])
+    try: sid=int(request.match_info['session_id'])
+    except Exception: return json_response({'error':'Invalid live quiz.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_live_quiz_schema(conn)
+        cur=await conn.execute("""SELECT s.id,s.quiz_id,s.title,s.status,s.duration_minutes,s.started_at,s.paused_at,s.paused_seconds,
+            CASE WHEN s.started_at IS NULL THEN s.duration_minutes*60 ELSE GREATEST(0,s.duration_minutes*60-EXTRACT(EPOCH FROM (NOW()-s.started_at))+s.paused_seconds+CASE WHEN s.status='paused' AND s.paused_at IS NOT NULL THEN EXTRACT(EPOCH FROM (NOW()-s.paused_at)) ELSE 0 END)::INTEGER END AS remaining_seconds,
+            (SELECT COUNT(*) FROM bpsc_nexus_live_quiz_participants p WHERE p.session_id=s.id) AS participants,
+            (SELECT COUNT(*) FROM bpsc_nexus_live_quiz_participants p WHERE p.session_id=s.id AND p.last_seen_at>NOW()-INTERVAL '90 seconds') AS live_users,
+            p.attempt_id FROM bpsc_nexus_live_quiz_sessions s LEFT JOIN bpsc_nexus_live_quiz_participants p ON p.session_id=s.id AND p.telegram_id=%s WHERE s.id=%s""",(uid,sid))
+        r=await cur.fetchone()
+        if not r:return json_response({'error':'Live quiz not found.'},404)
+        if r['status']=='live' and int(r['remaining_seconds'] or 0)<=0:
+            await conn.execute("UPDATE bpsc_nexus_live_quiz_sessions SET status='ended',updated_at=NOW() WHERE id=%s AND status='live'",(sid,))
+            r=dict(r);r['status']='ended'
+        if request.method=='POST':
+            await conn.execute("UPDATE bpsc_nexus_live_quiz_participants SET last_seen_at=NOW() WHERE session_id=%s AND telegram_id=%s",(sid,uid))
+            body={}
+            try: body=await request.json()
+            except Exception: pass
+            if body.get('attempt_id'):
+                aid=int(body['attempt_id'])
+                cur=await conn.execute("SELECT id,quiz_id FROM bank_quiz_attempts WHERE id=%s AND telegram_id=%s",(aid,uid)); ar=await cur.fetchone()
+                if not ar or int(ar['quiz_id'])!=int(r['quiz_id']):return json_response({'error':'Attempt does not belong to this live quiz.'},403)
+                await conn.execute("UPDATE bpsc_nexus_live_quiz_participants SET attempt_id=%s,last_seen_at=NOW() WHERE session_id=%s AND telegram_id=%s",(aid,sid,uid))
+                r=dict(r);r['attempt_id']=aid
+        return json_response({'id':int(r['id']),'quiz_id':int(r['quiz_id']),'title':r['title'],'status':r['status'],'duration_minutes':int(r['duration_minutes']),'remaining_seconds':int(r['remaining_seconds'] or 0),'participants':int(r['participants'] or 0),'live_users':int(r['live_users'] or 0),'attempt_id':int(r['attempt_id']) if r['attempt_id'] else None,'started_at':r['started_at'].isoformat() if r['started_at'] else None})
+
+
 def build_app() -> web.Application:
     app=web.Application(middlewares=[telegram_auth], client_max_size=25*1024*1024)
     app.add_routes([
@@ -3124,6 +3284,13 @@ def build_app() -> web.Application:
         web.post('/api/access/register-demo', register_demo),
 
         web.get('/api/leaderboard', leaderboard_data),
+        web.get('/api/live-quizzes', live_quizzes_public),
+        web.post('/api/live-quizzes/{session_id}/join', live_quiz_join),
+        web.get('/api/live-quizzes/{session_id}/state', live_quiz_state),
+        web.post('/api/live-quizzes/{session_id}/state', live_quiz_state),
+        web.get('/api/admin/live-quizzes', admin_live_quizzes),
+        web.post('/api/admin/live-quizzes', admin_live_quizzes),
+        web.post('/api/admin/live-quizzes/{session_id}/status', admin_live_quiz_status),
         web.get('/api/leaderboard/admin/challenges', leaderboard_admin_challenges),
         web.post('/api/leaderboard/admin/challenges', leaderboard_admin_challenges),
         web.get('/api/leaderboard/admin/attempts', leaderboard_admin_attempts),
