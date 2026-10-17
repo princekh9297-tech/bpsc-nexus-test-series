@@ -1079,7 +1079,7 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
 .home-feature-card.rank-feature{background:#d4f4b2;color:#18300c}
 .home-feature-card.admin-feature{background:#d9c7ff;color:#21113d}
 .home-feature-card.admin-feature .shortcut-icon{background:#f1eaff}
-.bottom-nav{grid-template-columns:repeat(5,minmax(0,1fr))!important}
+.bottom-nav{grid-template-columns:repeat(6,minmax(0,1fr))!important}
 .bottom-nav .tab-btn{min-width:0!important;flex:1 1 0!important}
 @media(max-width:380px){.home-feature-zone{padding:10px}.home-feature-card{padding:10px;min-height:158px}.home-feature-card>strong{font-size:14px}.home-feature-card .feature-chip{font-size:7px;padding:4px}.home-feature-card>small{font-size:10px}}
 @media(min-width:700px){#home-shortcuts.home-shortcuts{grid-template-columns:repeat(4,minmax(0,1fr))}.home-feature-card{min-height:180px}}
@@ -1112,6 +1112,17 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
 @media(prefers-reduced-motion:reduce){.home-feature-card,.hero-pass-cta{transition:none!important}}
 </style>
 
+<style>
+.live-quiz-hero{padding:20px;border-radius:18px;background:radial-gradient(circle at 90% 0%,#5eead422,transparent 40%),linear-gradient(130deg,#102b31,#142d49 60%,#30214a);border:1px solid #4ad5bd66;color:#f4fffd;margin:6px 0 14px;box-shadow:0 12px 28px #0002}
+.live-quiz-hero .live-kicker{font:900 9px Manrope,Inter,sans-serif;letter-spacing:.18em;color:#75f1d3}
+.live-quiz-hero h1{font:900 clamp(24px,5vw,32px)/1.08 Manrope,Inter,sans-serif;margin:8px 0;color:#fff}
+.live-quiz-hero p{margin:0;color:#c8e8e7;font-size:12px;line-height:1.6}
+.live-session{padding:15px;border:1px solid var(--line);border-radius:15px;background:var(--paper);margin-bottom:10px;box-shadow:var(--shadow)}
+.live-session-top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}.live-session h3{font:850 15px Manrope,Inter,sans-serif;margin:5px 0 4px;line-height:1.3}.live-session p{font-size:12px;color:var(--muted);margin:0 0 10px;line-height:1.5}
+.live-state{display:inline-flex;align-items:center;gap:5px;padding:5px 8px;border-radius:7px;font:900 9px Manrope,Inter,sans-serif;letter-spacing:.06em;text-transform:uppercase;background:var(--soft);color:var(--muted);white-space:nowrap}.live-state.live{background:#123e32;color:#85f0c9}.live-state.open{background:#12314a;color:#9cd8ff}.live-state.scheduled{background:#47351b;color:#f6d18a}.live-meta{display:flex;gap:10px;flex-wrap:wrap;font-size:10px;color:var(--muted);margin:8px 0 12px}.live-session-actions{display:flex;gap:8px}.live-session-actions button{flex:1}
+.live-empty{padding:25px 15px;text-align:center;border:1px dashed var(--line);border-radius:14px;color:var(--muted);background:var(--paper)}
+.live-nav-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#5eead4;margin-left:3px;vertical-align:middle}
+</style>
 </head>
 
 <body>
@@ -1188,6 +1199,12 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
         <strong>Leaderboard</strong>
         <small>See ranks, scores and how you compare.</small>
         <span class="feature-cta">View ranks <b>↗</b></span>
+      </button>
+      <button class="home-feature-card live-feature" type="button" id="live-quiz-home" aria-label="View and join live quizzes" style="background:#a9f5e5;color:#102c2b">
+        <span class="feature-topline"><span class="shortcut-icon">🔴</span><span class="feature-chip">LIVE SESSIONS</span></span>
+        <strong>Live Quiz</strong>
+        <small>Find scheduled exams, join active quizzes and compete with other aspirants.</small>
+        <span class="feature-cta">Browse live quizzes <b>↗</b></span>
       </button>
       <button class="home-feature-card admin-feature" type="button" id="admin-launch-card" aria-label="Open restricted admin console">
         <span class="feature-topline"><span class="shortcut-icon">⚙️</span><span class="feature-chip">RESTRICTED</span></span>
@@ -1296,6 +1313,14 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
       <span id="builder-status">Set your filters.</span>
     </div>
   </div>
+</section>
+
+<section id="live-quiz-panel" class="hidden-tab" style="margin-bottom:18px">
+  <div class="live-quiz-hero"><div class="live-kicker">BPSC NEXUS · LIVE EXAM HALL</div><h1>Live Quiz Arena</h1><p>All scheduled and currently running live quizzes in one place. Open a session to join the exam; your score is recorded through the existing quiz system.</p><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button class="primary" id="live-quiz-refresh" type="button" style="background:#75f1d3;color:#102b31;border-color:#75f1d3">↻ Refresh sessions</button><span class="pill" id="live-quiz-count">Loading sessions…</span></div></div>
+  <div class="section-head"><h2>🔴 Live now</h2><small>Join while open</small></div><div id="live-quiz-live-list"><div class="loader">Loading live sessions…</div></div>
+  <div class="section-head"><h2>🗓️ Upcoming sessions</h2><small>Scheduled by admin</small></div><div id="live-quiz-upcoming-list"><div class="loader">Loading schedule…</div></div>
+  <div class="section-head"><h2>📜 Recently ended</h2><small>Last 24 hours</small></div><div id="live-quiz-ended-list"><div class="loader">Loading recent sessions…</div></div>
+  <p class="planner-note">Tip: refresh shortly before the announced start time. A quiz becomes joinable when the admin opens or starts the session.</p>
 </section>
 
 <section id="arena-panel" class="hidden-tab" style="margin-bottom:18px">
@@ -1429,6 +1454,7 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
         <button class="admin-nav-btn" data-admin-view="banks">🗃️ Banks</button>
         <button class="admin-nav-btn" data-admin-view="tests">🗑️ Delete Tests</button>
         <button class="admin-nav-btn" data-admin-view="series">📚 Series</button>
+        <button class="admin-nav-btn" data-admin-view="live-quizzes">🔴 Live Quizzes</button>
         <button class="admin-nav-btn" data-admin-view="demo">🧪 Demo</button>
         <button class="admin-nav-btn" data-admin-view="banner">📣 Promo</button>
         <button class="admin-nav-btn" data-admin-view="maintenance">🚫 Maintenance</button>
@@ -1664,6 +1690,24 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
         <div id="admin-series-manager-status" class="admin-status"></div>
       </div>
       <div class="panel admin-panel-card"><div class="section-head" style="margin-top:0"><h3 class="admin-section-title">📚 Existing Series</h3><button class="secondary" id="sm-refresh-series" type="button">↻ Refresh</button></div><div id="admin-series-list"><div class="loader">Loading…</div></div><div id="admin-series-status" class="admin-status"></div></div>
+    </div>
+
+    <div class="admin-view" id="admin-view-live-quizzes">
+      <div class="admin-view-head"><h2>🔴 Live Quiz Manager</h2><p>Create sessions from published quizzes, set a start time, and open, start, end or cancel them. Students discover sessions in the dedicated Live Quiz section.</p></div>
+      <div class="panel admin-panel-card">
+        <h3 class="admin-section-title">＋ Schedule a live quiz</h3>
+        <form id="admin-live-quiz-form" class="admin-form">
+          <label>Session title *<input id="admin-live-title" maxlength="180" required placeholder="e.g. VORTEX Nightly GS Live Test"></label>
+          <label>Published quiz *<select id="admin-live-quiz-id" required><option value="">Loading published quizzes…</option></select></label>
+          <label>Description<input id="admin-live-description" maxlength="1000" placeholder="Subjects, rules or announcement"></label>
+          <label>Start date and time<input id="admin-live-starts" type="datetime-local"></label>
+          <label>Duration (minutes)<input id="admin-live-duration" type="number" min="1" max="600" value="60" required></label>
+          <label>Initial status<select id="admin-live-status"><option value="scheduled">Scheduled (not joinable)</option><option value="open">Open for joining</option><option value="live">Live now</option></select></label>
+          <button class="primary full" type="submit">Create live quiz session</button>
+        </form>
+        <div id="admin-live-quiz-status" class="admin-status"></div>
+      </div>
+      <div class="panel admin-panel-card"><div class="section-head" style="margin-top:0"><h3 class="admin-section-title">Manage sessions</h3><button class="secondary" id="admin-live-refresh" type="button">↻ Refresh</button></div><div id="admin-live-session-list"><div class="loader">Loading sessions…</div></div></div>
     </div>
 
     <div class="admin-view" id="admin-view-demo">
@@ -1913,6 +1957,7 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
 <nav class="bottom-nav" id="bottom-nav" aria-label="Main navigation">
   <button class="tab-btn active" data-tab="home" aria-label="Home"><span class="tab-icon">🏠</span><span>Home</span></button>
   <button class="tab-btn" data-tab="series" aria-label="Series"><span class="tab-icon">🗂️</span><span>Series</span></button>
+  <button class="tab-btn" data-tab="live-quizzes" aria-label="Live Quiz"><span class="tab-icon">🔴</span><span>Live</span></button>
   <button class="tab-btn" data-tab="create" aria-label="Create"><span class="tab-icon">⚒️</span><span>Create</span></button>
   <button class="tab-btn" data-tab="analytics" aria-label="Stats"><span class="tab-icon">📈</span><span>Stats</span></button>
   <button class="tab-btn" data-tab="profile" aria-label="Profile"><span class="tab-icon">🧑‍🎓</span><span>Profile</span></button>
@@ -1929,6 +1974,7 @@ if(tg){tg.ready();tg.expand();try{tg.setHeaderColor('#151515');tg.setBackgroundC
 const $=id=>document.getElementById(id);
 let quizzes=[],attempt=null,index=0,answers={},review=new Set(),busy=false;
 let timerHandle=null,questionTimerHandle=null,questionDeadline=0,questionTimerKey=null;
+let liveSessionId=null,liveSessionState=null,livePresenceHandle=null,liveClockLastTick=0;
 let feedback={},result=null,optionOrders={};
 let accessInfo=null,adminSessionActive=false;
 let allAdminTests=[],selectedTests=new Set();
@@ -1961,15 +2007,15 @@ let splashSeen=false;try{splashSeen=sessionStorage.getItem('bpsc_nexus_splash_se
 if(splashSeen)dismissSplash();else setTimeout(dismissSplash,3500);
 
 function switchTab(tab,scroll=true){
-  const valid=['home','series','intel','create','arena','analytics','leaderboard','profile','buy-pass','admin'];
+  const valid=['home','series','intel','create','arena','live-quizzes','analytics','leaderboard','profile','buy-pass','admin'];
   if(!valid.includes(tab))tab='home';
   document.querySelectorAll('.tab-btn').forEach(b=>{
-    const active=b.dataset.tab===tab || (b.dataset.tab==='home' && ['intel','arena','leaderboard','buy-pass','admin'].includes(tab));
+    const active=b.dataset.tab===tab || (b.dataset.tab==='home' && ['intel','arena','live-quizzes','leaderboard','buy-pass','admin'].includes(tab));
     b.classList.toggle('active',active);
     if(active)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');
   });
-  const panels={home:['home-view'],series:['series-panel'],intel:['intel-panel'],create:['create-panel'],arena:['arena-panel'],analytics:['analytics-panel'],leaderboard:['leaderboard-panel'],profile:['profile-panel'],'buy-pass':['buy-pass-panel'],admin:['admin-panel']};
-  const allPanels=['home-view','series-panel','intel-panel','create-panel','arena-panel','analytics-panel','leaderboard-panel','profile-panel','buy-pass-panel','admin-panel'];
+  const panels={home:['home-view'],series:['series-panel'],intel:['intel-panel'],create:['create-panel'],arena:['arena-panel'],'live-quizzes':['live-quiz-panel'],analytics:['analytics-panel'],leaderboard:['leaderboard-panel'],profile:['profile-panel'],'buy-pass':['buy-pass-panel'],admin:['admin-panel']};
+  const allPanels=['home-view','series-panel','intel-panel','create-panel','arena-panel','live-quiz-panel','analytics-panel','leaderboard-panel','profile-panel','buy-pass-panel','admin-panel'];
   allPanels.forEach(id=>{const el=$(id);if(el)el.classList.add('hidden-tab');});
   (panels[tab]||panels.home).forEach(id=>{const el=$(id);if(el)el.classList.remove('hidden-tab');});
   if(tab==='series'){loadTestSeries();loadSeriesQuestionBanks();}
@@ -1978,9 +2024,35 @@ function switchTab(tab,scroll=true){
   if(tab==='analytics'){loadHistory();loadRevision();loadXRay().catch(()=>{});loadArsenal(false).catch(()=>{});}
   if(tab==='leaderboard')loadLeaderboard();
   if(tab==='arena'){setTimeout(refreshArena,150);setTimeout(reconnectArena,250);}
+  if(tab==='live-quizzes')loadLiveQuizSessions();
   if(tab==='admin'){updateAdminPanelAuthView();if(hasAdminAccess())loadAdminPanel();}
   if(scroll)window.scrollTo({top:0,behavior:'auto'});
 }
+
+async function loadLiveQuizSessions(){
+ const liveBox=$('live-quiz-live-list'),upBox=$('live-quiz-upcoming-list'),endBox=$('live-quiz-ended-list');
+ [liveBox,upBox,endBox].forEach(b=>{if(b)b.innerHTML='<div class="loader">Loading sessions…</div>';});
+ try{const d=await api('/api/live-quizzes');const rows=d.sessions||[];if($('live-quiz-count'))$('live-quiz-count').textContent=rows.length+' session'+(rows.length===1?'':'s');
+  const card=x=>{const status=String(x.status||'scheduled');const dt=x.starts_at?new Date(x.starts_at).toLocaleString():'Start time to be announced';const joinable=['open','live','paused'].includes(status);return `<article class="live-session"><div class="live-session-top"><div><span class="subject">${esc(x.subject||'General Studies')}</span><h3>${esc(x.title||'Live Quiz')}</h3></div><span class="live-state ${esc(status)}">${status==='live'?'● Live now':status==='paused'?'Ⅱ Paused':status==='open'?'Open to join':status==='ended'?'Ended':status==='cancelled'?'Cancelled':'Scheduled'}</span></div>${x.description?`<p>${esc(x.description)}</p>`:''}<div class="live-meta"><span>🗓 ${esc(dt)}</span><span>⏱ ${Number(x.duration_minutes)||60} min</span><span>👥 ${Number(x.participants)||0} joined</span><span>🟢 ${Number(x.live_users)||0} online</span>${status==='live'||status==='paused'?`<span>⏳ ${Math.ceil((Number(x.remaining_seconds)||0)/60)} min left</span>`:''}${x.joined?'<span>✓ Joined before</span>':''}</div><div class="live-session-actions">${joinable?`<button class="primary" data-live-join="${Number(x.id)}">${status==='paused'?'Join / Resume (paused)':x.joined?'Resume quiz':'Join live quiz'} →</button>`:status==='scheduled'?'<button class="secondary" disabled>Not open yet</button>':'<button class="secondary" disabled>Session closed</button>'}</div></article>`};
+  const live=rows.filter(x=>['live','open','paused'].includes(x.status)),up=rows.filter(x=>x.status==='scheduled'),ended=rows.filter(x=>['ended','cancelled'].includes(x.status));
+  if(liveBox)liveBox.innerHTML=live.map(card).join('')||'<div class="live-empty">No live sessions at the moment.<br><small>Check the upcoming schedule or refresh later.</small></div>';
+  if(upBox)upBox.innerHTML=up.map(card).join('')||'<div class="live-empty">No upcoming sessions published yet.</div>';
+  if(endBox)endBox.innerHTML=ended.map(card).join('')||'<div class="live-empty">No recently ended sessions.</div>';
+ }catch(e){[liveBox,upBox,endBox].forEach(b=>{if(b)b.innerHTML=`<div class="error">${esc(e.message||'Could not load live quizzes.')}</div>`;});}
+}
+$('live-quiz-refresh')?.addEventListener('click',loadLiveQuizSessions);
+document.addEventListener('click',async e=>{const b=e.target.closest('[data-live-join]');if(!b)return;b.disabled=true;const old=b.textContent;const sid=Number(b.dataset.liveJoin);b.textContent='Joining…';try{const d=await api('/api/live-quizzes/'+sid+'/join','POST',{});liveSessionId=sid;liveSessionState=await api('/api/live-quizzes/'+sid+'/state');switchTab('home',false);if(d.attempt_id){attempt=await api('/api/attempts/'+Number(d.attempt_id));if(attempt.submitted){showResult(attempt);return;}restoreAttemptForResume(attempt);startLivePresence();}else{await startQuiz(Number(d.quiz_id),'exam',sid);} }catch(err){showError(err.message||'Could not join live quiz.');b.disabled=false;b.textContent=old;loadLiveQuizSessions();}});
+function restoreAttemptForResume(a){index=0;answers={};review=new Set();feedback={};optionOrders={};a.questions.forEach(q=>{answers[q.id]=q.selected_option||null;if(q.marked_review)review.add(q.id);if(q.feedback)feedback[q.id]=q.feedback;});showView('exam');renderQuestion();startTimer();}
+function startLivePresence(){if(livePresenceHandle)clearInterval(livePresenceHandle);const pulse=async()=>{if(!liveSessionId)return;try{liveSessionState=await api('/api/live-quizzes/'+liveSessionId+'/state','POST',{attempt_id:attempt&&attempt.attempt_id});if(liveSessionState.status==='ended'||liveSessionState.status==='cancelled'){if(attempt&&!attempt.submitted)await submitTest(true);return;}if(liveSessionState.status==='paused'&&$('timer'))$('timer').textContent='PAUSED';}catch(e){}};pulse();livePresenceHandle=setInterval(pulse,5000);}
+
+
+async function loadAdminLiveQuizzes(){const list=$('admin-live-session-list'),select=$('admin-live-quiz-id');if(list)list.innerHTML='<div class="loader">Loading sessions…</div>';try{const d=await api('/api/admin/live-quizzes');if(select){const current=select.value;select.innerHTML='<option value="">Choose a published quiz…</option>'+(d.quizzes||[]).map(q=>`<option value="${Number(q.id)}">#${Number(q.id)} · ${esc(q.title)} — ${esc(q.subject||'Mixed')} (${Number(q.total_questions)||0} Q)</option>`).join('');if(current)select.value=current;}
+ if(list)list.innerHTML=(d.sessions||[]).map(x=>`<div class="admin-row live-admin-row"><div style="flex:1;min-width:180px"><strong>#${Number(x.id)} · ${esc(x.title)}</strong><small>${esc(x.subject||'Mixed')} · Quiz #${Number(x.quiz_id)} · ${x.starts_at?esc(new Date(x.starts_at).toLocaleString()):'No start time'}</small><small>👥 ${Number(x.participants)||0} total joined · 🟢 ${Number(x.live_users)||0} active in last 90 sec · ⏳ ${Math.ceil((Number(x.remaining_seconds)||0)/60)} min remaining</small><small>Status: <b>${esc(x.status)}</b></small></div><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${x.status==='live'?`<button type="button" class="secondary" data-live-action="paused" data-live-id="${Number(x.id)}">Ⅱ Pause</button>`:`<button type="button" class="primary" data-live-action="live" data-live-id="${Number(x.id)}" ${['ended','cancelled'].includes(x.status)?'disabled':''}>▶ Start / Resume</button>`}${x.status!=='ended'&&x.status!=='cancelled'?`<button type="button" class="secondary" data-live-action="ended" data-live-id="${Number(x.id)}">■ End</button>`:''}<select data-live-status="${Number(x.id)}"><option value="scheduled" ${x.status==='scheduled'?'selected':''}>Scheduled</option><option value="open" ${x.status==='open'?'selected':''}>Open</option><option value="live" ${x.status==='live'?'selected':''}>Live</option><option value="paused" ${x.status==='paused'?'selected':''}>Paused</option><option value="ended" ${x.status==='ended'?'selected':''}>Ended</option><option value="cancelled" ${x.status==='cancelled'?'selected':''}>Cancelled</option></select></div></div>`).join('')||'<div class="empty">No live quiz sessions yet.</div>';
+ }catch(e){if(list)list.innerHTML=`<div class="error">${esc(e.message||'Could not load admin sessions.')}</div>`;}}
+$('admin-live-refresh')?.addEventListener('click',loadAdminLiveQuizzes);
+$('admin-live-quiz-form')?.addEventListener('submit',async e=>{e.preventDefault();const status=$('admin-live-quiz-status'),btn=e.currentTarget.querySelector('button[type="submit"]');btn.disabled=true;status.textContent='Creating session…';try{const raw=$('admin-live-starts').value;const starts_at=raw?new Date(raw).toISOString():null;await api('/api/admin/live-quizzes','POST',{title:$('admin-live-title').value.trim(),quiz_id:Number($('admin-live-quiz-id').value),description:$('admin-live-description').value.trim(),starts_at,duration_minutes:Number($('admin-live-duration').value),status:$('admin-live-status').value});status.textContent='Live quiz session created.';e.currentTarget.reset();$('admin-live-duration').value=60;$('admin-live-status').value='scheduled';await loadAdminLiveQuizzes();}catch(err){status.textContent=err.message||'Could not create session.';}finally{btn.disabled=false;}});
+document.addEventListener('click',async e=>{const b=e.target.closest('[data-live-action]');if(!b)return;const status=b.dataset.liveAction;b.disabled=true;try{await api('/api/admin/live-quizzes/'+Number(b.dataset.liveId)+'/status','POST',{status});await loadAdminLiveQuizzes();}catch(err){showError(err.message||'Could not update live quiz.');b.disabled=false;}});
+document.addEventListener('change',async e=>{const sel=e.target.closest('[data-live-status]');if(!sel)return;const previous=sel.dataset.previous||'';try{await api('/api/admin/live-quizzes/'+Number(sel.dataset.liveStatus)+'/status','POST',{status:sel.value});sel.dataset.previous=sel.value;loadAdminLiveQuizzes();}catch(err){showError(err.message||'Could not update session status.');if(previous)sel.value=previous;}});
 
 async function reconnectArena(){try{const d=await api('/api/arena');const live=(d.matches||[]).find(m=>m.status==='active'||m.status==='waiting');if(live&&$('arena-live'))openArenaMatch(live.id);}catch(e){}}
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)reconnectArena();});
@@ -2102,6 +2174,7 @@ async function loadAdminPanel(){
     if($('admin-series-list')&&!$('admin-series-list').querySelector('.sm-series-row'))$('admin-series-list').innerHTML=(s.series||[]).map(x=>`<div class="admin-row"><div><strong>#${x.id} · ${esc(x.title)}</strong><small>${esc(x.exam_type)} · ${x.test_count} tests · ${x.is_published?'Published':'Draft'}</small></div><select data-series-access="${x.id}"><option value="free" ${x.access_type==='free'?'selected':''}>Free</option><option value="paid" ${x.access_type==='paid'?'selected':''}>Paid</option></select></div>`).join('')||'<div class="empty">No series.</div>';
     renderAdminCleanup(c);
   }catch(e){if($('admin-demo-status'))$('admin-demo-status').textContent='Some data failed: '+(e.message||'error');}
+  loadAdminLiveQuizzes().catch(()=>{});
   loadAdminPayments().catch(()=>{});
   loadAdminImportSubjects().catch(()=>{});
   loadAdminPassOptions().catch(()=>{});
@@ -2123,6 +2196,7 @@ document.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click',()
 document.querySelectorAll('[data-tab-go]').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.tabGo)));
 document.querySelectorAll('[data-home-route]').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.homeRoute)));
 $('arena-coming-home')?.addEventListener('click',()=>switchTab('arena'));
+$('live-quiz-home')?.addEventListener('click',()=>switchTab('live-quizzes'));
 $('get-pass-home')?.addEventListener('click',()=>switchTab('buy-pass'));
 $('hero-pass-cta')?.addEventListener('click',()=>switchTab('buy-pass'));
 $('top-theme-btn')?.addEventListener('click',()=>switchTab('profile'));
@@ -2131,6 +2205,7 @@ window.activateAdminView=function(name){
   document.querySelectorAll('.admin-view').forEach(v=>v.classList.toggle('active',v.id==='admin-view-'+name));
   document.querySelectorAll('.admin-nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.adminView===name));
   if(name==='payments')loadAdminPayments().catch(()=>{});
+  if(name==='live-quizzes')loadAdminLiveQuizzes().catch(()=>{});
   if(name==='banks'||name==='series')loadAdminPanel().catch(()=>{});if(name==='series'){loadSMQuizCatalog().catch(()=>{});loadSMSeries().catch(()=>{});}
   if(name==='demo')loadAdminDemoRegistrations().catch(()=>{});
   if(name==='notifications')loadAdminNotifications().catch(()=>{});
@@ -2629,18 +2704,18 @@ async function createCustomQuiz(){
 $('build-quiz-btn')?.addEventListener('click',createCustomQuiz);
 loadBuilderMeta();
 
-async function startQuiz(id,mode){
+async function startQuiz(id,mode,liveSid=null){
   if(!(await ensureDemoGate('attempt quizzes')))return;
   if(maintenanceOn&&!hasAdminAccess()){showError('Under maintenance. New quizzes are temporarily disabled.');return;}
-  try{clearError();const created=await api('/api/attempts','POST',{quiz_id:id,mode});attempt=await api('/api/attempts/'+created.attempt_id);if(attempt.submitted){showResult(attempt);return;}index=0;answers={};review=new Set();feedback={};optionOrders={};attempt.questions.forEach(q=>{answers[q.id]=q.selected_option||null;if(q.marked_review)review.add(q.id);if(q.feedback)feedback[q.id]=q.feedback;});showView('exam');renderQuestion();startTimer();}
+  try{clearError();const created=await api('/api/attempts','POST',{quiz_id:id,mode});attempt=await api('/api/attempts/'+created.attempt_id);if(attempt.submitted){showResult(attempt);return;}liveSessionId=liveSid||null;index=0;answers={};review=new Set();feedback={};optionOrders={};attempt.questions.forEach(q=>{answers[q.id]=q.selected_option||null;if(q.marked_review)review.add(q.id);if(q.feedback)feedback[q.id]=q.feedback;});if(liveSessionId){await api('/api/live-quizzes/'+liveSessionId+'/state','POST',{attempt_id:attempt.attempt_id});liveSessionState=await api('/api/live-quizzes/'+liveSessionId+'/state');startLivePresence();}showView('exam');renderQuestion();startTimer();}
   catch(e){showError(e.message);}
 }
 function showView(name){['home-view','exam-view','result-view'].forEach(id=>$(id).classList.toggle('hidden',id!==name+'-view'));const nav=$('bottom-nav');if(nav)nav.classList.toggle('nav-hidden',name!=='home');window.scrollTo({top:0,behavior:'auto'});}
 function startTimer(){
   if(timerHandle)clearInterval(timerHandle);
-  const update=()=>{if(!attempt||!attempt.deadline){if($('timer'))$('timer').textContent='Practice';return;}const remain=Math.max(0,Math.floor((new Date(attempt.deadline).getTime()-Date.now())/1000));const h=Math.floor(remain/3600),m=Math.floor((remain%3600)/60),s=remain%60;if($('timer'))$('timer').textContent=h?`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;$('timer')?.classList.toggle('warn',remain<300);if(remain===0&&attempt.mode==='exam'){clearInterval(timerHandle);submitTest(true);}};
-  if(attempt.mode==='practice'){if($('timer'))$('timer').textContent='PRACTICE';return;}
-  update();timerHandle=setInterval(update,1000);
+  const update=()=>{if(!attempt){return;}let remain;if(liveSessionId){if(!liveSessionState){if($('timer'))$('timer').textContent='SYNCING…';return;}if(liveSessionState.status==='paused'){if($('timer'))$('timer').textContent='PAUSED';return;}if(liveSessionState.status==='open'){if($('timer'))$('timer').textContent='WAITING FOR START';return;}if(liveSessionState.status!=='live'){if($('timer'))$('timer').textContent=liveSessionState.status.toUpperCase();return;}if(typeof liveSessionState._localRemain!=='number')liveSessionState._localRemain=Number(liveSessionState.remaining_seconds)||0;const now=Date.now();if(liveClockLastTick&&now-liveClockLastTick>=900&&now-liveClockLastTick<=1500)liveSessionState._localRemain=Math.max(0,liveSessionState._localRemain-1);liveClockLastTick=now;remain=Math.max(0,Math.floor(liveSessionState._localRemain));}else{if(!attempt.deadline){if($('timer'))$('timer').textContent='Practice';return;}remain=Math.max(0,Math.floor((new Date(attempt.deadline).getTime()-Date.now())/1000));}const h=Math.floor(remain/3600),m=Math.floor((remain%3600)/60),ss=remain%60;if($('timer'))$('timer').textContent=h?`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`:`${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;$('timer')?.classList.toggle('warn',remain<300);if(remain===0&&attempt.mode==='exam'){clearInterval(timerHandle);submitTest(true);}};
+  if(attempt.mode==='practice'&&!liveSessionId){if($('timer'))$('timer').textContent='PRACTICE';return;}
+  liveClockLastTick=Date.now();update();timerHandle=setInterval(update,1000);
 }
 function startQuestionTimer(q){
   if(questionTimerHandle)clearInterval(questionTimerHandle);questionTimerHandle=null;
@@ -2684,7 +2759,7 @@ function prevQ(){if(index>0){index--;renderQuestion();}}
 function openPalette(){const list=$('palette-list');if(!list)return;list.innerHTML=attempt.questions.map((q,i)=>`<button class="palette-btn ${answers[q.id]?'answered':''} ${review.has(q.id)?'review':''} ${i===index?'current':''}" data-jump="${i}">${i+1}</button>`).join('');list.querySelectorAll('[data-jump]').forEach(b=>b.onclick=()=>{index=Number(b.dataset.jump);$('palette-backdrop').classList.add('hidden');renderQuestion();});$('palette-backdrop').classList.remove('hidden');}
 async function submitTest(auto=false){if(!attempt||busy)return;if(!auto&&!confirm('Submit?'))return;busy=true;try{const data=await api('/api/attempts/'+attempt.attempt_id+'/submit','POST',{});showResult(data);}catch(e){showError(e.message);}finally{busy=false;}}
 function showResult(r){
-  if(timerHandle)clearInterval(timerHandle);if(questionTimerHandle)clearInterval(questionTimerHandle);attempt=null;showView('result');
+  if(timerHandle)clearInterval(timerHandle);if(questionTimerHandle)clearInterval(questionTimerHandle);if(livePresenceHandle)clearInterval(livePresenceHandle);livePresenceHandle=null;liveSessionId=null;liveSessionState=null;attempt=null;showView('result');
   const html=`<div class="result-head"><div class="eyebrow">${esc(r.mode||'practice').toUpperCase()}</div><h1>${esc(r.title)}</h1><div class="score">${Number(r.score).toFixed(2)}<span style="font-size:16px;opacity:.7"> / ${Number(r.max_score).toFixed(2)}</span></div><div style="color:#d7e2f1">${esc(r.subject)} · ${r.accuracy}%</div></div><div class="stats"><div class="stat"><strong>${r.correct}</strong><span>Correct</span></div><div class="stat"><strong>${r.incorrect}</strong><span>Incorrect</span></div><div class="stat"><strong>${r.skipped}</strong><span>Skipped</span></div></div><button id="back-home" class="primary full" style="margin-top:14px">Back to home</button>`;
   if($('result-view'))$('result-view').innerHTML=html;
   $('back-home')?.addEventListener('click',()=>{showView('home');loadAccess().catch(()=>{});loadQuizzes();});
