@@ -538,20 +538,14 @@ async def arena_create(request):
         if not gate_ok:
             return json_response({'error':('Register for the free demo to enter the Arena.' if gate_reason in ('register','no_trial') else 'Your demo has ended. Unlock a pass to keep battling.'),'demo_gate':'register' if gate_reason in ('register','no_trial') else 'expired'},403)
         if mode=="matchmaking":
-            await conn.execute("""UPDATE bpsc_nexus_arena_matches SET status='expired'
-                WHERE status='waiting' AND created_at < NOW() - INTERVAL '5 minutes'""")
-            async with conn.transaction():
-                cur=await conn.execute("""SELECT m.id FROM bpsc_nexus_arena_matches m
-                    WHERE m.status='waiting' AND m.match_type='matchmaking'
-                      AND NOT EXISTS (SELECT 1 FROM bpsc_nexus_arena_players p
-                                      WHERE p.match_id=m.id AND p.telegram_id=%s)
-                    ORDER BY m.created_at FOR UPDATE OF m SKIP LOCKED LIMIT 1""",(uid,))
-                open_match=await cur.fetchone()
-                if open_match:
-                    match_id=int(open_match["id"])
-                    await conn.execute("INSERT INTO bpsc_nexus_arena_players(match_id,telegram_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",(match_id,uid))
-                    await conn.execute("UPDATE bpsc_nexus_arena_matches SET status='active',started_at=NOW() WHERE id=%s AND status='waiting'",(match_id,))
-                    return json_response({"match_id":match_id,"status":"active","joined":True})
+            cur=await conn.execute("""SELECT m.id FROM bpsc_nexus_arena_matches m JOIN bpsc_nexus_arena_players p ON p.match_id=m.id
+                WHERE m.status='waiting' AND m.match_type='matchmaking' AND p.telegram_id<>%s ORDER BY m.created_at FOR UPDATE OF m SKIP LOCKED LIMIT 1""",(uid,))
+            open_match=await cur.fetchone()
+            if open_match:
+                match_id=int(open_match["id"])
+                await conn.execute("INSERT INTO bpsc_nexus_arena_players(match_id,telegram_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",(match_id,uid))
+                await conn.execute("UPDATE bpsc_nexus_arena_matches SET status='active',started_at=NOW() WHERE id=%s AND status='waiting'",(match_id,))
+                return json_response({"match_id":match_id,"status":"active","joined":True})
         cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' ORDER BY RANDOM() LIMIT 10")
         qs=await cur.fetchall()
         if len(qs)<5: return json_response({"error":"The question bank needs at least five verified questions before Arena can start."},503)
@@ -584,20 +578,6 @@ async def arena_join(request):
         await conn.execute("UPDATE bpsc_nexus_arena_matches SET status='active',started_at=NOW() WHERE id=%s",(m["id"],))
     return json_response({"match_id":int(m["id"]),"status":"active","joined":True})
 
-def _normalize_arena_options(raw):
-    if isinstance(raw, dict):
-        return raw
-    try:
-        parsed = json.loads(raw or "{}")
-        if isinstance(parsed, dict):
-            return parsed
-        if isinstance(parsed, list):
-            return {chr(65+i): str(v) for i, v in enumerate(parsed) if str(v).strip()}
-    except Exception:
-        pass
-    return {}
-
-
 async def arena_match(request):
     uid=request["telegram_user"]["id"]
     try: mid=int(request.match_info["match_id"])
@@ -611,7 +591,7 @@ async def arena_match(request):
             LEFT JOIN bpsc_nexus_arena_answers a ON a.match_id=q.match_id AND a.position=q.position AND a.telegram_id=%s
             WHERE q.match_id=%s ORDER BY q.position""",(uid,mid)); qs=await cur.fetchall()
         cur=await conn.execute("SELECT position,selected_option FROM bpsc_nexus_arena_answers WHERE match_id=%s AND telegram_id=%s",(mid,uid)); answered={int(r["position"]):r["selected_option"] for r in await cur.fetchall()}
-    return json_response({"id":int(m["id"]),"invite_code":m["invite_code"],"status":m["status"],"question_count":int(m["question_count"]),"started_at":m["started_at"].isoformat() if m["started_at"] else None,"players":[{"is_you":int(p["telegram_id"])==uid,"score":int(p["score"] or 0),"finished":bool(p["finished_at"])} for p in players],"questions":[{"position":int(q["position"]),"id":int(q["question_id"]),"subject":q["subject"],"question_en":q["question_en"],"question_hi":q["question_hi"],"options":_normalize_arena_options(q["options"]),"selected_option":answered.get(int(q["position"]))} for q in qs]})
+    return json_response({"id":int(m["id"]),"invite_code":m["invite_code"],"status":m["status"],"question_count":int(m["question_count"]),"started_at":m["started_at"].isoformat() if m["started_at"] else None,"players":[{"is_you":int(p["telegram_id"])==uid,"score":int(p["score"] or 0),"finished":bool(p["finished_at"])} for p in players],"questions":[{"position":int(q["position"]),"id":int(q["question_id"]),"subject":q["subject"],"question_en":q["question_en"],"question_hi":q["question_hi"],"options":q["options"] if isinstance(q["options"],dict) else json.loads(q["options"] or "{}"),"selected_option":answered.get(int(q["position"]))} for q in qs]})
 
 async def arena_answer(request):
     uid=request["telegram_user"]["id"]
@@ -675,6 +655,29 @@ async def payment_schema(conn):
     await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS product_code TEXT NOT NULL DEFAULT 'all_access'")
     await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS group_chat_id BIGINT")
     await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_payment_requests_status_idx ON bpsc_payment_requests(status, submitted_at DESC)")
+    await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS coupon_code TEXT")
+    await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS base_amount_inr INTEGER")
+    await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS discount_amount_inr INTEGER NOT NULL DEFAULT 0")
+    await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS pass_scope TEXT")
+    await conn.execute("ALTER TABLE bpsc_payment_requests ADD COLUMN IF NOT EXISTS pass_vault_keys TEXT[]")
+    await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_payment_requests_coupon_idx ON bpsc_payment_requests(coupon_code, status)")
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_pass_offers (
+        product_code TEXT PRIMARY KEY, pass_name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+        amount_inr INTEGER NOT NULL CHECK(amount_inr >= 0), duration_days INTEGER NOT NULL DEFAULT 0 CHECK(duration_days >= 0),
+        scope TEXT NOT NULL CHECK(scope IN ('all_access','individual','bank','group')),
+        vault_keys TEXT[] NOT NULL DEFAULT ARRAY['*']::TEXT[], category TEXT NOT NULL DEFAULT 'Premium',
+        is_active BOOLEAN NOT NULL DEFAULT TRUE, is_featured BOOLEAN NOT NULL DEFAULT FALSE,
+        sort_order INTEGER NOT NULL DEFAULT 0, created_by BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_coupon_codes (
+        code TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '', discount_type TEXT NOT NULL CHECK(discount_type IN ('percent','fixed')),
+        discount_value INTEGER NOT NULL CHECK(discount_value > 0), max_discount_inr INTEGER,
+        min_order_inr INTEGER NOT NULL DEFAULT 0, starts_at TIMESTAMPTZ, expires_at TIMESTAMPTZ,
+        max_redemptions INTEGER, per_user_limit INTEGER NOT NULL DEFAULT 1,
+        applicable_product_codes TEXT[], is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_by BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+    await conn.execute("ALTER TABLE bpsc_coupon_codes ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ")
+    await conn.execute("ALTER TABLE bpsc_coupon_codes ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ")
     await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_individual_products (
         product_code TEXT PRIMARY KEY, product_name TEXT NOT NULL, amount_inr INTEGER NOT NULL CHECK(amount_inr >= 0),
         entitlement_key TEXT NOT NULL, duration_days INTEGER NOT NULL DEFAULT 0, is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -704,6 +707,65 @@ async def membership_page(request):
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return response
 
+async def _pass_offer_rows(conn, active_only=True):
+    where = "WHERE is_active=TRUE" if active_only else ""
+    cur=await conn.execute(f"SELECT product_code,pass_name,description,amount_inr,duration_days,scope,vault_keys,category,is_active,is_featured,sort_order FROM bpsc_pass_offers {where} ORDER BY sort_order,created_at DESC")
+    rows=[]
+    for r in await cur.fetchall():
+        d=dict(r); d['vault_keys']=list(d.get('vault_keys') or [])
+        d['duration_label']='Lifetime access' if int(d['duration_days'])==0 else f"{int(d['duration_days'])} days access"
+        d['product_name']=d['pass_name']; d['name']=d['pass_name']
+        d['description']=d.get('description') or ''; d['price']=int(d['amount_inr'])
+        rows.append(d)
+    return rows
+
+async def _coupon_discount(conn, code, telegram_id, product_code, base_amount, lock=False):
+    code=re.sub(r'[^A-Z0-9_-]','',str(code or '').upper())[:40]
+    if not code: return {'code':'','discount':0,'final_amount':int(base_amount)}
+    cur=await conn.execute("SELECT * FROM bpsc_coupon_codes WHERE code=%s"+(" FOR UPDATE" if lock else ""),(code,)); c=await cur.fetchone()
+    if not c or not c['is_active']: raise ValueError('This coupon is invalid or inactive.')
+    now=datetime.now(timezone.utc)
+    for key,label in [('starts_at','not active yet'),('expires_at','has expired')]:
+        val=c.get(key)
+        if val and ((key=='starts_at' and val>now) or (key=='expires_at' and val<now)):
+            raise ValueError(f'This coupon {label}.')
+    if int(base_amount)<int(c['min_order_inr'] or 0): raise ValueError(f"Minimum order for this coupon is ₹{int(c['min_order_inr'])}.")
+    applies=c.get('applicable_product_codes')
+    if applies and product_code not in applies: raise ValueError('This coupon does not apply to the selected pass.')
+    if c.get('max_redemptions') is not None:
+        cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_payment_requests WHERE coupon_code=%s AND status IN ('pending','approved')",(code,)); used=int((await cur.fetchone())['n'])
+        if used>=int(c['max_redemptions']): raise ValueError('This coupon has reached its redemption limit.')
+    cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_payment_requests WHERE coupon_code=%s AND telegram_id=%s AND status IN ('pending','approved')",(code,int(telegram_id))); user_used=int((await cur.fetchone())['n'])
+    if user_used>=int(c['per_user_limit'] or 1): raise ValueError('You have already used this coupon the maximum number of times.')
+    if c['discount_type']=='percent': discount=(int(base_amount)*int(c['discount_value']))//100
+    else: discount=int(c['discount_value'])
+    if c.get('max_discount_inr') is not None: discount=min(discount,int(c['max_discount_inr']))
+    discount=max(0,min(max(0,int(base_amount)-1),discount))
+    return {'code':code,'discount':discount,'final_amount':int(base_amount)-discount,'description':c.get('description') or ''}
+
+async def payment_coupon_validate(request):
+    user=request['telegram_user']
+    try:
+        body=await request.json(); code=str(body.get('coupon_code') or ''); product_code=str(body.get('product_code') or '').strip().lower(); days=body.get('duration_days')
+    except Exception: return json_response({'error':'Invalid coupon request.'},400)
+    async with request.app['pool'].connection() as conn:
+        await payment_schema(conn)
+        base=None
+        cur=await conn.execute("SELECT product_code,amount_inr,duration_days FROM bpsc_pass_offers WHERE product_code=%s AND is_active=TRUE",(product_code,)); offer=await cur.fetchone()
+        if offer: base=int(offer['amount_inr'])
+        elif product_code=='all_access':
+            try: base=ALL_ACCESS_PRICES[int(days)]
+            except Exception: return json_response({'error':'Choose a valid All Access duration.'},400)
+        else:
+            cur=await conn.execute("SELECT amount_inr FROM bpsc_individual_products WHERE product_code=%s AND is_active=TRUE",(product_code,)); prod=await cur.fetchone()
+            plan=next((x for x in GROUP_AND_INDIVIDUAL_PLANS if x['product_code']==product_code),None)
+            if prod: base=int(prod['amount_inr'])
+            elif plan: base=int(plan['amount_inr'])
+        if base is None: return json_response({'error':'Pass not found or inactive.'},404)
+        try: result=await _coupon_discount(conn,code,user['id'],product_code,base)
+        except ValueError as e: return json_response({'error':str(e)},400)
+    return json_response({'valid':True,'coupon_code':result['code'],'base_amount':base,'discount_amount':result['discount'],'final_amount':result['final_amount'],'description':result.get('description','')})
+
 async def payment_options(request):
     uid=request["telegram_user"]["id"]
     async with request.app["pool"].connection() as conn:
@@ -712,12 +774,14 @@ async def payment_options(request):
         history=await cur.fetchall()
         cur=await conn.execute("SELECT product_code,product_name,amount_inr,entitlement_key,duration_days FROM bpsc_individual_products WHERE is_active=TRUE ORDER BY product_name")
         products=await cur.fetchall()
+        offers=await _pass_offer_rows(conn, True)
     plans = list(GROUP_AND_INDIVIDUAL_PLANS) + [
         {"product_code":"all_access","product_name":"All Access","amount_inr":price,"duration_days":days,
          "duration_label":f"{days} days · all vaults","scope":"individual",
          "description":"All personal question banks and vaults for the selected duration."}
         for days, price in ALL_ACCESS_PRICES.items()
     ]
+    plans.extend([{k:v for k,v in o.items() if k not in ('vault_keys','category','is_active','sort_order')} | {'scope':('group' if o['scope']=='group' else 'individual' if o['scope'] in ('individual','all_access') else 'banks'),'custom_pass':True,'entitlement_key':','.join(o.get('vault_keys') or [])} for o in offers])
     return json_response({
         "plans": plans,
         "prices":[{"days":d,"price":p} for d,p in ALL_ACCESS_PRICES.items()],
@@ -737,8 +801,22 @@ async def submit_payment(request):
     group_chat_id = None
     async with request.app["pool"].connection() as conn:
         await payment_schema(conn)
+        cur=await conn.execute("SELECT product_code,pass_name,description,amount_inr,duration_days,scope,vault_keys FROM bpsc_pass_offers WHERE product_code=%s AND is_active=TRUE",(product_code,)); custom_offer=await cur.fetchone()
         plan = next((p for p in GROUP_AND_INDIVIDUAL_PLANS if p["product_code"] == product_code), None)
-        if product_code == "all_access":
+        if custom_offer:
+            amount=int(custom_offer['amount_inr']); days=int(custom_offer['duration_days']); product_name=custom_offer['pass_name']
+            if custom_offer['scope']=='group':
+                raw=body.get('group_chat_id')
+                try: group_chat_id=int(str(raw).strip())
+                except (TypeError,ValueError): return json_response({'error':'Enter the numeric Telegram group ID for a Group Pass.'},400)
+                try:
+                    import aiohttp as _aiohttp
+                    async with _aiohttp.ClientSession() as _sess:
+                        async with _sess.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember",params={'chat_id':group_chat_id,'user_id':user['id']},timeout=_aiohttp.ClientTimeout(total=8)) as _r: _payload=await _r.json()
+                    status=((_payload or {}).get('result') or {}).get('status','')
+                    if str(status).lower() not in ('administrator','creator'): return json_response({'error':'You must be an administrator of that Telegram group to purchase a Group Pass.'},403)
+                except Exception: return json_response({'error':'Could not verify group admin status. Add the bot to the group and try again.'},400)
+        elif product_code == "all_access":
             try:
                 days=int(body.get("duration_days")); amount=ALL_ACCESS_PRICES[days]
             except Exception: return json_response({"error":"Choose a valid All Access duration."},400)
@@ -767,12 +845,20 @@ async def submit_payment(request):
             product=await cur.fetchone()
             if not product: return json_response({"error":"This question bank is unavailable for new purchases."},404)
             amount=int(product["amount_inr"]); days=int(product["duration_days"]); product_name=product["product_name"]
-        cur=await conn.execute("SELECT status FROM bpsc_payment_requests WHERE transaction_ref=%s",(ref,))
-        if await cur.fetchone(): return json_response({"error":"This transaction/reference ID has already been submitted."},409)
-        cur=await conn.execute("""INSERT INTO bpsc_payment_requests(telegram_id,product_code,product_name,duration_days,amount_inr,transaction_ref,screenshot_data,group_chat_id)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,submitted_at""",(user["id"],product_code,product_name,days,amount,ref,screenshot,group_chat_id))
-        r=await cur.fetchone()
-    return json_response({"request_id":int(r["id"]),"status":"pending","amount":amount,"product_code":product_code,"product_name":product_name,"submitted_at":r["submitted_at"].isoformat()},201)
+        coupon_code=str(body.get('coupon_code') or '').strip().upper()
+        try:
+            async with conn.transaction():
+                cur=await conn.execute("SELECT status FROM bpsc_payment_requests WHERE transaction_ref=%s",(ref,))
+                if await cur.fetchone(): return json_response({"error":"This transaction/reference ID has already been submitted."},409)
+                coupon={'code':'','discount':0,'final_amount':amount}
+                if coupon_code:
+                    coupon=await _coupon_discount(conn,coupon_code,user['id'],product_code,amount,lock=True)
+                final_amount=int(coupon['final_amount'])
+                cur=await conn.execute("""INSERT INTO bpsc_payment_requests(telegram_id,product_code,product_name,duration_days,amount_inr,transaction_ref,screenshot_data,group_chat_id,coupon_code,base_amount_inr,discount_amount_inr,pass_scope,pass_vault_keys)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,submitted_at""",(user["id"],product_code,product_name,days,final_amount,ref,screenshot,group_chat_id,coupon.get('code') or None,amount,int(coupon['discount']),custom_offer['scope'] if custom_offer else None,list(custom_offer.get('vault_keys') or []) if custom_offer else None))
+                r=await cur.fetchone()
+        except ValueError as e: return json_response({'error':str(e)},400)
+    return json_response({"request_id":int(r["id"]),"status":"pending","amount":final_amount,"base_amount":amount,"discount_amount":int(coupon['discount']),"coupon_code":coupon.get('code',''),"product_code":product_code,"product_name":product_name,"submitted_at":r["submitted_at"].isoformat()},201)
 
 async def index(request):
     page = ROOT / "static" / "index.html"
@@ -872,6 +958,7 @@ async def ensure_test_series_schema(conn):
     )""")
     await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_nexus_test_series_public_idx ON bpsc_nexus_test_series(is_published,exam_type,sort_order,id)")
     await conn.execute("ALTER TABLE bpsc_nexus_test_series ADD COLUMN IF NOT EXISTS access_type VARCHAR(12) NOT NULL DEFAULT 'paid'")
+    await conn.execute("ALTER TABLE bpsc_nexus_test_series ADD COLUMN IF NOT EXISTS logo_url TEXT NOT NULL DEFAULT ''")
     await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_test_series_entitlements (
         series_id BIGINT NOT NULL REFERENCES bpsc_nexus_test_series(id) ON DELETE CASCADE,
         telegram_id BIGINT NOT NULL,
@@ -1557,7 +1644,35 @@ async def admin_review_payment(request):
                 cur=await conn.execute('SELECT id FROM app_users WHERE telegram_id=%s',(r['telegram_id'],)); app_user=await cur.fetchone()
                 if not app_user: return json_response({'error':'The student is not registered yet. Ask them to open the Mini App once, then retry.'},409)
                 product_code=str(r['product_code'] or 'all_access')
-                if product_code in ('group_starter','group_elite'):
+                cur=await conn.execute("SELECT product_code,pass_name,description,duration_days,scope,vault_keys FROM bpsc_pass_offers WHERE product_code=%s",(product_code,)); custom_offer=await cur.fetchone()
+                saved_scope=(r.get('pass_scope') if isinstance(r,dict) else None) or (custom_offer['scope'] if custom_offer else None)
+                if custom_offer and saved_scope=='group':
+                    group_chat_id=int(r.get('group_chat_id') or 0)
+                    if not group_chat_id: return json_response({'error':'This Group Pass has no target group ID.'},409)
+                    if int(r['duration_days']):
+                        await conn.execute("""INSERT INTO group_quiz_memberships(chat_id,chat_title,is_active,granted_by,granted_at,revoked_at,expires_at,plan_code) VALUES(%s,%s,TRUE,%s,NOW(),NULL,NOW()+(%s*INTERVAL '1 day'),%s) ON CONFLICT(chat_id) DO UPDATE SET is_active=TRUE,granted_by=EXCLUDED.granted_by,granted_at=NOW(),revoked_at=NULL,expires_at=EXCLUDED.expires_at,plan_code=EXCLUDED.plan_code""",(group_chat_id,f"Group · {custom_offer['pass_name']}",admin['id'],int(r['duration_days']),product_code))
+                    else:
+                        await conn.execute("""INSERT INTO group_quiz_memberships(chat_id,chat_title,is_active,granted_by,granted_at,revoked_at,expires_at,plan_code) VALUES(%s,%s,TRUE,%s,NOW(),NULL,NULL,%s) ON CONFLICT(chat_id) DO UPDATE SET is_active=TRUE,granted_by=EXCLUDED.granted_by,granted_at=NOW(),revoked_at=NULL,expires_at=NULL,plan_code=EXCLUDED.plan_code""",(group_chat_id,f"Group · {custom_offer['pass_name']}",admin['id'],product_code))
+                    await conn.execute("UPDATE bpsc_payment_requests SET status='approved',reviewed_at=NOW(),reviewed_by=%s,review_note=%s WHERE id=%s",(admin['id'],note or 'Approved Group Pass',rid))
+                    await _write_admin_audit(conn,admin['id'],'custom_group_pass_approve',str(rid),{'telegram_id':r['telegram_id'],'group_chat_id':group_chat_id,'product_code':product_code})
+                    result_message=f"✅ Group Pass approved. {custom_offer['pass_name']} is active for group {group_chat_id}."
+                elif custom_offer:
+                    saved_keys=(r.get('pass_vault_keys') if isinstance(r,dict) else None) or list(custom_offer.get('vault_keys') or [])
+                    keys=list(saved_keys)
+                    if saved_scope in ('all_access','individual'): keys=['*']
+                    if not keys: keys=['*'] if saved_scope=='individual' else [product_code]
+                    cur=await conn.execute("INSERT INTO pass_catalogue(pass_code,pass_name,description,is_active) VALUES(%s,%s,%s,TRUE) ON CONFLICT(pass_code) DO UPDATE SET pass_name=EXCLUDED.pass_name,description=EXCLUDED.description,is_active=TRUE RETURNING id",(product_code,custom_offer['pass_name'],custom_offer['description'] or 'BPSC Nexus custom pass'))
+                    cat=await cur.fetchone()
+                    expiry_expr="NOW()+(%s*INTERVAL '1 day')" if int(r['duration_days']) else "NULL"
+                    if int(r['duration_days']):
+                        cur=await conn.execute(f"INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys) VALUES(%s,%s,%s,NOW(),{expiry_expr},%s,%s,%s) RETURNING id",(app_user['id'],cat['id'],admin['id'],int(r['duration_days']),f"Payment #{rid}; ₹{r['amount_inr']}; coupon {r.get('coupon_code') or '—'}",product_code,keys))
+                    else:
+                        cur=await conn.execute("INSERT INTO premium_passes(user_id,pass_id,granted_by_telegram_id,granted_at,expires_at,note,pass_code,vault_keys) VALUES(%s,%s,%s,NOW(),NULL,%s,%s,%s) RETURNING id",(app_user['id'],cat['id'],admin['id'],f"Payment #{rid}; ₹{r['amount_inr']}; coupon {r.get('coupon_code') or '—'}",product_code,keys))
+                    pass_id=int((await cur.fetchone())['id'])
+                    await conn.execute("UPDATE bpsc_payment_requests SET status='approved',reviewed_at=NOW(),reviewed_by=%s,review_note=%s,activated_pass_id=%s WHERE id=%s",(admin['id'],note or 'Approved',pass_id,rid))
+                    await _write_admin_audit(conn,admin['id'],'custom_pass_approve',str(rid),{'telegram_id':r['telegram_id'],'product_code':product_code,'pass_id':pass_id,'coupon_code':r.get('coupon_code')})
+                    result_message=f"✅ Your BPSC Nexus payment is approved. {custom_offer['pass_name']} access is now active."
+                elif product_code in ('group_starter','group_elite'):
                     group_chat_id = r.get('group_chat_id') if isinstance(r, dict) else None
                     try: group_chat_id = int(group_chat_id or 0)
                     except Exception: group_chat_id = 0
@@ -1602,6 +1717,97 @@ async def admin_review_payment(request):
     await _notify_telegram_user(int(r['telegram_id']),result_message)
     return json_response({'request_id':rid,'status':'approved' if action=='approve' else 'rejected','activated_pass_id':pass_id,'updated':True})
 
+
+async def admin_pass_offers(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    async with request.app['pool'].connection() as conn:
+        await payment_schema(conn)
+        rows=await _pass_offer_rows(conn,False)
+        cur=await conn.execute("SELECT code,description,discount_type,discount_value,max_discount_inr,min_order_inr,starts_at,expires_at,max_redemptions,per_user_limit,applicable_product_codes,is_active,created_at,(SELECT COUNT(*) FROM bpsc_payment_requests p WHERE p.coupon_code=c.code AND p.status IN ('pending','approved')) AS redemptions FROM bpsc_coupon_codes c ORDER BY created_at DESC")
+        coupons=[]
+        for r in await cur.fetchall():
+            d=dict(r)
+            for k in ('starts_at','expires_at','created_at'):
+                if d.get(k): d[k]=d[k].isoformat()
+            d['applicable_product_codes']=list(d.get('applicable_product_codes') or [])
+            coupons.append(d)
+    return json_response({'passes':rows,'coupons':coupons})
+
+async def admin_pass_offer_save(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try:
+        body=await request.json(); code=re.sub(r'[^a-z0-9_-]','',str(body.get('product_code') or '').strip().lower())[:50]
+        name=str(body.get('pass_name') or '').strip()[:160]; description=str(body.get('description') or '').strip()[:2000]
+        amount=int(body.get('amount_inr')); days=int(body.get('duration_days',0)); scope=str(body.get('scope') or 'individual')
+        keys=body.get('vault_keys') or (['*'] if scope=='all_access' else [code]); keys=[str(x).strip()[:120] for x in keys if str(x).strip()][:100]
+        category=str(body.get('category') or 'Premium').strip()[:80]; active=bool(body.get('is_active',True)); featured=bool(body.get('is_featured',False)); order=int(body.get('sort_order',0))
+        if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{2,49}',code): raise ValueError('Pass code must be 3–50 lowercase letters, numbers, underscores or hyphens.')
+        if not name: raise ValueError('Pass name is required.')
+        if code in {'all_access','group_starter','group_elite','individual_pro','individual_prime','bpsc_pyq','upsc_cse_pyq','ssc_pyq','lucent'} or code in INDIVIDUAL_PRODUCTS: raise ValueError('This pass code is reserved by an existing product. Choose a unique code.')
+        if amount<1 or amount>1000000 or days<0 or days>36500: raise ValueError('Pass price must be at least ₹1; check price and duration.')
+        if scope not in ('all_access','individual','bank','group'): raise ValueError('Invalid pass scope.')
+        if scope in ('all_access','individual'): keys=['*']
+        if scope=='bank' and not keys: keys=[code]
+    except Exception as e: return json_response({'error':str(e) or 'Invalid pass details.'},400)
+    async with request.app['pool'].connection() as conn:
+        await payment_schema(conn)
+        await conn.execute("""INSERT INTO bpsc_pass_offers(product_code,pass_name,description,amount_inr,duration_days,scope,vault_keys,category,is_active,is_featured,sort_order,created_by,updated_at)
+          VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()) ON CONFLICT(product_code) DO UPDATE SET pass_name=EXCLUDED.pass_name,description=EXCLUDED.description,amount_inr=EXCLUDED.amount_inr,duration_days=EXCLUDED.duration_days,scope=EXCLUDED.scope,vault_keys=EXCLUDED.vault_keys,category=EXCLUDED.category,is_active=EXCLUDED.is_active,is_featured=EXCLUDED.is_featured,sort_order=EXCLUDED.sort_order,updated_at=NOW()""",(code,name,description,amount,days,scope,keys,category,active,featured,order,user['id']))
+        await _write_admin_audit(conn,user['id'],'pass_offer_save',code,{'amount_inr':amount,'duration_days':days,'scope':scope,'is_active':active})
+    return json_response({'saved':True,'product_code':code,'pass_name':name})
+
+async def admin_pass_offer_toggle(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    code=str(request.match_info.get('product_code') or '')
+    try: body=await request.json(); active=bool(body.get('is_active'))
+    except Exception:return json_response({'error':'Invalid status.'},400)
+    async with request.app['pool'].connection() as conn:
+        await payment_schema(conn)
+        cur=await conn.execute("UPDATE bpsc_pass_offers SET is_active=%s,updated_at=NOW() WHERE product_code=%s RETURNING product_code",(active,code)); row=await cur.fetchone()
+        if not row:return json_response({'error':'Pass not found.'},404)
+        await _write_admin_audit(conn,user['id'],'pass_offer_toggle',code,{'is_active':active})
+    return json_response({'updated':True,'product_code':code,'is_active':active})
+
+async def admin_coupon_save(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try:
+        body=await request.json(); code=re.sub(r'[^A-Z0-9_-]','',str(body.get('code') or '').strip().upper())[:40]
+        desc=str(body.get('description') or '').strip()[:300]; dtype=str(body.get('discount_type') or 'percent'); value=int(body.get('discount_value')); maxdisc=body.get('max_discount_inr'); maxdisc=int(maxdisc) if maxdisc not in (None,'') else None
+        minimum=max(0,int(body.get('min_order_inr',0))); maxuses=body.get('max_redemptions'); maxuses=int(maxuses) if maxuses not in (None,'') else None
+        peruser=max(1,min(100,int(body.get('per_user_limit',1)))); active=bool(body.get('is_active',True)); applies=body.get('applicable_product_codes') or None
+        starts_raw=str(body.get('starts_at') or '').strip(); expires_raw=str(body.get('expires_at') or '').strip()
+        starts_at=datetime.fromisoformat(starts_raw).replace(tzinfo=timezone.utc) if starts_raw and datetime.fromisoformat(starts_raw).tzinfo is None else (datetime.fromisoformat(starts_raw) if starts_raw else None)
+        expires_at=datetime.fromisoformat(expires_raw).replace(tzinfo=timezone.utc) if expires_raw and datetime.fromisoformat(expires_raw).tzinfo is None else (datetime.fromisoformat(expires_raw) if expires_raw else None)
+        if starts_at and expires_at and expires_at<=starts_at: raise ValueError('Coupon expiry must be after its start time.')
+        if not re.fullmatch(r'[A-Z0-9][A-Z0-9_-]{2,39}',code): raise ValueError('Coupon code must be 3–40 characters (letters, numbers, _ or -).')
+        if dtype not in ('percent','fixed') or value<1 or (dtype=='percent' and value>100): raise ValueError('Use a valid fixed discount or percentage from 1–100.')
+        if maxdisc is not None and maxdisc<1: raise ValueError('Maximum discount must be positive.')
+        if maxuses is not None and maxuses<1: raise ValueError('Maximum redemptions must be positive.')
+        if applies: applies=[str(x)[:50] for x in applies][:100]
+    except Exception as e:return json_response({'error':str(e) or 'Invalid coupon details.'},400)
+    async with request.app['pool'].connection() as conn:
+        await payment_schema(conn)
+        await conn.execute("""INSERT INTO bpsc_coupon_codes(code,description,discount_type,discount_value,max_discount_inr,min_order_inr,starts_at,expires_at,max_redemptions,per_user_limit,applicable_product_codes,is_active,created_by,updated_at)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()) ON CONFLICT(code) DO UPDATE SET description=EXCLUDED.description,discount_type=EXCLUDED.discount_type,discount_value=EXCLUDED.discount_value,max_discount_inr=EXCLUDED.max_discount_inr,min_order_inr=EXCLUDED.min_order_inr,starts_at=EXCLUDED.starts_at,expires_at=EXCLUDED.expires_at,max_redemptions=EXCLUDED.max_redemptions,per_user_limit=EXCLUDED.per_user_limit,applicable_product_codes=EXCLUDED.applicable_product_codes,is_active=EXCLUDED.is_active,updated_at=NOW()""",(code,desc,dtype,value,maxdisc,minimum,starts_at,expires_at,maxuses,peruser,applies,active,user['id']))
+        await _write_admin_audit(conn,user['id'],'coupon_save',code,{'discount_type':dtype,'discount_value':value,'is_active':active})
+    return json_response({'saved':True,'code':code})
+
+async def admin_coupon_toggle(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    code=str(request.match_info.get('code') or '').upper()
+    try: body=await request.json(); active=bool(body.get('is_active'))
+    except Exception:return json_response({'error':'Invalid status.'},400)
+    async with request.app['pool'].connection() as conn:
+        await payment_schema(conn)
+        cur=await conn.execute("UPDATE bpsc_coupon_codes SET is_active=%s,updated_at=NOW() WHERE code=%s RETURNING code",(active,code)); row=await cur.fetchone()
+        if not row:return json_response({'error':'Coupon not found.'},404)
+        await _write_admin_audit(conn,user['id'],'coupon_toggle',code,{'is_active':active})
+    return json_response({'updated':True,'code':code,'is_active':active})
 
 async def admin_members_search(request):
     user=request['telegram_user']
@@ -2053,7 +2259,7 @@ async def list_series(request):
     user=request['telegram_user']
     async with request.app['pool'].connection() as conn:
         await ensure_test_series_schema(conn)
-        cur=await conn.execute("""SELECT s.id,s.title,s.description,s.exam_type,s.series_type,s.subject,s.difficulty,s.access_type,s.sort_order,
+        cur=await conn.execute("""SELECT s.id,s.title,s.description,s.logo_url,s.exam_type,s.series_type,s.subject,s.difficulty,s.access_type,s.sort_order,
             COUNT(DISTINCT st.quiz_id) AS test_count
             FROM bpsc_nexus_test_series s LEFT JOIN bpsc_nexus_test_series_tests st ON st.series_id=s.id
             WHERE s.is_published=TRUE GROUP BY s.id ORDER BY s.sort_order ASC,s.id DESC LIMIT 100""")
@@ -2067,7 +2273,7 @@ async def series_detail(request):
     except ValueError: return json_response({'error':'Invalid series ID.'},400)
     async with request.app['pool'].connection() as conn:
         await ensure_test_series_schema(conn)
-        cur=await conn.execute("SELECT id,title,description,exam_type,series_type,subject,difficulty,access_type FROM bpsc_nexus_test_series WHERE id=%s AND is_published=TRUE",(sid,))
+        cur=await conn.execute("SELECT id,title,description,logo_url,exam_type,series_type,subject,difficulty,access_type FROM bpsc_nexus_test_series WHERE id=%s AND is_published=TRUE",(sid,))
         series=await cur.fetchone()
         if not series: return json_response({'error':'Test series not found.'},404)
         cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.duration_minutes,
@@ -2182,11 +2388,122 @@ async def admin_series_list(request):
         return json_response({'error': 'Admin access required.'}, 403)
     async with request.app['pool'].connection() as conn:
         await ensure_test_series_schema(conn)
-        cur = await conn.execute("""SELECT s.id,s.title,s.description,s.exam_type,s.series_type,s.subject,s.difficulty,s.access_type,s.is_published,s.sort_order,
-            COUNT(DISTINCT st.quiz_id) AS test_count FROM bpsc_nexus_test_series s
+        cur = await conn.execute("""SELECT s.id,s.title,s.description,s.exam_type,s.series_type,s.subject,s.difficulty,s.access_type,s.is_published,s.sort_order,s.logo_url,
+            COUNT(DISTINCT st.quiz_id) AS test_count,
+            COALESCE(ARRAY_AGG(DISTINCT st.quiz_id) FILTER (WHERE st.quiz_id IS NOT NULL), ARRAY[]::BIGINT[]) AS quiz_ids
+            FROM bpsc_nexus_test_series s
             LEFT JOIN bpsc_nexus_test_series_tests st ON st.series_id=s.id GROUP BY s.id ORDER BY s.sort_order,s.id DESC LIMIT 300""")
         rows = [dict(r) for r in await cur.fetchall()]
     return json_response({'series': rows})
+
+
+async def admin_series_publish(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try:
+        sid=int(request.match_info['series_id']); body=await request.json(); published=bool(body.get('is_published',False))
+    except Exception: return json_response({'error':'Invalid publish status.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_test_series_schema(conn)
+        cur=await conn.execute("UPDATE bpsc_nexus_test_series SET is_published=%s,updated_at=NOW() WHERE id=%s RETURNING id,title,is_published",(published,sid))
+        row=await cur.fetchone()
+        if not row:return json_response({'error':'Series not found.'},404)
+        await _write_admin_audit(conn,user['id'],'series_publish',str(sid),{'is_published':published})
+    return json_response({'series':dict(row),'updated':True})
+
+
+async def admin_series_quiz_catalog(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.is_published,q.access_type,
+            COUNT(qq.question_id) AS total_questions FROM bank_quizzes q
+            LEFT JOIN bank_quiz_questions qq ON qq.quiz_id=q.id
+            GROUP BY q.id ORDER BY q.id DESC LIMIT 500""")
+        rows=[dict(r) for r in await cur.fetchall()]
+    return json_response({'quizzes':rows})
+
+
+async def admin_series_create(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try:
+        body=await request.json()
+        title=str(body.get('title') or '').strip()[:180]
+        description=str(body.get('description') or '').strip()[:4000]
+        logo_url=str(body.get('logo_url') or '').strip()[:1000]
+        exam_type=str(body.get('exam_type') or 'BPSC').upper()
+        series_type=str(body.get('series_type') or 'subject_wise').lower()
+        subject=str(body.get('subject') or 'General Studies').strip()[:100]
+        difficulty=str(body.get('difficulty') or 'Mixed').strip()[:24]
+        access_type=str(body.get('access_type') or 'free').lower()
+        is_published=bool(body.get('is_published',False))
+        sort_order=max(-100000,min(100000,int(body.get('sort_order',0))))
+        quiz_ids=list(dict.fromkeys(int(x) for x in (body.get('quiz_ids') or []) if int(x)>0))[:300]
+        if not title: raise ValueError('Series title is required.')
+        if exam_type not in ('UPSC','BPSC'): raise ValueError('Exam type must be UPSC or BPSC.')
+        if series_type not in ('full_length','sectional','subject_wise'): raise ValueError('Invalid series type.')
+        if access_type not in ('free','paid'): raise ValueError('Access must be free or paid.')
+        if logo_url and not (logo_url.startswith('https://') or logo_url.startswith('http://') or logo_url.startswith('data:image/')): raise ValueError('Logo must be an image URL or data image.')
+    except ValueError as e: return json_response({'error':str(e)},400)
+    except Exception: return json_response({'error':'Invalid series details.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_test_series_schema(conn)
+        if quiz_ids:
+            cur=await conn.execute('SELECT id FROM bank_quizzes WHERE id = ANY(%s)',(quiz_ids,))
+            found={int(r['id']) for r in await cur.fetchall()}
+            missing=[qid for qid in quiz_ids if qid not in found]
+            if missing:return json_response({'error':'Quiz not found: '+', '.join('#'+str(x) for x in missing)},400)
+        async with conn.transaction():
+            cur=await conn.execute("""INSERT INTO bpsc_nexus_test_series
+                (title,description,exam_type,series_type,subject,difficulty,access_type,is_published,sort_order,created_by_telegram_id,logo_url)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (title,description,exam_type,series_type,subject,difficulty,access_type,is_published,sort_order,int(user['id']),logo_url))
+            sid=int((await cur.fetchone())['id'])
+            for pos,qid in enumerate(quiz_ids,1):
+                await conn.execute("INSERT INTO bpsc_nexus_test_series_tests(series_id,quiz_id,position) VALUES(%s,%s,%s) ON CONFLICT(series_id,quiz_id) DO UPDATE SET position=EXCLUDED.position",(sid,qid,pos))
+            await _write_admin_audit(conn,user['id'],'series_create',str(sid),{'title':title,'quiz_ids':quiz_ids,'is_published':is_published,'access_type':access_type})
+    return json_response({'created':True,'series_id':sid,'title':title,'test_count':len(quiz_ids)})
+
+
+async def admin_series_update(request):
+    user=request['telegram_user']
+    if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
+    try:
+        sid=int(request.match_info['series_id']); body=await request.json()
+        title=str(body.get('title') or '').strip()[:180]
+        description=str(body.get('description') or '').strip()[:4000]
+        logo_url=str(body.get('logo_url') or '').strip()[:1000]
+        exam_type=str(body.get('exam_type') or 'BPSC').upper()
+        series_type=str(body.get('series_type') or 'subject_wise').lower()
+        subject=str(body.get('subject') or 'General Studies').strip()[:100]
+        difficulty=str(body.get('difficulty') or 'Mixed').strip()[:24]
+        access_type=str(body.get('access_type') or 'free').lower()
+        is_published=bool(body.get('is_published',False))
+        sort_order=max(-100000,min(100000,int(body.get('sort_order',0))))
+        quiz_ids=list(dict.fromkeys(int(x) for x in (body.get('quiz_ids') or []) if int(x)>0))[:300]
+        if not title: raise ValueError('Series title is required.')
+        if exam_type not in ('UPSC','BPSC') or series_type not in ('full_length','sectional','subject_wise') or access_type not in ('free','paid'): raise ValueError('Invalid exam, series or access type.')
+        if logo_url and not (logo_url.startswith('https://') or logo_url.startswith('http://') or logo_url.startswith('data:image/')): raise ValueError('Logo must be an image URL or data image.')
+    except ValueError as e: return json_response({'error':str(e)},400)
+    except Exception: return json_response({'error':'Invalid series update.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_test_series_schema(conn)
+        if quiz_ids:
+            cur=await conn.execute('SELECT id FROM bank_quizzes WHERE id = ANY(%s)',(quiz_ids,))
+            found={int(r['id']) for r in await cur.fetchall()}
+            missing=[qid for qid in quiz_ids if qid not in found]
+            if missing:return json_response({'error':'Quiz not found: '+', '.join('#'+str(x) for x in missing)},400)
+        async with conn.transaction():
+            cur=await conn.execute("""UPDATE bpsc_nexus_test_series SET title=%s,description=%s,logo_url=%s,exam_type=%s,series_type=%s,subject=%s,difficulty=%s,access_type=%s,is_published=%s,sort_order=%s,updated_at=NOW() WHERE id=%s RETURNING id""",
+                (title,description,logo_url,exam_type,series_type,subject,difficulty,access_type,is_published,sort_order,sid))
+            if not await cur.fetchone(): return json_response({'error':'Series not found.'},404)
+            await conn.execute('DELETE FROM bpsc_nexus_test_series_tests WHERE series_id=%s',(sid,))
+            for pos,qid in enumerate(quiz_ids,1):
+                await conn.execute('INSERT INTO bpsc_nexus_test_series_tests(series_id,quiz_id,position) VALUES(%s,%s,%s)',(sid,qid,pos))
+            await _write_admin_audit(conn,user['id'],'series_update',str(sid),{'title':title,'quiz_ids':quiz_ids,'is_published':is_published,'access_type':access_type})
+    return json_response({'updated':True,'series_id':sid,'title':title,'test_count':len(quiz_ids)})
 
 
 async def debug_env(request):
@@ -2680,29 +2997,6 @@ async def quiz_builder_create(request):
     return json_response({'quiz_id': qid, 'count': len(ids), 'mode': mode})
 
 
-async def arena_cancel(request):
-    uid=request["telegram_user"]["id"]
-    try:
-        mid=int(request.match_info["match_id"])
-    except (ValueError, TypeError):
-        return json_response({"error":"Invalid match."},400)
-    async with request.app["pool"].connection() as conn:
-        async with conn.transaction():
-            cur=await conn.execute("""SELECT m.status,m.created_by_telegram_id
-                FROM bpsc_nexus_arena_matches m
-                JOIN bpsc_nexus_arena_players p ON p.match_id=m.id AND p.telegram_id=%s
-                WHERE m.id=%s FOR UPDATE OF m""",(uid,mid))
-            m=await cur.fetchone()
-            if not m:
-                return json_response({"error":"Match not found."},404)
-            if m["status"]!="waiting":
-                return json_response({"error":"Can only cancel a waiting room."},409)
-            if int(m["created_by_telegram_id"])!=int(uid):
-                return json_response({"error":"Only the room creator can cancel."},403)
-            await conn.execute("UPDATE bpsc_nexus_arena_matches SET status='expired' WHERE id=%s",(mid,))
-    return json_response({"cancelled":True,"match_id":mid})
-
-
 async def arena_matches_compat(request):
     if request.method == 'POST':
         return await arena_create(request)
@@ -2846,6 +3140,10 @@ def build_app() -> web.Application:
         web.post('/api/admin/bank-access', admin_set_bank_access),
         web.get('/api/admin/quizzes', admin_quizzes),
         web.get('/api/admin/series', admin_series_list),
+        web.get('/api/admin/series/quizzes', admin_series_quiz_catalog),
+        web.post('/api/admin/series/{series_id}/publish', admin_series_publish),
+        web.post('/api/admin/series/create', admin_series_create),
+        web.post('/api/admin/series/{series_id}/update', admin_series_update),
         web.get('/api/admin/cleanup', admin_cleanup_catalog),
         web.post('/api/admin/test-series/{series_id}/access', admin_set_series_access),
         web.post('/api/admin/quizzes/{quiz_id}/access', admin_set_quiz_access),
@@ -2860,6 +3158,11 @@ def build_app() -> web.Application:
         web.post('/api/admin/demo/grant', admin_demo_grant),
         web.get('/api/admin/demo/registrations', admin_demo_registrations),
 
+        web.get('/api/admin/passes', admin_pass_offers),
+        web.post('/api/admin/passes', admin_pass_offer_save),
+        web.post('/api/admin/passes/{product_code}/toggle', admin_pass_offer_toggle),
+        web.post('/api/admin/coupons', admin_coupon_save),
+        web.post('/api/admin/coupons/{code}/toggle', admin_coupon_toggle),
         web.get('/api/admin/payments', admin_payments),
         web.get('/api/admin/payments/{request_id}', admin_payment_detail),
         web.post('/api/admin/payments/{request_id}/review', admin_review_payment),
@@ -2949,41 +3252,17 @@ def build_app() -> web.Application:
         web.post('/api/arena/matches', arena_matches_compat),
         web.get('/api/arena/matches/{match_id}', arena_match_compat),
         web.post('/api/arena/matches/{match_id}/answers', arena_answer_compat),
-        web.post('/api/arena/matches/{match_id}/cancel', arena_cancel),
         web.get('/api/arena/{match_id}', arena_match),
         web.post('/api/arena/{match_id}/answer', arena_answer),
 
         web.get('/api/payments/options', payment_options),
+        web.post('/api/payments/coupon/validate', payment_coupon_validate),
         web.post('/api/payments/submit', submit_payment),
     ])
     static_dir=ROOT/'static'
     if static_dir.is_dir():
         app.router.add_static('/static/', static_dir, name='static')
     return app
-
-
-async def ensure_arena_schema(conn):
-    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_arena_matches (
-        id BIGSERIAL PRIMARY KEY, invite_code VARCHAR(12) UNIQUE NOT NULL,
-        match_type VARCHAR(20) NOT NULL DEFAULT 'invite', status VARCHAR(16) NOT NULL DEFAULT 'waiting',
-        question_count INTEGER NOT NULL DEFAULT 10, created_by_telegram_id BIGINT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ)""")
-    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_arena_players (
-        match_id BIGINT NOT NULL REFERENCES bpsc_nexus_arena_matches(id) ON DELETE CASCADE,
-        telegram_id BIGINT NOT NULL, score INTEGER NOT NULL DEFAULT 0, joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        finished_at TIMESTAMPTZ, rating_delta INTEGER, PRIMARY KEY(match_id,telegram_id))""")
-    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_arena_questions (
-        match_id BIGINT NOT NULL REFERENCES bpsc_nexus_arena_matches(id) ON DELETE CASCADE,
-        position INTEGER NOT NULL, question_id BIGINT NOT NULL, PRIMARY KEY(match_id,position))""")
-    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_arena_answers (
-        match_id BIGINT NOT NULL REFERENCES bpsc_nexus_arena_matches(id) ON DELETE CASCADE,
-        telegram_id BIGINT NOT NULL, position INTEGER NOT NULL, selected_option VARCHAR(2) NOT NULL,
-        is_correct BOOLEAN NOT NULL DEFAULT FALSE, answered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY(match_id,telegram_id,position))""")
-    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_arena_ratings (
-        telegram_id BIGINT PRIMARY KEY, rating INTEGER NOT NULL DEFAULT 1000, wins INTEGER NOT NULL DEFAULT 0,
-        losses INTEGER NOT NULL DEFAULT 0, draws INTEGER NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
-    await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_nexus_arena_matches_status_idx ON bpsc_nexus_arena_matches(status,match_type,created_at)")
 
 
 async def on_startup(app):
@@ -2998,7 +3277,6 @@ async def on_startup(app):
             await ensure_access_schema(conn)
             await ensure_test_series_schema(conn)
             await ensure_notifications_schema(conn)
-            await ensure_arena_schema(conn)
             await payment_schema(conn)
         except Exception:
             log.exception('Schema bootstrap reported errors; continuing startup.')
