@@ -792,25 +792,26 @@ body.theme-alchemy-x .notif-bell{background:#150c2b!important;border:1px solid #
 @media(prefers-reduced-motion:reduce){body.theme-alchemy-x::before,body.theme-alchemy-x .section-head h2::before,body.theme-alchemy-x .panel::after{animation:none!important}}
 
 /* ==================== DEPLOYMENT UI PATCH ==================== */
-/* Keep every navigation item on one row; allow horizontal scrolling on narrow screens. */
+/* Five evenly-spaced tabs fill the navigation width without looking cramped. */
 .bottom-nav{
-  display:flex!important; flex-wrap:nowrap!important; justify-content:flex-start!important;
-  overflow-x:auto!important; overflow-y:hidden!important; scrollbar-width:none!important;
-  -webkit-overflow-scrolling:touch; white-space:nowrap!important;
-  width:calc(100% - 12px)!important; max-width:760px!important;
-  gap:3px!important; padding:5px!important;
+  display:grid!important; grid-template-columns:repeat(5,minmax(0,1fr))!important;
+  align-items:stretch!important; justify-content:stretch!important;
+  overflow:visible!important; white-space:normal!important;
+  width:calc(100% - 20px)!important; max-width:760px!important;
+  gap:7px!important; padding:7px!important;
 }
 .bottom-nav::-webkit-scrollbar{display:none!important}
 .bottom-nav .tab-btn{
-  flex:1 0 57px!important; min-width:57px!important; max-width:100px!important;
-  white-space:nowrap!important; overflow:visible!important;
-  font-size:9px!important; padding:5px 3px!important; gap:3px!important;
+  flex:none!important; width:100%!important; min-width:0!important; max-width:none!important;
+  white-space:nowrap!important; overflow:hidden!important;
+  font-size:10px!important; padding:7px 2px!important; gap:4px!important;
+  min-height:54px!important; border-radius:12px!important;
 }
-.bottom-nav .tab-btn .tab-icon{font-size:17px!important; line-height:1.1!important}
+.bottom-nav .tab-btn .tab-icon{font-size:18px!important; line-height:1.1!important}
 @media(max-width:420px){
-  .bottom-nav{gap:2px!important;padding:4px!important}
-  .bottom-nav .tab-btn{flex:1 0 55px!important;min-width:55px!important;font-size:8px!important;padding:4px 2px!important}
-  .bottom-nav .tab-btn .tab-icon{font-size:16px!important}
+  .bottom-nav{width:calc(100% - 16px)!important;gap:5px!important;padding:6px!important}
+  .bottom-nav .tab-btn{font-size:9px!important;padding:6px 1px!important;min-height:51px!important}
+  .bottom-nav .tab-btn .tab-icon{font-size:17px!important}
 }
 /* Notifications open as a top-right overlay below the fixed header, not as a bottom sheet. */
 #notif-backdrop{
@@ -1033,12 +1034,84 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
 .demo-expired-gate{padding:22px 18px;border-radius:18px;margin:14px 0;background:radial-gradient(circle at 85% 10%,#d5a83c30,transparent 45%),linear-gradient(135deg,var(--paper),var(--bg));border:1.5px solid color-mix(in srgb,var(--brand-gold) 55%,var(--line));text-align:center}
 .demo-expired-gate .deg-mark{font-size:48px;line-height:1;margin-bottom:8px}.demo-expired-gate h3{margin:0 0 6px;font:850 20px Manrope,Inter,sans-serif;letter-spacing:-.03em;color:var(--ink)}.demo-expired-gate p{margin:0 0 14px;font-size:12.5px;color:var(--muted);line-height:1.55}.demo-expired-gate .deg-actions{display:flex;gap:9px;justify-content:center;flex-wrap:wrap}.demo-expired-gate .deg-actions button{min-width:130px}
 
+
+/* Dynamic Series question-bank catalog */
+.qb-series-header{padding:18px 17px;margin:4px 0 13px;border:1.5px solid var(--line);border-radius:18px;background:linear-gradient(135deg,var(--paper),var(--bg));box-shadow:var(--shadow)}
+.qb-series-brand{display:flex;align-items:center;gap:12px}.qb-brand-mark{display:grid;place-items:center;width:46px;height:46px;flex:none;border:2px solid var(--ink);border-radius:13px;background:#f8cf42;color:#151515;font:1000 24px/1 Manrope,Inter,sans-serif;box-shadow:3px 3px 0 var(--ink)}
+.qb-series-eyebrow,.qb-kicker{font-size:10px;letter-spacing:.14em;font-weight:900;color:var(--muted)}.qb-series-header h2{font:900 22px/1.1 Manrope,Inter,sans-serif;margin:4px 0 0;color:var(--ink)}.qb-series-header p{font-size:12px;line-height:1.5;color:var(--muted);margin:13px 0 0;max-width:460px}
+.qb-common-card{display:grid;grid-template-columns:56px minmax(0,1fr);gap:12px;align-items:start;padding:16px;margin:10px 0 20px;border:2px solid var(--ink);border-radius:17px;background:var(--paper);box-shadow:4px 4px 0 var(--ink)}
+.qb-logo{display:grid;place-items:center;width:52px;height:52px;border:1.5px solid var(--ink);border-radius:14px;font-size:23px;font-weight:1000;color:var(--ink);background:#f8cf42;box-shadow:2px 2px 0 var(--ink)}.qb-logo-main{font-family:Manrope,Inter,sans-serif}.qb-logo-main span{font-size:13px;vertical-align:top}
+.qb-common-copy h3,.qb-subject-head h3{font:900 16px/1.2 Manrope,Inter,sans-serif;margin:4px 0 5px;color:var(--ink)}.qb-common-copy p{font-size:12px;line-height:1.45;color:var(--muted);margin:0}.qb-count{margin-top:8px;font-size:11px;font-weight:850;color:var(--ink)}
+.qb-bank-actions{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr;gap:9px}.qb-bank-actions button{min-height:42px}
+.qb-subject-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:4px 0 10px}.qb-subject-head h3{margin:3px 0 0}.qb-live-pill{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line);border-radius:99px;padding:6px 8px;font-size:9px;font-weight:900;color:var(--muted);white-space:nowrap}.qb-live-pill i{width:6px;height:6px;border-radius:50%;background:#22a06b;display:inline-block}
+.qb-subject-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:22px}.qb-subject-card{min-width:0;padding:12px;border:1.5px solid var(--line);border-radius:15px;background:var(--paper);box-shadow:var(--shadow);display:flex;flex-direction:column;gap:9px}.qb-subject-card-top{display:flex;align-items:center;gap:9px}.qb-subject-logo{width:38px;height:38px;display:grid;place-items:center;flex:none;border:1.5px solid var(--ink);border-radius:11px;background:var(--subject-tint,#d9e7ff);font-size:19px;box-shadow:2px 2px 0 var(--ink)}.qb-subject-card h4{font:850 12px/1.25 Manrope,Inter,sans-serif;margin:0;color:var(--ink);overflow-wrap:anywhere}.qb-subject-card p{font-size:10px;color:var(--muted);line-height:1.35;margin:0}.qb-subject-count{font-size:10px;font-weight:850;color:var(--ink);margin-top:auto}.qb-subject-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px}.qb-subject-actions button{min-width:0;padding:9px 5px;font-size:10px}
+@media(max-width:360px){.qb-subject-grid{grid-template-columns:1fr}.qb-common-card{grid-template-columns:46px minmax(0,1fr);padding:12px}.qb-logo{width:42px;height:42px}.qb-subject-actions button{font-size:11px}}
+
+/* Admin Series Manager */
+.sm-quiz-picker{display:grid;gap:7px;max-height:300px;overflow:auto;padding:8px;border:1px solid var(--line);border-radius:12px;background:var(--bg)}.sm-quiz-option{display:flex;align-items:flex-start;gap:8px;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--paper);font-size:11px;line-height:1.35}.sm-quiz-option input{width:17px;height:17px;flex:none;margin:1px 0 0;accent-color:var(--blue)}.sm-quiz-option strong{display:block;font-size:11px}.sm-quiz-option small{display:block;color:var(--muted);margin-top:3px}.sm-series-row{display:grid;grid-template-columns:44px minmax(0,1fr);gap:10px;padding:12px 0;border-bottom:1px solid var(--line)}.sm-series-logo{width:42px;height:42px;object-fit:cover;border:1.5px solid var(--line);border-radius:11px;background:var(--bg)}.sm-series-info strong{font-size:12px}.sm-series-info small{display:block;color:var(--muted);font-size:10px;line-height:1.5;margin-top:3px}.sm-series-actions{grid-column:1/-1;display:flex;gap:7px;flex-wrap:wrap;margin-top:4px}.sm-series-actions button{padding:8px 10px;font-size:10px}.sm-series-status{font-size:10px;font-weight:800;color:var(--muted)}
+@media(max-width:420px){#admin-series-manager-form{grid-template-columns:1fr!important}.sm-series-row{grid-template-columns:38px minmax(0,1fr)}.sm-series-logo{width:36px;height:36px}}
 </style>
 <style id="buy-pass-styles">
 #buy-pass-panel{color-scheme:dark;--bg:#10131d;--panel:#191e2c;--line:#30384a;--gold:#e7bd70;--text:#f4f5f8;--muted:#aab2c3;--good:#7ed9aa;--bad:#ff9b9b;--blue:#8fc8ff}#buy-pass-panel *{box-sizing:border-box}#buy-pass-panel{margin:0;background:radial-gradient(ellipse at top,#20263a 0,#10131d 50%);font:15px system-ui,-apple-system,BlinkMacSystemFont,sans-serif;color:var(--text);padding:18px 13px 42px}#buy-pass-panel .wrap{max-width:660px;margin:auto}#buy-pass-panel .brand{font-size:12px;letter-spacing:.18em;color:var(--gold);font-weight:900}#buy-pass-panel .hero h1{font-size:clamp(27px,7vw,36px);line-height:1.08;margin:8px 0}#buy-pass-panel .muted{color:var(--muted);line-height:1.55}#buy-pass-panel .panel{background:rgba(25,30,44,.96);border:1px solid var(--line);border-radius:18px;padding:16px;margin:14px 0}#buy-pass-panel .tag{display:inline-block;color:var(--gold);font-size:11px;font-weight:900;letter-spacing:.09em}#buy-pass-panel .categories{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:12px}#buy-pass-panel .cat{border:1px solid var(--line);border-radius:12px;padding:11px 5px;background:#141927;color:var(--muted);font-size:12px;font-weight:850;line-height:1.25}#buy-pass-panel .cat.active{border-color:var(--gold);color:var(--gold);background:#252131}#buy-pass-panel .price-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:13px}#buy-pass-panel .price{position:relative;border:1px solid var(--line);border-radius:14px;padding:14px 12px;text-align:left;background:#141927;color:var(--text);cursor:pointer;min-width:0;min-height:144px}#buy-pass-panel .price.active{border-color:var(--gold);box-shadow:inset 0 0 0 1px var(--gold),0 8px 24px #0002}#buy-pass-panel .price .plan{display:block;color:var(--gold);font-size:12px;font-weight:900;letter-spacing:.07em}#buy-pass-panel .price b{display:block;font-size:29px;line-height:1.2;margin:8px 0 4px}#buy-pass-panel .price small{display:block;color:var(--muted);line-height:1.35}#buy-pass-panel .price .desc{display:block;color:#d6dbea;font-size:12px;line-height:1.45;margin-top:9px}#buy-pass-panel .price .selected-mark{position:absolute;top:10px;right:10px;color:var(--good);font-weight:900}#buy-pass-panel .primary,#buy-pass-panel .secondary{border:0;border-radius:11px;padding:13px 15px;font-weight:850;cursor:pointer}#buy-pass-panel .primary{background:var(--gold);color:#211a10;width:100%;margin-top:12px}#buy-pass-panel .primary:disabled{opacity:.55;cursor:wait}#buy-pass-panel .secondary{background:#252d40;color:var(--text);width:100%;margin-top:8px}#buy-pass-panel .label{display:block;font-size:13px;color:var(--muted);margin:13px 0 6px}#buy-pass-panel input{width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);background:#101521;color:var(--text);font:inherit}#buy-pass-panel .qr{display:block;width:min(100%,310px);margin:12px auto;border-radius:12px;border:1px solid var(--line);background:#fff}#buy-pass-panel .notice{font-size:12px;color:var(--muted);line-height:1.5}#buy-pass-panel .status{padding:11px;border-radius:10px;background:#111622;margin-top:10px;white-space:pre-wrap;line-height:1.5}#buy-pass-panel .hidden{display:none!important}#buy-pass-panel .history-item{border-top:1px solid var(--line);padding:11px 0;font-size:13px;overflow-wrap:anywhere}#buy-pass-panel .status-pending{color:#f4d28b}#buy-pass-panel .status-approved{color:var(--good)}#buy-pass-panel .status-rejected{color:var(--bad)}#buy-pass-panel .empty{padding:14px 0;color:var(--muted);font-size:13px}#buy-pass-panel .steps{display:grid;gap:10px;margin-top:10px}#buy-pass-panel .step{display:flex;gap:10px;align-items:flex-start}#buy-pass-panel .num{display:grid;place-items:center;flex:0 0 27px;height:27px;border-radius:9px;background:#302b20;color:var(--gold);font-weight:900}#buy-pass-panel .soon{border:1px solid #a77b32;background:linear-gradient(120deg,#322617,#211d20);border-radius:15px;padding:15px;margin:14px 0}#buy-pass-panel .soon strong{display:block;color:#ffdf91;font-size:14px;line-height:1.45}#buy-pass-panel .feature-list{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}#buy-pass-panel .feature{background:#121724;border:1px solid #2a3244;border-radius:10px;padding:10px;font-size:12px;color:#d8deea}#buy-pass-panel .section-title{font-size:17px;margin:4px 0 0}#buy-pass-panel .pill{display:inline-block;border:1px solid #3a4357;border-radius:999px;padding:4px 8px;color:var(--blue);font-size:11px;font-weight:800}@media(max-width:390px){#buy-pass-panel .categories{grid-template-columns:1fr}#buy-pass-panel .price-grid{grid-template-columns:1fr}#buy-pass-panel .price{min-height:0}#buy-pass-panel .feature-list{grid-template-columns:1fr}#buy-pass-panel .panel{padding:13px}}
 
 #buy-pass-panel{padding:12px 12px 100px;max-width:760px;margin:0 auto}#buy-pass-panel .wrap{max-width:100%;padding:0}
 </style>
+
+<style id="home-feature-navigation-update">
+.home-feature-zone{margin:2px 0 18px;padding:13px;border:2px solid var(--ink);border-radius:18px;background:var(--paper);box-shadow:5px 5px 0 var(--ink)}
+.home-feature-heading{display:flex;flex-direction:column;gap:4px;margin:0 0 12px}
+.home-feature-heading>span{font-size:10px;letter-spacing:.16em;font-weight:950;color:var(--brand-gold)}
+.home-feature-heading>b{font-size:18px;line-height:1.2;font-weight:950;color:var(--ink)}
+.home-feature-heading i{font-style:normal;float:right}
+#home-shortcuts.home-shortcuts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px;margin:0}
+.home-feature-card{display:flex;flex-direction:column;align-items:stretch;text-align:left;min-width:0;min-height:164px;padding:13px 12px 11px;border:2px solid var(--ink);border-radius:13px;background:var(--panel);color:var(--ink);box-shadow:3px 3px 0 var(--ink);cursor:pointer;transition:transform .15s ease,box-shadow .15s ease}
+.home-feature-card:active{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}
+.home-feature-card .feature-topline{display:flex;align-items:center;justify-content:space-between;gap:5px;margin-bottom:12px}
+.home-feature-card .shortcut-icon{font-size:23px;line-height:1}
+.home-feature-card .feature-chip{font-size:8px;line-height:1.2;letter-spacing:.06em;font-weight:950;padding:5px 6px;border:1.5px solid currentColor;border-radius:5px;white-space:normal;text-align:center}
+.home-feature-card>strong{font-size:16px;line-height:1.15;font-weight:950;margin-bottom:6px}
+.home-feature-card>small{font-size:11px;line-height:1.4;opacity:.86;flex:1}
+.home-feature-card .feature-cta{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:12px;padding-top:9px;border-top:1.5px solid currentColor;font-size:11px;font-weight:950}
+.home-feature-card .feature-cta b{font-size:16px}
+.home-feature-card.pass-feature{background:#ffe28a;color:#1d1d1d}
+.home-feature-card.arena-feature{background:#ffb5a7;color:#28120f}
+.home-feature-card.intel-feature{background:#b8e8ff;color:#102536}
+.home-feature-card.rank-feature{background:#d4f4b2;color:#18300c}
+.home-feature-card.admin-feature{background:#d9c7ff;color:#21113d}
+.home-feature-card.admin-feature .shortcut-icon{background:#f1eaff}
+.bottom-nav{grid-template-columns:repeat(5,minmax(0,1fr))!important}
+.bottom-nav .tab-btn{min-width:0!important;flex:1 1 0!important}
+@media(max-width:380px){.home-feature-zone{padding:10px}.home-feature-card{padding:10px;min-height:158px}.home-feature-card>strong{font-size:14px}.home-feature-card .feature-chip{font-size:7px;padding:4px}.home-feature-card>small{font-size:10px}}
+@media(min-width:700px){#home-shortcuts.home-shortcuts{grid-template-columns:repeat(4,minmax(0,1fr))}.home-feature-card{min-height:180px}}
+</style>
+<style id="premium-conversion-refinements">
+.hero-value-line{display:flex;align-items:center;gap:7px;margin:12px 0 10px;font-size:11px;font-weight:850;letter-spacing:.02em;color:var(--ink);opacity:.92}
+.hero-value-line span{display:inline-grid;place-items:center;width:18px;height:18px;border-radius:50%;background:color-mix(in srgb,var(--green) 22%,var(--paper));color:var(--green);font-size:12px}
+.hero-pass-cta{display:inline-flex;align-items:center;justify-content:space-between;gap:16px;min-height:43px;padding:10px 14px;border:2px solid var(--ink);border-radius:10px;background:var(--brand-gold);color:#171717;font:900 12px Manrope,Inter,sans-serif;box-shadow:3px 3px 0 var(--ink);cursor:pointer;transition:transform .15s ease,box-shadow .15s ease}
+.hero-pass-cta:active{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}
+.home-feature-zone{scroll-margin-top:12px}
+.home-feature-card{transition:transform .16s ease,box-shadow .16s ease,filter .16s ease}
+.home-feature-card:hover{transform:translateY(-2px);filter:saturate(1.05);box-shadow:5px 5px 0 var(--ink)}
+.home-feature-card:focus-visible,.hero-pass-cta:focus-visible,#buy-pass-panel button:focus-visible{outline:3px solid var(--brand-gold);outline-offset:3px}
+#buy-pass-panel .pass-trust-row{display:flex;flex-wrap:wrap;gap:7px;margin-top:14px}
+#buy-pass-panel .pass-trust-row span{display:inline-flex;align-items:center;gap:5px;border:1px solid #3a4357;border-radius:999px;padding:6px 9px;background:#151b29;color:#dce4f3;font-size:10px;font-weight:800}
+#buy-pass-panel .access-compare{border-color:#4a5367;background:linear-gradient(150deg,#1c2232,#151a27)}
+#buy-pass-panel .access-compare-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+#buy-pass-panel .access-compare-card{border:1px solid #3a4357;border-radius:13px;padding:13px;background:#121724;min-width:0}
+#buy-pass-panel .access-compare-card.premium{border-color:#a88748;background:linear-gradient(150deg,#29251f,#171a25);box-shadow:inset 0 0 0 1px #e7bd7020}
+#buy-pass-panel .access-label{display:inline-block;font-size:9px;font-weight:950;letter-spacing:.1em;color:#aab2c3}
+#buy-pass-panel .access-compare-card.premium .access-label{color:var(--gold)}
+#buy-pass-panel .access-compare-card h3{font-size:14px;line-height:1.3;margin:7px 0 9px}
+#buy-pass-panel .access-compare-card ul{padding-left:17px;margin:0;color:#c4ccdb;font-size:11px;line-height:1.55}
+#buy-pass-panel .access-compare-card li+li{margin-top:5px}
+#buy-pass-panel .access-rules-note{padding:10px 11px;border-radius:10px;background:#111622;border:1px solid #30384a}
+#buy-pass-panel .payment-status-steps{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:12px}
+#buy-pass-panel .payment-status-steps span{border:1px solid #30384a;background:#141927;border-radius:9px;padding:8px;font-size:10px;line-height:1.35;color:#aab2c3;font-weight:750}
+#buy-pass-panel .payment-status-steps .current{border-color:#a88748;color:#ffdf91;background:#29251f}
+@media(max-width:390px){#buy-pass-panel .access-compare-grid{grid-template-columns:1fr}#buy-pass-panel .pass-trust-row span{font-size:9px}}
+@media(prefers-reduced-motion:reduce){.home-feature-card,.hero-pass-cta{transition:none!important}}
+</style>
+
 </head>
 
 <body>
@@ -1069,7 +1142,7 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
       <span class="bell-icon">🔔</span>
       <span class="bell-badge hidden" id="notif-badge">0</span>
     </button>
-    <button class="pill admin-top-btn" id="admin-top-btn" type="button">✦</button>
+    <button class="pill admin-top-btn" id="admin-top-btn" type="button" aria-label="Admin settings">⚙️</button>
     <button class="pill" id="top-theme-btn" type="button">◐</button>
   </div>
 </header>
@@ -1084,8 +1157,46 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
       <div class="eyebrow">Your workspace · ULUK</div>
       <h1 id="greeting-title">Welcome back.</h1>
       <p>Your next focused session starts here.</p>
+      <div class="hero-value-line"><span>✓</span> Practice · Analyse · Improve</div>
+      <button class="hero-pass-cta" type="button" id="hero-pass-cta">Explore Premium Passes <span aria-hidden="true">↗</span></button>
     </div>
   </div>
+
+  <section class="home-feature-zone" aria-label="Featured Nexus features">
+    <div class="home-feature-heading"><span>YOUR NEXUS</span><b>Pick your next move <i>↘</i></b></div>
+    <div class="home-shortcuts" id="home-shortcuts">
+      <button class="home-feature-card pass-feature" type="button" id="get-pass-home" aria-label="Get your Nexus Pass">
+        <span class="feature-topline"><span class="shortcut-icon">🎟️</span><span class="feature-chip">UNLOCK ACCESS</span></span>
+        <strong>Get Your Pass</strong>
+        <small>Unlock tests, question banks and premium practice.</small>
+        <span class="feature-cta">Explore passes <b>↗</b></span>
+      </button>
+      <button class="home-feature-card arena-feature" type="button" id="arena-coming-home" aria-label="Enter Battle Arena">
+        <span class="feature-topline"><span class="shortcut-icon">⚔️</span><span class="feature-chip">CHALLENGE MODE</span></span>
+        <strong>Battle Arena</strong>
+        <small>Challenge another aspirant in a competitive 1v1.</small>
+        <span class="feature-cta">Enter arena <b>↗</b></span>
+      </button>
+      <button class="home-feature-card intel-feature" type="button" data-home-route="intel">
+        <span class="feature-topline"><span class="shortcut-icon">📡</span><span class="feature-chip">STAY UPDATED</span></span>
+        <strong>Nexus Intel</strong>
+        <small>Current affairs and important official updates.</small>
+        <span class="feature-cta">Open Intel <b>↗</b></span>
+      </button>
+      <button class="home-feature-card rank-feature" type="button" data-home-route="leaderboard">
+        <span class="feature-topline"><span class="shortcut-icon">🏆</span><span class="feature-chip">TRACK THE RACE</span></span>
+        <strong>Leaderboard</strong>
+        <small>See ranks, scores and how you compare.</small>
+        <span class="feature-cta">View ranks <b>↗</b></span>
+      </button>
+      <button class="home-feature-card admin-feature" type="button" id="admin-launch-card" aria-label="Open restricted admin console">
+        <span class="feature-topline"><span class="shortcut-icon">⚙️</span><span class="feature-chip">RESTRICTED</span></span>
+        <strong>Admin Console</strong>
+        <small>Authorized administrators only. Sign in required.</small>
+        <span class="feature-cta">Admin sign in <b>↗</b></span>
+      </button>
+    </div>
+  </section>
 
   <div class="panel" id="planner-panel" style="margin-bottom:14px">
     <div class="section-head" style="margin-top:0"><h2>☑ My Study Planner</h2><small id="planner-summary">Loading…</small></div>
@@ -1106,26 +1217,22 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
 
   <div id="demo-banner" class="demo-banner hidden"></div>
 
-  <button id="admin-launch-card" class="admin-launch" type="button">✦ Open Admin Console<small>Manage demo access, pricing, users and content.</small></button>
 
-  <div class="home-shortcuts" id="home-shortcuts" style="margin:0 0 14px">
-    <button class="arena-coming" type="button" id="arena-coming-home">
-      <span class="arena-mark">⚔</span>
-      <span><strong>Battle Arena</strong><small>Competitive 1v1 challenges</small></span>
-      <span class="coming-tag">ENTER</span>
-    </button>
-    <button class="shortcut soon" type="button" data-home-route="intel">
-      <span class="shortcut-icon">📰</span>
-      <span><strong>Nexus Intel</strong><small>Current affairs & briefings</small></span>
-    </button>
-    <button class="shortcut" type="button" data-home-route="leaderboard">
-      <span class="shortcut-icon">🏆</span>
-      <span><strong>Leaderboard</strong><small>Ranks & challenge scores</small></span>
-    </button>
-  </div>
 </section>
 
 <section id="series-panel" class="hidden-tab">
+  <div class="qb-series-header">
+    <div class="qb-series-brand"><span class="qb-brand-mark">N</span><div><div class="qb-series-eyebrow">BPSC NEXUS · QUESTION VAULT</div><h2>Question Banks</h2></div></div>
+    <p>Newly published questions automatically appear in the common bank and their matching subject bank.</p>
+  </div>
+  <div id="series-bank-status" class="series-note">Loading question banks…</div>
+  <div id="common-question-bank" class="qb-common-card">
+    <div class="qb-logo qb-logo-main">N<span>+</span></div>
+    <div class="qb-common-copy"><div class="qb-kicker">ALL SUBJECTS</div><h3>Common Question Bank</h3><p>Practice across every available subject in one place.</p><div class="qb-count" id="common-bank-count">Loading questions…</div></div>
+    <div class="qb-bank-actions"><button class="secondary" data-bank-start="common" data-mode="practice">Practice</button><button class="primary" data-bank-start="common" data-mode="exam">Exam</button></div>
+  </div>
+  <div class="qb-subject-head"><div><div class="qb-kicker">EXPLORE BY CATEGORY</div><h3>Subject-wise Banks</h3></div><span class="qb-live-pill"><i></i> LIVE CATALOG</span></div>
+  <div id="subject-question-banks" class="qb-subject-grid"><div class="panel empty">Loading subject banks…</div></div>
   <div class="series-hero">
     <div class="series-eyebrow">NEXUS TEST LIBRARY</div>
     <h1>One workspace.<br>Every exam target.</h1>
@@ -1316,6 +1423,7 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
         <button class="admin-nav-btn" data-admin-view="activity">📡 Activity</button>
         <button class="admin-nav-btn" data-admin-view="notifications">🔔 Notifications</button>
         <button class="admin-nav-btn" data-admin-view="payments">💳 Payments <span id="admin-pay-badge" class="admin-badge hidden"></span></button>
+        <button class="admin-nav-btn" data-admin-view="passes">🎟️ Passes & Coupons</button>
         <button class="admin-nav-btn" data-admin-view="revenue">💰 Revenue</button>
         <button class="admin-nav-btn" data-admin-view="members">👥 Members</button>
         <button class="admin-nav-btn" data-admin-view="banks">🗃️ Banks</button>
@@ -1415,6 +1523,46 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
       </div>
     </div>
 
+    <div class="admin-view" id="admin-view-passes">
+      <div class="admin-view-head"><h2>🎟️ Pass Studio & Coupon Engine</h2><p>Create the offers students see in Get Your Pass, manage pricing/validity/entitlements, and run controlled coupon campaigns.</p></div>
+      <div class="panel admin-panel-card">
+        <h3 class="admin-section-title" id="pass-form-title">✨ Create a Pass</h3>
+        <form id="admin-pass-form" class="admin-form" style="grid-template-columns:1fr 1fr;gap:10px">
+          <label>Unique pass code *<input id="po-code" required pattern="[a-z0-9][a-z0-9_-]{2,49}" maxlength="50" placeholder="nexus_pro_149"></label>
+          <label>Display name *<input id="po-name" required maxlength="160" placeholder="Nexus Pro Pass"></label>
+          <label style="grid-column:1/-1">Description / benefits<textarea id="po-description" rows="3" maxlength="2000" placeholder="Clearly list what this pass unlocks"></textarea></label>
+          <label>Price (₹) *<input id="po-price" type="number" min="1" max="1000000" required value="149"></label>
+          <label>Validity<select id="po-days"><option value="0">Lifetime</option><option value="7">7 days</option><option value="30">30 days</option><option value="60">60 days</option><option value="90">90 days</option><option value="180">180 days</option><option value="365">365 days</option><option value="custom">Custom days…</option></select><input id="po-days-custom" class="hidden" type="number" min="1" max="36500" placeholder="Number of days"></label>
+          <label>Pass type<select id="po-scope"><option value="all_access">All Access (all vaults)</option><option value="individual">Individual premium access</option><option value="bank">Specific question bank</option><option value="group">Telegram Group Pass</option></select></label>
+          <label>Category / badge<input id="po-category" maxlength="80" value="Premium" placeholder="Launch Offer"></label>
+          <label style="grid-column:1/-1">Entitlement keys (comma-separated)<input id="po-keys" placeholder="* for all access, or bpsc_pyq, science, history"><small>For specific question banks, use the matching vault/subject keys. All Access always grants *.</small></label>
+          <label>Display order<input id="po-order" type="number" value="0"></label>
+          <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><label><input id="po-active" type="checkbox" checked> Active in Get Your Pass</label><label><input id="po-featured" type="checkbox"> Featured offer</label></div>
+          <div style="grid-column:1/-1;display:flex;gap:8px;flex-wrap:wrap"><button class="primary" type="submit" id="po-save">Create Pass</button><button class="secondary" type="button" id="po-reset">Reset form</button></div>
+        </form><div id="po-status" class="admin-status"></div>
+      </div>
+      <div class="panel admin-panel-card"><div class="section-head" style="margin-top:0"><h3 class="admin-section-title">🪪 Pass Catalogue</h3><button class="secondary" type="button" id="po-refresh">↻ Refresh</button></div><div id="po-list"><div class="loader">Loading passes…</div></div></div>
+      <div class="panel admin-panel-card">
+        <h3 class="admin-section-title">🏷️ Create Coupon</h3>
+        <form id="admin-coupon-form" class="admin-form" style="grid-template-columns:1fr 1fr;gap:10px">
+          <label>Coupon code *<input id="cp-code" required maxlength="40" placeholder="NEXUS20" pattern="[A-Za-z0-9_-]{3,40}"></label>
+          <label>Short description<input id="cp-description" maxlength="300" placeholder="Launch discount"></label>
+          <label>Discount type<select id="cp-type"><option value="percent">Percentage (%)</option><option value="fixed">Fixed amount (₹)</option></select></label>
+          <label>Discount value *<input id="cp-value" type="number" min="1" max="100" required value="20"></label>
+          <label>Maximum discount (₹)<input id="cp-max-discount" type="number" min="1" placeholder="Optional cap"></label>
+          <label>Minimum order (₹)<input id="cp-min-order" type="number" min="0" value="0"></label>
+          <label>Starts at (optional)<input id="cp-starts" type="datetime-local"></label>
+          <label>Expires at (optional)<input id="cp-expires" type="datetime-local"></label>
+          <label>Maximum redemptions<input id="cp-max-uses" type="number" min="1" placeholder="Unlimited"></label>
+          <label>Per-user limit<input id="cp-user-limit" type="number" min="1" max="100" value="1" required></label>
+          <label style="grid-column:1/-1">Applicable pass codes (comma-separated; blank = all)<input id="cp-products" placeholder="nexus_pro_149, all_access"></label>
+          <label style="grid-column:1/-1"><input id="cp-active" type="checkbox" checked> Coupon active</label>
+          <button class="primary" type="submit">Save Coupon</button>
+        </form><div id="cp-status" class="admin-status"></div>
+      </div>
+      <div class="panel admin-panel-card"><div class="section-head" style="margin-top:0"><h3 class="admin-section-title">🎟️ Coupon Campaigns</h3><button class="secondary" type="button" id="cp-refresh">↻ Refresh</button></div><div id="cp-list"><div class="loader">Loading coupons…</div></div></div>
+    </div>
+
     <div class="admin-view" id="admin-view-revenue">
       <div class="admin-view-head"><h2>💰 Revenue</h2><p>All-time earnings and trends.</p></div>
       <div class="revenue-hero">
@@ -1495,8 +1643,27 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
     </div>
 
     <div class="admin-view" id="admin-view-series">
-      <div class="admin-view-head"><h2>📚 Test Series</h2><p>Free/Paid per series.</p></div>
-      <div class="panel admin-panel-card"><div id="admin-series-list"><div class="loader">Loading…</div></div><div id="admin-series-status" class="admin-status"></div></div>
+      <div class="admin-view-head"><h2>📚 Series Manager</h2><p>Create and manage branded series, attach existing quizzes, control access and publish them to the student Series section.</p></div>
+      <div class="panel admin-panel-card">
+        <h3 class="admin-section-title" id="series-manager-form-title">➕ Create Series</h3>
+        <form id="admin-series-manager-form" class="admin-form" style="grid-template-columns:1fr 1fr;gap:10px">
+          <input type="hidden" id="sm-edit-id" value="">
+          <label style="grid-column:1/-1">Series name *<input id="sm-title" maxlength="180" required placeholder="e.g. BPSC Prelims PYQ Vault"></label>
+          <label style="grid-column:1/-1">Description<textarea id="sm-description" maxlength="4000" rows="3" placeholder="What students get in this series"></textarea></label>
+          <label style="grid-column:1/-1">Logo image URL<input id="sm-logo" maxlength="1000" type="url" placeholder="https://…/logo.png"><small>Use a public HTTPS image URL. Leave blank for the Nexus logo.</small></label>
+          <label>Exam<select id="sm-exam"><option value="BPSC">BPSC</option><option value="UPSC">UPSC</option></select></label>
+          <label>Series type<select id="sm-type"><option value="subject_wise">Subject-wise</option><option value="sectional">Sectional</option><option value="full_length">Full length</option></select></label>
+          <label>Subject / category<input id="sm-subject" maxlength="100" value="General Studies" required></label>
+          <label>Difficulty<select id="sm-difficulty"><option>Mixed</option><option>Easy</option><option>Moderate</option><option>Hard</option></select></label>
+          <label>Access<select id="sm-access"><option value="free">Free</option><option value="paid">Paid</option></select></label>
+          <label>Display order<input id="sm-order" type="number" value="0" min="-100000" max="100000"></label>
+          <label style="grid-column:1/-1;display:flex;align-items:center;gap:8px"><input id="sm-publish" type="checkbox" style="width:18px;height:18px"> Publish immediately (visible to students)</label>
+          <div style="grid-column:1/-1"><div class="admin-section-title">Attach existing quizzes/tests</div><p style="font-size:11px;color:var(--muted);margin:4px 0 8px">Select existing quizzes to include. Add/import questions using the existing Questions/Import tools first, then build/link quizzes here.</p><input id="sm-quiz-search" type="search" placeholder="Search quiz title, subject or ID…" style="margin-bottom:8px"><div id="sm-quiz-picker" class="sm-quiz-picker"><div class="loader">Loading quizzes…</div></div></div>
+          <div style="grid-column:1/-1;display:flex;gap:8px;flex-wrap:wrap"><button class="primary" id="sm-save" type="submit">Create Series</button><button class="secondary hidden" id="sm-cancel-edit" type="button">Cancel edit</button><button class="secondary" id="sm-refresh-quizzes" type="button">↻ Refresh quizzes</button></div>
+        </form>
+        <div id="admin-series-manager-status" class="admin-status"></div>
+      </div>
+      <div class="panel admin-panel-card"><div class="section-head" style="margin-top:0"><h3 class="admin-section-title">📚 Existing Series</h3><button class="secondary" id="sm-refresh-series" type="button">↻ Refresh</button></div><div id="admin-series-list"><div class="loader">Loading…</div></div><div id="admin-series-status" class="admin-status"></div></div>
     </div>
 
     <div class="admin-view" id="admin-view-demo">
@@ -1731,12 +1898,13 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
 
 <section id="buy-pass-panel" class="hidden-tab">
 
-<header class="hero"><div class="brand">BPSC NEXUS · TEST BOT</div><h1>Premium Pass Plans</h1><p class="muted">Choose the right access for your Telegram group or personal preparation. Payments are made through PhonePe/UPI and activated only after an administrator verifies the transaction.</p></header>
+<header class="hero"><div class="brand">BPSC NEXUS · PREMIUM ACCESS</div><h1>Choose your access.<br>Prepare with purpose.</h1><p class="muted">Compare the available plans, check exactly what each one unlocks, and choose access for your Telegram group, personal preparation or a specific question bank.</p><div class="pass-trust-row"><span>🔒 Secure submission</span><span>✓ Admin-verified payment</span><span>↻ Status tracking</span></div></header>
+<section class="panel access-compare" aria-label="Free and premium access comparison"><div class="tag">KNOW BEFORE YOU BUY</div><h2 class="section-title">Free access vs paid access</h2><p class="notice" style="margin:7px 0 12px">Exact access depends on the plan selected and the content's access setting. Check the selected plan details before payment.</p><div class="access-compare-grid"><div class="access-compare-card"><span class="access-label">FREE / DEMO</span><h3>Explore first</h3><ul><li>Use content marked free or demo</li><li>Try the available practice flow</li><li>See what fits your preparation</li></ul></div><div class="access-compare-card premium"><span class="access-label">PAID ACCESS</span><h3>Unlock selected content</h3><ul><li>Access the specific plan or bank purchased</li><li>Paid tests/series where included</li><li>Access remains subject to plan validity and rules</li></ul></div></div></section>
 <div class="soon"><strong>✦ COMING SOON · COACHING INSTITUTE TEST SERIES</strong><div style="margin-top:5px;color:#f6e8c9;font-weight:800">Selected institute test series at just ₹49 per series.</div><div class="notice" style="margin-top:5px;color:#d9c8a8">Available series and launch details will be announced here.</div></div>
 <section class="panel"><div class="tag">01 · SELECT YOUR PASS TYPE</div><div class="categories"><button class="cat active" data-category="group">👥 GROUP PASSES</button><button class="cat" data-category="individual">👤 INDIVIDUAL PASSES</button><button class="cat" data-category="banks">📚 QUESTION BANKS</button></div><div id="categoryIntro" class="muted" style="font-size:13px;margin-top:11px">A Group Pass activates quiz features for one selected Telegram group only.</div><div id="prices" class="price-grid"><div class="empty">Loading plans…</div></div>
 <div id="groupFields"><label class="label" for="groupId">Target Telegram group ID</label><input id="groupId" inputmode="numeric" autocomplete="off" placeholder="Example: -1001234567890"><p class="notice">How to get it: add BPSC Nexus bot to your target group, then send <b>/groupid</b> inside that group. Purchase using a Telegram account that is an admin of that group.</p></div>
-<button class="primary" id="showPay">Continue to payment →</button><p class="notice">Group passes never activate every group automatically. Individual passes activate personal access. Individual Question Bank purchases grant only the selected bank, not All Access.</p></section>
-<section id="payPanel" class="panel hidden"><div class="tag">02 · MANUAL UPI PAYMENT</div><h2 style="margin:7px 0 4px">Pay <span id="amount">₹99</span></h2><p id="payProduct" class="muted" style="margin-top:0">Selected plan</p><p class="muted">Scan the official BPSC Nexus PhonePe QR and pay the exact amount shown above.</p><img class="qr" src="/static/phonepe_qr.jpg" alt="BPSC Nexus PhonePe UPI QR"><p class="notice">Check the amount before paying. The QR may not pre-fill the amount. Do not submit the same transaction twice.</p><label class="label" for="ref">UPI transaction/reference ID (UTR)</label><input id="ref" maxlength="40" autocomplete="off" placeholder="Enter UTR / transaction ID"><label class="label" for="proof">Payment screenshot (required, max 650 KB)</label><input id="proof" type="file" accept="image/*"><button class="primary" id="submit">Submit for admin verification</button><p class="notice">A screenshot alone does not activate access. The administrator checks the transaction in the PhonePe/bank app before approval.</p></section>
+<button class="primary" id="showPay">Continue to payment →</button><p class="notice access-rules-note"><b>Before you pay:</b> Group passes apply only to the selected Telegram group; individual passes apply to personal access; a Question Bank purchase covers only the selected bank unless the plan explicitly says otherwise. Test series may need to be purchased separately. Always check the selected plan's listed benefits and validity.</p></section>
+<section id="payPanel" class="panel hidden"><div class="tag">02 · MANUAL UPI PAYMENT</div><h2 style="margin:7px 0 4px">Pay <span id="amount">₹99</span></h2><p id="payProduct" class="muted" style="margin-top:0">Selected plan</p><p class="muted">Scan the official BPSC Nexus PhonePe QR and pay the exact amount shown above.</p><div class="coupon-apply-row" style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin:12px 0"><input id="buyer-coupon-code" maxlength="40" autocomplete="off" placeholder="Have a coupon code?"><button class="secondary" id="buyer-coupon-apply" type="button">Apply</button></div><div id="buyer-coupon-status" class="notice" style="margin:0 0 10px"></div><div id="buyer-price-breakdown" class="notice hidden" style="margin:0 0 10px"></div><img class="qr" src="/static/phonepe_qr.jpg" alt="BPSC Nexus PhonePe UPI QR"><p class="notice">Check the amount before paying. The QR may not pre-fill the amount. Do not submit the same transaction twice.</p><label class="label" for="ref">UPI transaction/reference ID (UTR)</label><input id="ref" maxlength="40" autocomplete="off" placeholder="Enter UTR / transaction ID"><label class="label" for="proof">Payment screenshot (required, max 650 KB)</label><input id="proof" type="file" accept="image/*"><button class="primary" id="submit">Submit for admin verification</button><p class="notice">A screenshot alone does not activate access. The administrator checks the transaction in the PhonePe/bank app before approval.</p><div class="payment-status-steps" aria-label="Payment process"><span class="current">1 · Pay</span><span>2 · Submit proof</span><span>3 · Await verification</span><span>4 · Access activated after approval</span></div></section>
 <section class="panel"><div class="tag">03 · WHAT YOU GET</div><h2 class="section-title">Learn · Practice · Evolve</h2><div class="feature-list"><div class="feature">✓ PYQs & topic-wise practice</div><div class="feature">✓ Exam-like mock tests</div><div class="feature">✓ Detailed performance analysis</div><div class="feature">✓ Personal Revision Bank</div><div class="feature">✓ Competitive leaderboard</div><div class="feature">✓ Practice & Exam modes</div></div><div class="steps"><div class="step"><span class="num">1</span><div><b>Choose a pass</b><div class="notice">Select Group, Individual or Question Bank.</div></div></div><div class="step"><span class="num">2</span><div><b>Enter group ID if buying a Group Pass</b><div class="notice">The system checks that you are an admin of the selected group.</div></div></div><div class="step"><span class="num">3</span><div><b>Pay and submit proof</b><div class="notice">Use the QR, then enter your UTR and upload the payment screenshot.</div></div></div><div class="step"><span class="num">4</span><div><b>Wait for admin approval</b><div class="notice">You will receive a Telegram message after approval or rejection.</div></div></div></div></section>
 <section class="panel"><div class="tag">04 · MY PAYMENT REQUESTS</div><div id="history" class="muted" style="margin-top:8px">Loading…</div><button class="secondary" id="refresh">Refresh payment status</button></section><div id="msg" class="status hidden" role="status"></div>
 
@@ -1745,14 +1913,9 @@ body.theme-bodhi .option{background:#fff8ec!important;color:#3a2412!important;bo
 <nav class="bottom-nav" id="bottom-nav" aria-label="Main navigation">
   <button class="tab-btn active" data-tab="home" aria-label="Home"><span class="tab-icon">🏠</span><span>Home</span></button>
   <button class="tab-btn" data-tab="series" aria-label="Series"><span class="tab-icon">🗂️</span><span>Series</span></button>
-  <button class="tab-btn" data-tab="intel" aria-label="Nexus Intel"><span class="tab-icon">🛰️</span><span>Intel</span></button>
   <button class="tab-btn" data-tab="create" aria-label="Create"><span class="tab-icon">⚒️</span><span>Create</span></button>
-  <button class="tab-btn" data-tab="arena" aria-label="Arena"><span class="tab-icon">⚔️</span><span>Arena</span></button>
   <button class="tab-btn" data-tab="analytics" aria-label="Stats"><span class="tab-icon">📈</span><span>Stats</span></button>
-  <button class="tab-btn" data-tab="leaderboard" aria-label="Ranks"><span class="tab-icon">🏆</span><span>Ranks</span></button>
   <button class="tab-btn" data-tab="profile" aria-label="Profile"><span class="tab-icon">🧑‍🎓</span><span>Profile</span></button>
-  <button class="tab-btn" data-tab="buy-pass" aria-label="Buy Pass"><span class="tab-icon">🛍️</span><span>Buy Pass</span></button>
-  <button class="tab-btn" id="admin-nav-btn" data-tab="admin" type="button" style="display:none" aria-label="Admin"><span class="tab-icon">🔐</span><span>Admin</span></button>
 </nav>
 
 <script>
@@ -1801,7 +1964,7 @@ function switchTab(tab,scroll=true){
   const valid=['home','series','intel','create','arena','analytics','leaderboard','profile','buy-pass','admin'];
   if(!valid.includes(tab))tab='home';
   document.querySelectorAll('.tab-btn').forEach(b=>{
-    const active=b.dataset.tab===tab;
+    const active=b.dataset.tab===tab || (b.dataset.tab==='home' && ['intel','arena','leaderboard','buy-pass','admin'].includes(tab));
     b.classList.toggle('active',active);
     if(active)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');
   });
@@ -1809,7 +1972,7 @@ function switchTab(tab,scroll=true){
   const allPanels=['home-view','series-panel','intel-panel','create-panel','arena-panel','analytics-panel','leaderboard-panel','profile-panel','buy-pass-panel','admin-panel'];
   allPanels.forEach(id=>{const el=$(id);if(el)el.classList.add('hidden-tab');});
   (panels[tab]||panels.home).forEach(id=>{const el=$(id);if(el)el.classList.remove('hidden-tab');});
-  if(tab==='series')loadTestSeries();
+  if(tab==='series'){loadTestSeries();loadSeriesQuestionBanks();}
   if(tab==='buy-pass'&&window.BPSC_NEXUS_BUY_PASS_REFRESH)window.BPSC_NEXUS_BUY_PASS_REFRESH();
   if(tab==='intel'){const m=$('intel-panel');}
   if(tab==='analytics'){loadHistory();loadRevision();loadXRay().catch(()=>{});loadArsenal(false).catch(()=>{});}
@@ -1871,7 +2034,7 @@ function updateAdminPanelAuthView(){
   const ok=hasAdminAccess();
   if(login)login.hidden=ok;
   if(secure)secure.hidden=!ok;
-  const launch=$('admin-launch-card');if(launch)launch.style.display=ok?'block':'none';
+  const launch=$('admin-launch-card');if(launch)launch.style.display='flex';
   const topBtn=$('admin-top-btn');if(topBtn)topBtn.style.display=ok?'inline-flex':'none';
   const navBtn=$('admin-nav-btn');if(navBtn)navBtn.style.display=ok?'flex':'none';
   if(ok&&typeof window.activateAdminView==='function')window.activateAdminView('overview');
@@ -1909,6 +2072,20 @@ async function loadAccess(){
 $('demo-close-btn')?.addEventListener('click',()=>$('demo-welcome')?.classList.add('hidden'));
 $('demo-explore-btn')?.addEventListener('click',()=>{$('demo-welcome')?.classList.add('hidden');switchTab('series');});
 
+
+let smQuizCatalog=[];
+function renderSMQuizPicker(selected=[]){
+ const box=$('sm-quiz-picker');if(!box)return;const query=String($('sm-quiz-search')?.value||'').toLowerCase().trim();
+ const rows=smQuizCatalog.filter(q=>!query||`${q.id} ${q.title||''} ${q.subject||''}`.toLowerCase().includes(query));
+ box.innerHTML=rows.length?rows.map(q=>`<label class="sm-quiz-option"><input type="checkbox" value="${q.id}" data-sm-quiz ${selected.includes(Number(q.id))?'checked':''}><span><strong>#${q.id} · ${esc(q.title||'Untitled quiz')}</strong><small>${esc(q.subject||'Mixed')} · ${Number(q.total_questions||0)} questions · ${q.is_published?'Published':'Draft'}</small></span></label>`).join(''):'<div class="empty">No matching quizzes found.</div>';
+}
+async function loadSMQuizCatalog(selected=[]){const box=$('sm-quiz-picker');if(box)box.innerHTML='<div class="loader">Loading quizzes…</div>';try{const d=await api('/api/admin/series/quizzes');smQuizCatalog=d.quizzes||[];renderSMQuizPicker(selected);}catch(e){if(box)box.innerHTML=`<div class="error">${esc(e.message||'Could not load quizzes')}</div>`;}}
+function resetSeriesManagerForm(){const f=$('admin-series-manager-form');if(!f)return;f.reset();$('sm-edit-id').value='';$('sm-subject').value='General Studies';$('sm-order').value='0';$('sm-publish').checked=false;$('series-manager-form-title').textContent='➕ Create Series';$('sm-save').textContent='Create Series';$('sm-cancel-edit').classList.add('hidden');renderSMQuizPicker([]);}
+async function editManagedSeries(id){try{const d=await api('/api/admin/series');const s=(d.series||[]).find(x=>Number(x.id)===Number(id));if(!s)throw new Error('Series not found.');$('sm-edit-id').value=s.id;$('sm-title').value=s.title||'';$('sm-description').value=s.description||'';$('sm-logo').value=s.logo_url||'';$('sm-exam').value=s.exam_type||'BPSC';$('sm-type').value=s.series_type||'subject_wise';$('sm-subject').value=s.subject||'General Studies';$('sm-difficulty').value=s.difficulty||'Mixed';$('sm-access').value=s.access_type||'free';$('sm-order').value=s.sort_order||0;$('sm-publish').checked=!!s.is_published;$('series-manager-form-title').textContent=`✏️ Edit Series #${s.id}`;$('sm-save').textContent='Save Changes';$('sm-cancel-edit').classList.remove('hidden');await loadSMQuizCatalog((s.quiz_ids||[]).map(Number));$('admin-view-series').scrollIntoView({behavior:'smooth',block:'start'});}catch(e){$('admin-series-manager-status').textContent=e.message||'Could not open series.';}}
+async function loadSMSeries(){try{const d=await api('/api/admin/series');const el=$('admin-series-list');if(!el)return;el.innerHTML=(d.series||[]).map(s=>`<div class="sm-series-row"><img class="sm-series-logo" src="${esc(s.logo_url||'')}" alt="" onerror="this.style.display='none'" style="${s.logo_url?'':'visibility:hidden;'}"><div class="sm-series-info"><strong>#${s.id} · ${esc(s.title)}</strong><small>${esc(s.exam_type)} · ${esc(s.subject||'General Studies')} · ${Number(s.test_count||0)} linked tests · ${s.access_type==='paid'?'Paid':'Free'} · ${s.is_published?'Published':'Draft'}</small><div class="sm-series-actions"><button class="secondary" type="button" data-sm-edit="${s.id}">✏️ Edit</button><button class="${s.is_published?'secondary':'primary'}" type="button" data-sm-publish="${s.id}" data-next-published="${!s.is_published}">${s.is_published?'Unpublish':'Publish'}</button><button class="secondary" type="button" data-sm-access="${s.id}" data-next-access="${s.access_type==='paid'?'free':'paid'}">Set ${s.access_type==='paid'?'Free':'Paid'}</button><button class="danger" type="button" data-sm-delete="${s.id}">Delete</button></div></div></div>`).join('')||'<div class="empty">No series yet. Create the first one above.</div>';el.querySelectorAll('[data-sm-edit]').forEach(b=>b.onclick=()=>editManagedSeries(b.dataset.smEdit));el.querySelectorAll('[data-sm-publish]').forEach(b=>b.onclick=async()=>{try{await api(`/api/admin/series/${b.dataset.smPublish}/publish`,'POST',{is_published:b.dataset.nextPublished==='true'});$('admin-series-manager-status').textContent='Publish status updated.';await loadSMSeries();}catch(e){$('admin-series-manager-status').textContent=e.message;}});el.querySelectorAll('[data-sm-access]').forEach(b=>b.onclick=async()=>{try{await api(`/api/admin/series/${b.dataset.smAccess}/access`,'POST',{access_type:b.dataset.nextAccess});$('admin-series-manager-status').textContent='Access updated.';await loadSMSeries();}catch(e){$('admin-series-manager-status').textContent=e.message;}});el.querySelectorAll('[data-sm-delete]').forEach(b=>b.onclick=async()=>{if(!confirm(`Delete series #${b.dataset.smDelete}? This removes only the series and its links, not the question bank.`))return;try{await api(`/api/admin/remove-series/${b.dataset.smDelete}`,'DELETE');$('admin-series-manager-status').textContent='Series deleted.';await loadSMSeries();}catch(e){$('admin-series-manager-status').textContent=e.message;}});}catch(e){if($('admin-series-list'))$('admin-series-list').innerHTML=`<div class="error">${esc(e.message||'Could not load series')}</div>`;}}
+$('admin-series-manager-form')?.addEventListener('submit',async e=>{e.preventDefault();const status=$('admin-series-manager-status'),btn=$('sm-save');btn.disabled=true;status.textContent='Saving series…';const payload={title:$('sm-title').value,description:$('sm-description').value,logo_url:$('sm-logo').value,exam_type:$('sm-exam').value,series_type:$('sm-type').value,subject:$('sm-subject').value,difficulty:$('sm-difficulty').value,access_type:$('sm-access').value,sort_order:Number($('sm-order').value||0),is_published:$('sm-publish').checked,quiz_ids:[...document.querySelectorAll('[data-sm-quiz]:checked')].map(x=>Number(x.value))};try{const id=$('sm-edit-id').value;const d=await api(id?`/api/admin/series/${id}/update`:'/api/admin/series/create','POST',payload);status.textContent=`${d.title||payload.title} saved · ${d.test_count||payload.quiz_ids.length} linked tests.`;resetSeriesManagerForm();await loadSMSeries();await loadTestSeries();}catch(err){status.textContent=err.message||'Could not save series.';}finally{btn.disabled=false;}});
+$('sm-cancel-edit')?.addEventListener('click',resetSeriesManagerForm);$('sm-refresh-quizzes')?.addEventListener('click',()=>loadSMQuizCatalog([...document.querySelectorAll('[data-sm-quiz]:checked')].map(x=>Number(x.value))));$('sm-refresh-series')?.addEventListener('click',loadSMSeries);$('sm-quiz-search')?.addEventListener('input',()=>renderSMQuizPicker([...document.querySelectorAll('[data-sm-quiz]:checked')].map(x=>Number(x.value))));
+
 async function loadAdminPanel(){
   if(!hasAdminAccess())return;
   for(const id of ['admin-bank-list','admin-quiz-list','admin-series-list']){const el=$(id);if(el)el.innerHTML='<div class="loader">Loading…</div>';}
@@ -1922,12 +2099,13 @@ async function loadAdminPanel(){
     if($('admin-demo-status'))$('admin-demo-status').textContent=`Demo is ${o.demo.enabled?'enabled':'disabled'} · ${o.demo.duration_hours}h.`;
     if($('admin-bank-list'))$('admin-bank-list').innerHTML=(b.banks||[]).map(x=>`<div class="admin-row"><div><strong>${esc(x.name)}</strong><small>${Number(x.question_count).toLocaleString()} Q · ${esc(x.subject_type||'subject')}</small></div><select data-bank-access="${esc(x.name)}"><option value="free" ${x.access_type==='free'?'selected':''}>Free</option><option value="paid" ${x.access_type==='paid'?'selected':''}>Paid</option></select></div>`).join('')||'<div class="empty">No banks.</div>';
     if($('admin-quiz-list'))$('admin-quiz-list').innerHTML=(q.quizzes||[]).map(x=>`<div class="admin-row"><div><strong>#${x.id} · ${esc(x.title)}</strong><small>${esc(x.subject||'Mixed')} · ${x.total_questions} Q · ${x.is_published?'Published':'Draft'}</small></div><select data-quiz-access="${x.id}"><option value="inherit" ${x.access_type==='inherit'?'selected':''}>Inherit</option><option value="free" ${x.access_type==='free'?'selected':''}>Free</option><option value="paid" ${x.access_type==='paid'?'selected':''}>Paid</option></select></div>`).join('')||'<div class="empty">No quizzes.</div>';
-    if($('admin-series-list'))$('admin-series-list').innerHTML=(s.series||[]).map(x=>`<div class="admin-row"><div><strong>#${x.id} · ${esc(x.title)}</strong><small>${esc(x.exam_type)} · ${x.test_count} tests · ${x.is_published?'Published':'Draft'}</small></div><select data-series-access="${x.id}"><option value="free" ${x.access_type==='free'?'selected':''}>Free</option><option value="paid" ${x.access_type==='paid'?'selected':''}>Paid</option></select></div>`).join('')||'<div class="empty">No series.</div>';
+    if($('admin-series-list')&&!$('admin-series-list').querySelector('.sm-series-row'))$('admin-series-list').innerHTML=(s.series||[]).map(x=>`<div class="admin-row"><div><strong>#${x.id} · ${esc(x.title)}</strong><small>${esc(x.exam_type)} · ${x.test_count} tests · ${x.is_published?'Published':'Draft'}</small></div><select data-series-access="${x.id}"><option value="free" ${x.access_type==='free'?'selected':''}>Free</option><option value="paid" ${x.access_type==='paid'?'selected':''}>Paid</option></select></div>`).join('')||'<div class="empty">No series.</div>';
     renderAdminCleanup(c);
   }catch(e){if($('admin-demo-status'))$('admin-demo-status').textContent='Some data failed: '+(e.message||'error');}
   loadAdminPayments().catch(()=>{});
   loadAdminImportSubjects().catch(()=>{});
   loadAdminPassOptions().catch(()=>{});
+  loadAdminPassStudio().catch(()=>{});
   loadAdminDemoRegistrations().catch(()=>{});
   loadAdminNotifications().catch(()=>{});
   loadAdminTests().catch(()=>{});
@@ -1945,13 +2123,15 @@ document.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click',()
 document.querySelectorAll('[data-tab-go]').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.tabGo)));
 document.querySelectorAll('[data-home-route]').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.homeRoute)));
 $('arena-coming-home')?.addEventListener('click',()=>switchTab('arena'));
+$('get-pass-home')?.addEventListener('click',()=>switchTab('buy-pass'));
+$('hero-pass-cta')?.addEventListener('click',()=>switchTab('buy-pass'));
 $('top-theme-btn')?.addEventListener('click',()=>switchTab('profile'));
 
 window.activateAdminView=function(name){
   document.querySelectorAll('.admin-view').forEach(v=>v.classList.toggle('active',v.id==='admin-view-'+name));
   document.querySelectorAll('.admin-nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.adminView===name));
   if(name==='payments')loadAdminPayments().catch(()=>{});
-  if(name==='banks'||name==='series')loadAdminPanel().catch(()=>{});
+  if(name==='banks'||name==='series')loadAdminPanel().catch(()=>{});if(name==='series'){loadSMQuizCatalog().catch(()=>{});loadSMSeries().catch(()=>{});}
   if(name==='demo')loadAdminDemoRegistrations().catch(()=>{});
   if(name==='notifications')loadAdminNotifications().catch(()=>{});
   if(name==='tests')loadAdminTests().catch(()=>{});
@@ -2175,6 +2355,17 @@ document.querySelectorAll('[data-export]').forEach(b=>b.onclick=async()=>{
   }catch(e){s.textContent=e.message;}
 });
 
+// ---------- Pass Studio & Coupon Engine ----------
+let passStudioItems=[],passCouponItems=[];
+function resetPassOfferForm(){const f=$('admin-pass-form');if(!f)return;f.reset();$('po-code').disabled=false;$('po-days-custom').classList.add('hidden');$('po-active').checked=true;$('po-price').value='149';$('po-category').value='Premium';$('po-order').value='0';$('po-save').textContent='Create Pass';$('pass-form-title').textContent='✨ Create a Pass';}
+async function loadAdminPassStudio(){if(!hasAdminAccess())return;try{const d=await api('/api/admin/passes');passStudioItems=d.passes||[];passCouponItems=d.coupons||[];renderAdminPassOffers();renderAdminCoupons();}catch(e){if($('po-status'))$('po-status').textContent=e.message;}}
+function renderAdminPassOffers(){const el=$('po-list');if(!el)return;el.innerHTML=passStudioItems.map(p=>`<div class="admin-row"><div><strong>${esc(p.pass_name)} · ₹${Number(p.amount_inr).toLocaleString()}</strong><small>${esc(p.product_code)} · ${esc(p.scope)} · ${Number(p.duration_days)===0?'Lifetime':p.duration_days+' days'} · ${esc(p.category||'Premium')} · ${p.is_featured?'Featured · ':''}${p.is_active?'Visible in Get Your Pass':'Hidden from buyers'}</small><small>${esc(p.description||'No description')}</small></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="secondary" type="button" data-po-edit="${esc(p.product_code)}">Edit</button><button class="${p.is_active?'secondary':'primary'}" type="button" data-po-toggle="${esc(p.product_code)}" data-active="${!p.is_active}">${p.is_active?'Deactivate':'Activate'}</button></div></div>`).join('')||'<div class="empty">No custom passes yet. Create one above.</div>';el.querySelectorAll('[data-po-edit]').forEach(b=>b.onclick=()=>{const p=passStudioItems.find(x=>x.product_code===b.dataset.poEdit);if(!p)return;$('po-code').value=p.product_code;$('po-code').disabled=true;$('po-name').value=p.pass_name;$('po-description').value=p.description||'';$('po-price').value=p.amount_inr;$('po-days').value=[0,7,30,60,90,180,365].includes(Number(p.duration_days))?String(p.duration_days):'custom';$('po-days-custom').classList.toggle('hidden',$('po-days').value!=='custom');if($('po-days').value==='custom')$('po-days-custom').value=p.duration_days;$('po-scope').value=p.scope;$('po-category').value=p.category||'Premium';$('po-keys').value=(p.vault_keys||[]).join(',');$('po-order').value=p.sort_order||0;$('po-active').checked=!!p.is_active;$('po-featured').checked=!!p.is_featured;$('po-save').textContent='Save Changes';$('pass-form-title').textContent='✏️ Edit Pass';$('admin-view-passes').scrollIntoView({behavior:'smooth',block:'start'});});el.querySelectorAll('[data-po-toggle]').forEach(b=>b.onclick=async()=>{try{await api('/api/admin/passes/'+encodeURIComponent(b.dataset.poToggle)+'/toggle','POST',{is_active:b.dataset.active==='true'});await loadAdminPassStudio();}catch(e){$('po-status').textContent=e.message;}});}
+function renderAdminCoupons(){const el=$('cp-list');if(!el)return;el.innerHTML=passCouponItems.map(c=>`<div class="admin-row"><div><strong>${esc(c.code)} · ${c.discount_type==='percent'?Number(c.discount_value)+'%':'₹'+Number(c.discount_value)} off</strong><small>${esc(c.description||'Coupon')} · ${Number(c.redemptions||0)} redemptions · ${c.max_redemptions??'Unlimited'} max · ${c.is_active?'Active':'Inactive'}</small><small>Min ₹${Number(c.min_order_inr||0)} · Per user ${Number(c.per_user_limit||1)} · Applies: ${esc((c.applicable_product_codes||[]).join(', ')||'all passes')}</small></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="secondary" type="button" data-cp-edit="${esc(c.code)}">Edit</button><button class="${c.is_active?'secondary':'primary'}" type="button" data-cp-toggle="${esc(c.code)}" data-active="${!c.is_active}">${c.is_active?'Deactivate':'Activate'}</button></div></div>`).join('')||'<div class="empty">No coupon codes yet.</div>';el.querySelectorAll('[data-cp-edit]').forEach(b=>b.onclick=()=>{const c=passCouponItems.find(x=>x.code===b.dataset.cpEdit);if(!c)return;$('cp-code').value=c.code;$('cp-description').value=c.description||'';$('cp-type').value=c.discount_type;$('cp-value').value=c.discount_value;$('cp-max-discount').value=c.max_discount_inr??'';$('cp-min-order').value=c.min_order_inr||0;$('cp-max-uses').value=c.max_redemptions??'';$('cp-user-limit').value=c.per_user_limit||1;$('cp-products').value=(c.applicable_product_codes||[]).join(', ');$('cp-active').checked=!!c.is_active;$('cp-starts').value=c.starts_at?new Date(c.starts_at).toISOString().slice(0,16):'';$('cp-expires').value=c.expires_at?new Date(c.expires_at).toISOString().slice(0,16):'';$('admin-view-passes').scrollIntoView({behavior:'smooth',block:'start'});});el.querySelectorAll('[data-cp-toggle]').forEach(b=>b.onclick=async()=>{try{await api('/api/admin/coupons/'+encodeURIComponent(b.dataset.cpToggle)+'/toggle','POST',{is_active:b.dataset.active==='true'});await loadAdminPassStudio();}catch(e){$('cp-status').textContent=e.message;}});}
+$('po-days')?.addEventListener('change',()=> $('po-days-custom')?.classList.toggle('hidden',$('po-days').value!=='custom'));
+$('po-reset')?.addEventListener('click',resetPassOfferForm);$('po-refresh')?.addEventListener('click',loadAdminPassStudio);$('cp-refresh')?.addEventListener('click',loadAdminPassStudio);
+$('admin-pass-form')?.addEventListener('submit',async e=>{e.preventDefault();const status=$('po-status'),btn=$('po-save');btn.disabled=true;status.textContent='Saving pass…';try{const days=$('po-days').value==='custom'?Number($('po-days-custom').value):Number($('po-days').value);const keys=$('po-keys').value.split(',').map(x=>x.trim()).filter(Boolean);const d=await api('/api/admin/passes','POST',{product_code:$('po-code').value.trim().toLowerCase(),pass_name:$('po-name').value.trim(),description:$('po-description').value,amount_inr:Number($('po-price').value),duration_days:days,scope:$('po-scope').value,category:$('po-category').value,vault_keys:keys,is_active:$('po-active').checked,is_featured:$('po-featured').checked,sort_order:Number($('po-order').value||0)});status.textContent=`${d.pass_name} saved. ${d.saved?'It will appear in Get Your Pass when active.':''}`;resetPassOfferForm();await loadAdminPassStudio();}catch(err){status.textContent=err.message||'Could not save pass.';}finally{btn.disabled=false;}});
+$('admin-coupon-form')?.addEventListener('submit',async e=>{e.preventDefault();const status=$('cp-status');status.textContent='Saving coupon…';try{const d=await api('/api/admin/coupons','POST',{code:$('cp-code').value.trim().toUpperCase(),description:$('cp-description').value,discount_type:$('cp-type').value,discount_value:Number($('cp-value').value),max_discount_inr:$('cp-max-discount').value||null,min_order_inr:Number($('cp-min-order').value||0),max_redemptions:$('cp-max-uses').value||null,per_user_limit:Number($('cp-user-limit').value||1),starts_at:$('cp-starts').value||null,expires_at:$('cp-expires').value||null,applicable_product_codes:$('cp-products').value.split(',').map(x=>x.trim().toLowerCase()).filter(Boolean),is_active:$('cp-active').checked});status.textContent=`Coupon ${d.code} saved.`;$('admin-coupon-form').reset();$('cp-value').value='20';$('cp-user-limit').value='1';$('cp-min-order').value='0';$('cp-active').checked=true;await loadAdminPassStudio();}catch(err){status.textContent=err.message||'Could not save coupon.';}});
+
 // ---------- Payments ----------
 async function loadAdminPayments(){
   if(!hasAdminAccess())return;
@@ -2194,7 +2385,7 @@ async function loadAdminPaymentDetail(id){
   box.innerHTML='<div class="loader">Loading proof…</div>';
   try{
     const d=await api('/api/admin/payments/'+id),r=d.request;
-    box.innerHTML=`<div class="panel" style="margin-top:10px"><div class="section-head" style="margin-top:0"><h3>Request #${r.id}</h3><button type="button" class="secondary" id="admin-payment-detail-close">Close</button></div><p class="admin-section-sub">${esc(r.product_name)} · ₹${Number(r.amount_inr).toLocaleString()} · ${Number(r.duration_days)===0?'Lifetime':r.duration_days+' days'}<br>TG ID: ${r.telegram_id}<br>Ref: <b>${esc(r.transaction_ref)}</b><br>Status: ${esc(r.status)}</p>${r.screenshot_data?`<img src="${esc(r.screenshot_data)}" alt="Proof" style="width:100%;max-height:380px;object-fit:contain;border:1px solid var(--line);border-radius:12px;background:#fff">`:'<p class="admin-status">No screenshot.</p>'}<label class="admin-form">Note<input id="admin-payment-note" maxlength="500"></label>${r.status==='pending'?`<div class="mode-row" style="margin-top:10px"><button class="primary" type="button" id="admin-payment-approve">✓ Approve</button><button class="danger" type="button" id="admin-payment-reject">Reject</button></div>`:''}<div id="admin-payment-detail-status" class="admin-status"></div></div>`;
+    box.innerHTML=`<div class="panel" style="margin-top:10px"><div class="section-head" style="margin-top:0"><h3>Request #${r.id}</h3><button type="button" class="secondary" id="admin-payment-detail-close">Close</button></div><p class="admin-section-sub">${esc(r.product_name)} · Payable ₹${Number(r.amount_inr).toLocaleString()} · ${Number(r.duration_days)===0?'Lifetime':r.duration_days+' days'}${r.base_amount_inr!=null&&Number(r.discount_amount_inr)>0?`<br>Base ₹${Number(r.base_amount_inr).toLocaleString()} − Coupon ${esc(r.coupon_code||'')} ₹${Number(r.discount_amount_inr).toLocaleString()}`:''}<br>TG ID: ${r.telegram_id}<br>Ref: <b>${esc(r.transaction_ref)}</b><br>Status: ${esc(r.status)}</p>${r.screenshot_data?`<img src="${esc(r.screenshot_data)}" alt="Proof" style="width:100%;max-height:380px;object-fit:contain;border:1px solid var(--line);border-radius:12px;background:#fff">`:'<p class="admin-status">No screenshot.</p>'}<label class="admin-form">Note<input id="admin-payment-note" maxlength="500"></label>${r.status==='pending'?`<div class="mode-row" style="margin-top:10px"><button class="primary" type="button" id="admin-payment-approve">✓ Approve</button><button class="danger" type="button" id="admin-payment-reject">Reject</button></div>`:''}<div id="admin-payment-detail-status" class="admin-status"></div></div>`;
     $('admin-payment-detail-close').onclick=()=>box.innerHTML='';
     if(r.status==='pending'){
       $('admin-payment-approve').onclick=async()=>{if(!confirm('Approve only after confirming payment.'))return;const s=$('admin-payment-detail-status');s.textContent='Saving…';try{await api(`/api/admin/payments/${id}/review`,'POST',{action:'approve',note:$('admin-payment-note').value});s.textContent='Approved.';await loadAdminPayments();await loadAdminPaymentDetail(id);}catch(e){s.textContent=e.message;}};
@@ -2336,6 +2527,51 @@ async function loadQuizzes(){
   }catch(e){if($('quiz-list'))$('quiz-list').innerHTML='<div class="empty">Could not load.</div>';}
 }
 
+
+let seriesBankMetaCache=null;
+function subjectBankIcon(name){
+ const s=String(name||'').toLowerCase();
+ if(/science|physics|chemistry|biology/.test(s))return '⚛️';
+ if(/bihar/.test(s))return '🏛️';
+ if(/history/.test(s))return '📜';
+ if(/polity|constitution|governance/.test(s))return '⚖️';
+ if(/geography/.test(s))return '🌍';
+ if(/econom/.test(s))return '📈';
+ if(/math|aptitude|reason/.test(s))return '🧠';
+ if(/current|affair|news/.test(s))return '📰';
+ if(/environment|ecology/.test(s))return '🌿';
+ return '📚';
+}
+async function loadSeriesQuestionBanks(){
+ const status=$('series-bank-status'),commonCount=$('common-bank-count'),grid=$('subject-question-banks');
+ if(!status||!grid)return;
+ try{
+  if(!tg||!tg.initData){status.textContent='Open in Telegram to view the live question bank.';return;}
+  const data=await api('/api/quiz-builder/meta');seriesBankMetaCache=data;
+  const total=Number(data.total_ready||0),subjects=(data.subjects||[]).filter(s=>s.name&&Number(s.count)>0);
+  if(commonCount)commonCount.textContent=`${total.toLocaleString()} ready questions · All available subjects`;
+  status.textContent=`${total.toLocaleString()} ready questions · Live from the question bank`;
+  grid.innerHTML=subjects.length?subjects.map((s,i)=>`<article class="qb-subject-card" style="--subject-tint:${['#dce8ff','#f8dfaa','#d8f2df','#f5d8e7','#e6ddff','#d7eef4'][i%6]}"><div class="qb-subject-card-top"><div class="qb-subject-logo">${subjectBankIcon(s.name)}</div><div><h4>${esc(s.name)}</h4><p>Subject question bank</p></div></div><div class="qb-subject-count">${Number(s.count).toLocaleString()} questions</div><div class="qb-subject-actions"><button class="secondary" data-bank-subject="${esc(s.name)}" data-mode="practice">Practice</button><button class="primary" data-bank-subject="${esc(s.name)}" data-mode="exam">Exam</button></div></article>`).join(''):'<div class="panel empty">No ready subject questions are available yet.</div>';
+  grid.querySelectorAll('[data-bank-subject]').forEach(b=>b.onclick=()=>startSeriesBank(b.dataset.bankSubject,b.dataset.mode));
+  document.querySelectorAll('[data-bank-start="common"]').forEach(b=>b.onclick=()=>startSeriesBank('All subjects',b.dataset.mode));
+ }catch(e){status.textContent='Question banks could not load: '+(e.message||'Please retry.');grid.innerHTML='<div class="panel empty">Could not load subject banks. Please try again later.</div>';}
+}
+async function startSeriesBank(subject,mode){
+ const buttons=[...document.querySelectorAll('[data-bank-start],[data-bank-subject]')];buttons.forEach(b=>b.disabled=true);
+ const status=$('series-bank-status');if(status)status.textContent=`Preparing ${subject==='All subjects'?'Common Question Bank':subject+' bank'}…`;
+ try{
+  if(!(await ensureDemoGate('attempt question banks')))return;
+  const meta=seriesBankMetaCache||await api('/api/quiz-builder/meta');
+  const count=subject==='All subjects'?Number(meta.total_ready||0):Number((meta.subjects||[]).find(s=>s.name===subject)?.count||0);
+  if(!count)throw new Error('No ready questions are available in this bank yet.');
+  const title=subject==='All subjects'?'Nexus Common Question Bank':`${subject} · Question Bank`;
+  const created=await api('/api/quiz-builder/create','POST',{subject,topic:'',count,use_all_questions:true,selection:'random',mode,title,positive_marks:1,negative_marks:0.33,duration_minutes:Math.max(1,Math.ceil(count*0.5)),question_time_seconds:0,shuffle_options:true});
+  if(status)status.textContent=`Prepared ${Number(created.count||count).toLocaleString()} questions. Opening quiz…`;
+  await startQuiz(Number(created.quiz_id),mode);
+ }catch(e){if(status)status.textContent=e.message||'Could not start this bank.';}
+ finally{buttons.forEach(b=>b.disabled=false);}
+}
+
 let seriesExamFilter='ALL',seriesTypeFilter='ALL',seriesCache=[];
 async function loadTestSeries(){
   const status=$('test-series-status');if(!status)return;
@@ -2345,7 +2581,7 @@ function renderTestSeries(){
   const list=$('test-series-list');if(!list)return;
   const rows=seriesCache.filter(s=>(seriesExamFilter==='ALL'||s.exam_type===seriesExamFilter)&&(seriesTypeFilter==='ALL'||s.series_type===seriesTypeFilter));
   if(!rows.length){list.innerHTML='<div class="panel empty">No series in this filter.</div>';return;}
-  list.innerHTML=rows.map(s=>`<article class="series-card"><div class="card-top"><span class="series-chip">${esc(s.exam_type)}</span><span class="series-lock">${s.entitled?'✓':'◆ PAID'}</span></div><h3>${esc(s.title)}</h3><p>${esc(s.description||'')}</p></article>`).join('');
+  list.innerHTML=rows.map(s=>`<article class="series-card"><div class="card-top"><span class="series-chip">${esc(s.exam_type)}</span><span class="series-lock">${s.access_type==='free'?'FREE':'◆ PAID'}</span></div><div style="display:flex;align-items:center;gap:10px;margin:8px 0"><img src="${esc(s.logo_url||'')}" alt="" onerror="this.style.display='none'" style="width:42px;height:42px;object-fit:cover;border:1px solid var(--line);border-radius:10px;${s.logo_url?'':'display:none;'}"><div><h3 style="margin:0">${esc(s.title)}</h3><small style="color:var(--muted)">${Number(s.test_count||0)} tests · ${esc(s.subject||'General Studies')}</small></div></div><p>${esc(s.description||'')}</p></article>`).join('');
 }
 document.querySelectorAll('[data-series-exam]').forEach(b=>b.onclick=()=>{seriesExamFilter=b.dataset.seriesExam;document.querySelectorAll('[data-series-exam]').forEach(x=>x.classList.toggle('active',x===b));renderTestSeries();});
 document.querySelectorAll('[data-series-type]').forEach(b=>b.onclick=()=>{seriesTypeFilter=b.dataset.seriesType;document.querySelectorAll('[data-series-type]').forEach(x=>x.classList.toggle('active',x===b));renderTestSeries();});
@@ -2765,12 +3001,14 @@ loadAdminSession().finally(()=>{loadAccess().catch(()=>{}).finally(()=>{loadQuiz
  function planFor(code){return plans.find(p=>p.product_code===code)||products.find(p=>p.product_code===code)}
  function current(){return planFor(selectedCode)}
  function planCategory(p){return p.scope==='group'?'group':p.scope==='individual'?'individual':'banks'}
- function visibleItems(){return category==='banks'?products:plans.filter(p=>p.scope===category)}
- function renderPrices(){const items=visibleItems();$('groupFields').classList.toggle('hidden',category!=='group');$('categoryIntro').textContent=category==='group'?'A Group Pass activates quiz features for one selected Telegram group only.':category==='individual'?'An Individual Pass unlocks personal BPSC Nexus access on your own Telegram account.':'Purchase one question bank at a time. These products do not include All Access.';if(!items.length){$('prices').innerHTML='<div class="empty">No products are currently available in this category.</div>';return}if(!items.some(p=>p.product_code===selectedCode))selectedCode=items[0].product_code;$('prices').innerHTML=items.map(p=>{const code=p.product_code,name=p.product_name||p.name,price=p.amount_inr??p.price,duration=p.duration_label||(Number(p.duration_days)===0?'Lifetime access':`${p.duration_days} days access`),desc=p.description||p.entitlement_key||'Question-bank access';return `<button class="price ${code===selectedCode?'active':''}" data-code="${esc(code)}"><span class="plan">${esc(name)}</span><b>₹${esc(price)}</b><small>${esc(duration)}</small><span class="desc">${esc(desc)}</span>${code===selectedCode?'<span class="selected-mark">✓</span>':''}</button>`}).join('');document.querySelectorAll('[data-code]').forEach(b=>b.onclick=()=>{selectedCode=b.dataset.code;renderPrices();$('payPanel').classList.add('hidden')})}
- async function load(){try{const d=await api('/api/payments');plans=d.plans||[];products=d.products||[];renderPrices();const h=d.history||[];$('history').innerHTML=h.length?h.map(x=>`<div class="history-item"><b>Request #${esc(x.id)} · ${esc(x.product_name)}</b><br>₹${esc(x.amount_inr)} · Ref ${esc(x.transaction_ref)}${x.group_chat_id?`<br>Group ID: ${esc(x.group_chat_id)}`:''}<br><span class="status-${esc(x.status)}">${esc(String(x.status).toUpperCase())}</span> · ${esc(new Date(x.submitted_at).toLocaleString())}</div>`).join(''):'No payment requests yet.'}catch(e){message(e.message);$('history').textContent='Could not load payment history.'}}
+ function visibleItems(){return category==='banks'?[...products,...plans.filter(p=>p.scope==='banks')]:plans.filter(p=>p.scope===category)}
+ function renderPrices(){const items=visibleItems();$('groupFields').classList.toggle('hidden',category!=='group');$('categoryIntro').textContent=category==='group'?'A Group Pass activates quiz features for one selected Telegram group only.':category==='individual'?'An Individual Pass unlocks personal BPSC Nexus access on your own Telegram account.':'Purchase one question bank at a time. These products do not include All Access.';if(!items.length){$('prices').innerHTML='<div class="empty">No products are currently available in this category.</div>';return}if(!items.some(p=>p.product_code===selectedCode))selectedCode=items[0].product_code;$('prices').innerHTML=items.map(p=>{const code=p.product_code,name=p.product_name||p.name,price=p.amount_inr??p.price,duration=p.duration_label||(Number(p.duration_days)===0?'Lifetime access':`${p.duration_days} days access`),desc=p.description||p.entitlement_key||'Question-bank access';return `<button class="price ${code===selectedCode?'active':''}" data-code="${esc(code)}">${p.is_featured?'<span class="tag">✦ FEATURED</span>':''}<span class="plan">${esc(name)}</span><b>₹${esc(price)}</b><small>${esc(duration)}</small><span class="desc">${esc(desc)}</span>${code===selectedCode?'<span class="selected-mark">✓</span>':''}</button>`}).join('');document.querySelectorAll('[data-code]').forEach(b=>b.onclick=()=>{selectedCode=b.dataset.code;appliedCoupon=null;$('buyer-coupon-code').value='';$('buyer-coupon-status').textContent='';$('buyer-price-breakdown').classList.add('hidden');renderPrices();$('payPanel').classList.add('hidden')})}
+ async function load(){try{const d=await api('/api/payments/options');plans=d.plans||[];products=d.products||[];renderPrices();const h=d.history||[];$('history').innerHTML=h.length?h.map(x=>`<div class="history-item"><b>Request #${esc(x.id)} · ${esc(x.product_name)}</b><br>₹${esc(x.amount_inr)} · Ref ${esc(x.transaction_ref)}${x.group_chat_id?`<br>Group ID: ${esc(x.group_chat_id)}`:''}<br><span class="status-${esc(x.status)}">${esc(String(x.status).toUpperCase())}</span> · ${esc(new Date(x.submitted_at).toLocaleString())}</div>`).join(''):'No payment requests yet.'}catch(e){message(e.message);$('history').textContent='Could not load payment history.'}}
  document.querySelectorAll('[data-category]').forEach(b=>b.onclick=()=>{category=b.dataset.category;document.querySelectorAll('[data-category]').forEach(x=>x.classList.toggle('active',x===b));$('payPanel').classList.add('hidden');renderPrices()});
- $('showPay').onclick=()=>{const item=current();if(!item)return message('No product is available in this category yet.');if(category==='group'&&!$('groupId').value.trim())return message('Enter the target group ID. Run /groupid inside your Telegram group to get it.');$('amount').textContent='₹'+(item.amount_inr??item.price);$('payProduct').textContent=(item.product_name||item.name)+' · '+(item.duration_label||(Number(item.duration_days)===0?'Lifetime access':`${item.duration_days} days`));$('payPanel').classList.remove('hidden');$('payPanel').scrollIntoView({behavior:'smooth',block:'start'})};$('refresh').onclick=load;
- $('submit').onclick=async()=>{const file=$('proof').files[0],ref=$('ref').value.trim(),item=current();if(!item)return message('Choose a product first.');if(category==='group'&&!$('groupId').value.trim())return message('Enter the target group ID first.');if(!file)return message('Please upload the payment screenshot.');if(file.size>650*1024)return message('Screenshot must be 650 KB or smaller.');if(!ref)return message('Enter the UPI transaction/reference ID.');$('submit').disabled=true;try{const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(file)});const payload={product_code:item.product_code,transaction_ref:ref,screenshot_data:data};if(category==='group')payload.group_chat_id=$('groupId').value.trim();const d=await api('/api/payments','POST',payload);message(`Request #${d.request_id} submitted for ${d.product_name}. Access remains pending until admin approval.`);$('ref').value='';$('proof').value='';$('payPanel').classList.add('hidden');await load()}catch(e){message(e.message)}finally{$('submit').disabled=false}};
+ let appliedCoupon=null;
+ $('buyer-coupon-apply')?.addEventListener('click',async()=>{const code=$('buyer-coupon-code').value.trim().toUpperCase(),item=current();if(!code){appliedCoupon=null;$('buyer-coupon-status').textContent='Enter a coupon code first.';return}if(!item){$('buyer-coupon-status').textContent='Choose a pass first.';return}$('buyer-coupon-apply').disabled=true;$('buyer-coupon-status').textContent='Validating coupon…';try{const d=await api('/api/payments/coupon/validate','POST',{coupon_code:code,product_code:item.product_code,duration_days:item.duration_days});appliedCoupon=d;$('buyer-coupon-status').textContent=`✓ ${d.coupon_code} applied — save ₹${d.discount_amount}.`;$('buyer-price-breakdown').classList.remove('hidden');$('buyer-price-breakdown').textContent=`Price ₹${d.base_amount} − discount ₹${d.discount_amount} = payable ₹${d.final_amount}. Pay exactly ₹${d.final_amount}.`;$('amount').textContent='₹'+d.final_amount;}catch(err){appliedCoupon=null;$('buyer-coupon-status').textContent=err.message;$('buyer-price-breakdown').classList.add('hidden');}finally{$('buyer-coupon-apply').disabled=false}});
+ $('showPay').onclick=()=>{appliedCoupon=null;$('buyer-coupon-code').value='';$('buyer-coupon-status').textContent='';$('buyer-price-breakdown').classList.add('hidden');const item=current();if(!item)return message('No product is available in this category yet.');if(category==='group'&&!$('groupId').value.trim())return message('Enter the target group ID. Run /groupid inside your Telegram group to get it.');$('amount').textContent='₹'+(item.amount_inr??item.price);$('payProduct').textContent=(item.product_name||item.name)+' · '+(item.duration_label||(Number(item.duration_days)===0?'Lifetime access':`${item.duration_days} days`));$('payPanel').classList.remove('hidden');$('payPanel').scrollIntoView({behavior:'smooth',block:'start'})};$('refresh').onclick=load;
+ $('submit').onclick=async()=>{const file=$('proof').files[0],ref=$('ref').value.trim(),item=current(),couponText=$('buyer-coupon-code')?.value.trim().toUpperCase()||'';if(!item)return message('Choose a product first.');if(couponText&&(!appliedCoupon||appliedCoupon.coupon_code!==couponText||Number(appliedCoupon.base_amount)!==Number(item.amount_inr??item.price)))return message('Apply and validate your coupon first. Pay exactly the discounted amount shown.');if(category==='group'&&!$('groupId').value.trim())return message('Enter the target group ID first.');if(!file)return message('Please upload the payment screenshot.');if(file.size>650*1024)return message('Screenshot must be 650 KB or smaller.');if(!ref)return message('Enter the UPI transaction/reference ID.');$('submit').disabled=true;try{const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(file)});const payload={product_code:item.product_code,transaction_ref:ref,screenshot_data:data};if(category==='group')payload.group_chat_id=$('groupId').value.trim();payload.coupon_code=$('buyer-coupon-code')?.value.trim().toUpperCase()||'';const d=await api('/api/payments/submit','POST',payload);message(`Request #${d.request_id} submitted for ${d.product_name}. Base ₹${d.base_amount??d.amount}, discount ₹${d.discount_amount||0}, payable ₹${d.amount}. Access remains pending until admin approval.`);$('ref').value='';$('proof').value='';$('payPanel').classList.add('hidden');await load()}catch(e){message(e.message)}finally{$('submit').disabled=false}};
  window.BPSC_NEXUS_BUY_PASS_REFRESH=load;
  load();
 })();
