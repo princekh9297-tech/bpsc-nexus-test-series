@@ -269,17 +269,11 @@ def _option_map(value: Any, row: dict) -> dict[str, str]:
         for k, v in value.items():
             key = str(k).strip().upper().replace("OPTION_", "")
             key = key[-1:] if key else ""
-            if isinstance(v, dict):
-                en = _get(v, "en", "english", "text", "value", default="")
-                hi = _get(v, "hi", "hindi", default="")
-                v = str(en or "") + ((" / " + str(hi)) if hi else "")
             if key in LETTERS and _norm(v): options[key] = _norm(v)
     elif isinstance(value, list):
         for i, v in enumerate(value[:5]):
             if isinstance(v, dict):
-                en = _get(v, "en", "english", "text", "value", "option", default="")
-                hi = _get(v, "hi", "hindi", default="")
-                val = str(en or "") + ((" / " + str(hi)) if hi else "")
+                val = _get(v, "text", "value", "option", default="")
                 key = str(_get(v, "key", "label", "letter", default=LETTERS[i])).upper()[:1]
             else:
                 val = v
@@ -771,62 +765,6 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
     return {"batch_id":batch_id,"detected":len(records)+invalid_count,"imported":imported,"duplicates":duplicates,"invalid":invalid_count,"pending":sum(1 for r in records if r["status"]=="pending")}
 
 
-def _manual_prompt(flow):
-    step=flow.get("step",""); m=flow.get("manual",{})
-    labels={"manual_question_en":"Enter the question in English.","manual_question_hi":"Enter the Hindi translation of the question.",
-            "manual_structure":"Enter the question structure in the requested format.","manual_explanation_en":"Enter the explanation in English.",
-            "manual_explanation_hi":"Enter the Hindi explanation."}
-    if step.startswith("manual_option_en_"):
-        letter=step.rsplit("_",1)[1]; return f"Enter option {letter} in English."
-    if step.startswith("manual_option_hi_"):
-        letter=step.rsplit("_",1)[1]; return f"Enter the Hindi translation of option {letter}."
-    if step=="manual_correct": return "Select the correct option."
-    if step=="manual_structure":
-        qtype=m.get("question_type")
-        if qtype=="statement_based": return "Enter each statement on a separate line as English / हिन्दी. At least two statements are required."
-        if qtype=="match_following": return "Enter both lists using this format (each item bilingual as English / हिन्दी):\nList I:\nItem one / हिन्दी अनुवाद\nItem two / हिन्दी अनुवाद\nList II:\nMatch one / हिन्दी अनुवाद\nMatch two / हिन्दी अनुवाद"
-        if qtype=="assertion_reason": return "Enter both parts in English and Hindi using this format:\nAssertion: English / हिन्दी\nReason: English / हिन्दी"
-    if step=="manual_preview": return "Review the complete question before saving."
-    return labels.get(step,"Continue question entry.")
-
-
-def _manual_keyboard(flow):
-    rows=[]
-    step=flow.get("step","")
-    if step=="manual_correct":
-        count=int(flow.get("manual",{}).get("option_count",4))
-        rows.append([InlineKeyboardButton(x,callback_data=f"qb:manualcorrect:{x}") for x in LETTERS[:count]])
-    if flow.get("history"):
-        rows.append([InlineKeyboardButton("← Edit previous field",callback_data="qb:manualback")])
-    rows.append([InlineKeyboardButton("Cancel question",callback_data="qb:manualcancel")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _manual_preview_text(record):
-    lines=["BPSC NEXUS · QUESTION PREVIEW",f"Type: {record['question_type']}",f"Subject: {record['subject']}","",record['question_en'],record['question_hi'] or ""]
-    structure=record.get("question_structure") or {}
-    if record["question_type"]=="statement_based":
-        lines.append("STATEMENTS")
-        lines.extend(f"{i}. {x}" for i,x in enumerate(structure.get("statements",[]),1))
-    elif record["question_type"]=="match_following":
-        lines.extend(["LIST I: "+" | ".join(structure.get("list_i",[])),"LIST II: "+" | ".join(structure.get("list_ii",[]))])
-    elif record["question_type"]=="assertion_reason":
-        lines.extend(["ASSERTION: "+str(structure.get("assertion","")),"REASON: "+str(structure.get("reason",""))])
-    lines.append("OPTIONS")
-    lines.extend(f"{k}. {v}" for k,v in record["options"].items())
-    lines.extend([f"Correct answer: {record['correct_option']}","", "EXPLANATION (ENGLISH)",record["explanation_en"],"", "व्याख्या (हिन्दी)",record["explanation_hi"]])
-    return "\n".join(x for x in lines if x is not None)
-
-
-def _manual_record(flow, owner_id):
-    m=flow["manual"]
-    opts={letter: f"{m['options_en'][letter]} / {m['options_hi'][letter]}" for letter in LETTERS[:int(m['option_count'])]}
-    raw={"question_en":m["question_en"],"question_hi":m["question_hi"],"question_type":m["question_type"],
-         "question_structure":m.get("question_structure",{}),"options":opts,"correct_option":m["correct_option"],
-         "explanation_en":m["explanation_en"],"explanation_hi":m["explanation_hi"],"subject":flow["subject"]}
-    return _normalize_record(raw,flow["subject"],"Manual admin entry",owner_id)
-
-
 def admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add One Question", callback_data="qb:addone"), InlineKeyboardButton("📥 Bulk Import File", callback_data="qb:import")],
@@ -837,6 +775,7 @@ def admin_keyboard():
         [InlineKeyboardButton("🧹 Bulk Delete by IDs", callback_data="qb:bulkdelete"), InlineKeyboardButton("📦 Import History / Undo", callback_data="qb:history")],
         [InlineKeyboardButton("🗂 Manage Test Series", callback_data="qb:manage")],
         [InlineKeyboardButton("🕵️ Verify Pending", callback_data="qb:pending"), InlineKeyboardButton("🧪 Quality Audit", callback_data="qb:audit")],
+        [InlineKeyboardButton("☢️ Reset Question Bank", callback_data="qb:reset")],
         [InlineKeyboardButton("↩ Main Admin Panel", callback_data="adm:home")],
     ])
 
@@ -859,6 +798,79 @@ def _admin(update: Update) -> bool:
     u=update.effective_user; c=update.effective_chat
     # IDs are also checked by caller in bot.py before routing callbacks/messages.
     return bool(u and c and c.type == ChatType.PRIVATE)
+
+
+RESET_TABLES = (
+    # (table, label) -- only tables that exist are counted/cleared.
+    ("question_bank", "questions"),
+    ("bank_quizzes", "quizzes / test series"),
+    ("bank_quiz_attempts", "personal attempts"),
+    ("group_quiz_sessions", "group quiz sessions"),
+    ("bpsc_global_leaderboard_attempts", "leaderboard entries"),
+)
+# Tables wiped together with the above. CASCADE also clears anything that points at them.
+RESET_TRUNCATE = (
+    "bank_quiz_attempt_question_snapshots", "bank_quiz_attempt_answers", "bank_quiz_attempts",
+    "bank_quiz_questions", "bank_quizzes", "question_bank", "question_import_batches",
+    "group_quiz_admin_reports", "group_quiz_answers", "group_quiz_session_questions", "group_quiz_sessions",
+    "bpsc_leaderboard_audit", "bpsc_leaderboard_daily_challenges", "bpsc_leaderboard_period_totals",
+    "bpsc_global_leaderboard_attempts",
+    # Leftovers from the removed Mini App / old test series (unused by the bot now).
+    "bpsc_nexus_test_series_tests", "bpsc_nexus_test_series_entitlements", "bpsc_nexus_test_series",
+    "bpsc_nexus_live_quiz_participants", "bpsc_nexus_live_quiz_sessions", "bpsc_nexus_revision_items",
+    "attempt_answers", "attempts", "test_questions", "tests", "questions",
+)
+RESET_CONFIRM_WORD = "RESET"
+
+
+async def _existing_tables(conn, names):
+    found = []
+    for name in names:
+        cur = await conn.execute("SELECT to_regclass(%s) AS t", (name,))
+        row = await cur.fetchone()
+        if row and row["t"]:
+            found.append(name)
+    return found
+
+
+async def reset_counts(pool) -> list[tuple[str, int]]:
+    out = []
+    async with pool.connection() as conn:
+        present = set(await _existing_tables(conn, [t for t, _ in RESET_TABLES]))
+        for table, label in RESET_TABLES:
+            if table in present:
+                cur = await conn.execute(f"SELECT COUNT(*) AS n FROM {table}")  # table names come from the constant above
+                out.append((label, int((await cur.fetchone())["n"])))
+    return out
+
+
+async def reset_question_bank(pool) -> int:
+    """Permanently empty the question bank, quizzes, attempts, group quiz history and leaderboard.
+
+    Kept: users, subjects/collections, group names/branding, Nexus Intel news.
+    One transaction: either everything is cleared or nothing is.
+    """
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            tables = await _existing_tables(conn, RESET_TRUNCATE)
+            if tables:
+                await conn.execute("TRUNCATE TABLE " + ", ".join(tables) + " RESTART IDENTITY CASCADE")
+    return len(tables)
+
+
+async def show_reset_prompt(q, context, pool):
+    counts = await reset_counts(pool)
+    lines = ["☢️ RESET QUESTION BANK", "", "This will PERMANENTLY delete:"]
+    lines += [f"• {n:,} {label}" for label, n in counts] or ["• (nothing found)"]
+    lines += [
+        "",
+        "Kept: users, subjects, group names/branding, Nexus Intel news.",
+        "This cannot be undone. There is no backup.",
+        "",
+        f"To continue, type {RESET_CONFIRM_WORD} (capital letters) in this chat. Anything else cancels.",
+    ]
+    context.user_data["qb_flow"] = {"step": "reset_confirm"}
+    await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data="qb:home")]]))
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, pool, is_authorized: bool):
@@ -885,60 +897,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
         context.user_data["qb_flow"]={"step":"create_collection" if create_type == "collection" else "create_subject", "subject_type": create_type}
         heading = "Question Collection" if create_type == "collection" else "Subject"
         await q.edit_message_text(f"➕ Create {heading}\n\nSend the exact {heading.lower()} name. Imports will be grouped under this single name; embedded set labels become topics inside a collection and will never create new subjects automatically.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
+    if data == "qb:reset":
+        await show_reset_prompt(q,context,pool); return
     if data == "qb:addone":
         if not SUBJECTS:
             await q.edit_message_text("Create a subject first, then add questions to it.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Create Subject", callback_data="qb:newsubject")],[InlineKeyboardButton("Back", callback_data="qb:home")]])); return
         context.user_data["qb_flow"]={"step":"add_question_subject"}
         await q.edit_message_text(f"➕ Add a question\n\nChoose its subject first · {len(SUBJECTS)} subjects",reply_markup=subject_keyboard("qb:addsubject")); return
     if data.startswith("qb:addsubject:"):
-        idx=int(data.rsplit(":",1)[1]); context.user_data["qb_flow"]={"step":"manual_type","subject":SUBJECTS[idx],"history":[]}
-        await q.edit_message_text(f"➕ Guided question entry\nSubject: {SUBJECTS[idx]}\n\nChoose the question format:",reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Standard MCQ",callback_data="qb:manualtype:standard")],
-            [InlineKeyboardButton("Statement-based",callback_data="qb:manualtype:statement_based")],
-            [InlineKeyboardButton("Matching",callback_data="qb:manualtype:match_following")],
-            [InlineKeyboardButton("Assertion–Reason",callback_data="qb:manualtype:assertion_reason")],
-            [InlineKeyboardButton("Cancel",callback_data="qb:manualcancel")]])); return
-    if data.startswith("qb:manualtype:"):
-        flow=context.user_data.get("qb_flow",{}); qtype=data.rsplit(":",1)[1]
-        if qtype not in {"standard","statement_based","match_following","assertion_reason"} or not flow.get("subject"):
-            return
-        flow["manual"]={"question_type":qtype,"options_en":{},"options_hi":{}}
-        flow["step"]="manual_question_en"; flow["history"]=[]; context.user_data["qb_flow"]=flow
-        await q.edit_message_text(_manual_prompt(flow),reply_markup=_manual_keyboard(flow)); return
-    if data.startswith("qb:manualcount:"):
-        flow=context.user_data.get("qb_flow",{}); count=int(data.rsplit(":",1)[1])
-        if count not in (4,5) or not flow.get("manual"):
-            return
-        flow["manual"]["option_count"]=count; flow["step"]="manual_option_en_A"; context.user_data["qb_flow"]=flow
-        await q.edit_message_text(_manual_prompt(flow),reply_markup=_manual_keyboard(flow)); return
-    if data.startswith("qb:manualcorrect:"):
-        flow=context.user_data.get("qb_flow",{}); letter=data.rsplit(":",1)[1]; m=flow.get("manual",{})
-        if letter not in LETTERS[:int(m.get("option_count",4))]: return
-        flow.setdefault("history",[]).append(flow.get("step")); m["correct_option"]=letter; flow["step"]="manual_explanation_en"; context.user_data["qb_flow"]=flow
-        await q.edit_message_text(_manual_prompt(flow),reply_markup=_manual_keyboard(flow)); return
-    if data=="qb:manualback":
-        flow=context.user_data.get("qb_flow",{})
-        if not flow.get("history"): return
-        flow["step"]=flow["history"].pop(); context.user_data["qb_flow"]=flow
-        await q.edit_message_text(_manual_prompt(flow),reply_markup=_manual_keyboard(flow)); return
-    if data=="qb:manualcancel":
-        context.user_data.pop("qb_flow",None); context.user_data.pop("qb_manual_preview",None)
-        await q.edit_message_text("Question entry cancelled. No question was saved.",reply_markup=admin_keyboard()); return
-    if data in ("qb:manualsave","qb:manualsaveforce"):
-        preview=context.user_data.get("qb_manual_preview")
-        if not preview: return
-        record=preview["record"]
-        if data=="qb:manualsaveforce":
-            record["question_hash"]=hashlib.sha256((record["question_hash"]+str(datetime.now(timezone.utc).timestamp())).encode()).hexdigest()
-        async with pool.connection() as conn:
-            cur=await conn.execute("INSERT INTO question_bank(question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status,question_hash,created_by_telegram_id) VALUES(%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                (record["question_en"],record["question_hi"],record["question_type"],json.dumps(record["question_structure"],ensure_ascii=False),json.dumps(record["question_flags"],ensure_ascii=False),json.dumps(record["options"],ensure_ascii=False),record["correct_option"],record["explanation_en"],record["explanation_hi"],record["subject"],record["topic"],record["source"],record["source_url"],record["attribution"],record["status"],record["question_hash"],update.effective_user.id))
-            saved=await cur.fetchone()
-        context.user_data.pop("qb_flow",None); context.user_data.pop("qb_manual_preview",None)
-        await q.edit_message_text(f"✅ Question #{saved['id']} saved successfully.\n\nStatus: {record['status']}\nBoth language versions and explanations are stored.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Add another question",callback_data="qb:addone")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
-    if data=="qb:manualdiscard":
-        context.user_data.pop("qb_flow",None); context.user_data.pop("qb_manual_preview",None)
-        await q.edit_message_text("Question discarded. No database changes were made.",reply_markup=admin_keyboard()); return
+        idx=int(data.rsplit(":",1)[1]); context.user_data["qb_flow"]={"step":"add_question_text","subject":SUBJECTS[idx]}
+        await q.edit_message_text("Send the MCQ in one message using this format:\n\nQuestion text\nA. Option A\nB. Option B\nC. Option C\nD. Option D\nAnswer: B\nExplanation: Explanation text\n\nHindi text may be included too. The question is previewed before saving.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel",callback_data="qb:home")]])); return
     if data == "qb:deletehub":
         await q.edit_message_text("🗑 Question deletion\n\nChoose a group to browse. Open a question to edit, archive, or permanently delete it. Permanent deletion can also remove its links from quizzes.",reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("All questions",callback_data="qb:liststatus:all:0")],
@@ -1612,72 +1580,18 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not msg or not msg.text or not user or not is_authorized: return False
     flow=context.user_data.get("qb_flow",{})
     step=flow.get("step")
-    if step and step.startswith("manual_") and step not in {"manual_type","manual_correct","manual_preview","manual_option_count"}:
-        m=flow.setdefault("manual",{}); value=_norm(msg.text)
-        if not value:
-            await msg.reply_text("This field cannot be empty. Send the text again.",reply_markup=_manual_keyboard(flow)); return True
-        current=step
-        if current=="manual_question_en":
-            m["question_en"]=value; nxt="manual_question_hi"
-        elif current=="manual_question_hi":
-            m["question_hi"]=value
-            if m.get("question_type")=="standard":
-                flow.setdefault("history",[]).append(current); flow["step"]="manual_option_count"
-                context.user_data["qb_flow"]=flow
-                await msg.reply_text("How many options?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("4 options",callback_data="qb:manualcount:4"),InlineKeyboardButton("5 options",callback_data="qb:manualcount:5")],[InlineKeyboardButton("← Edit previous field",callback_data="qb:manualback")],[InlineKeyboardButton("Cancel",callback_data="qb:manualcancel")]])); return True
-            nxt="manual_structure"
-        elif current=="manual_structure":
-            qtype=m.get("question_type")
-            if qtype=="statement_based":
-                statements=_as_text_list(value)
-                if len(statements)<2:
-                    await msg.reply_text("Enter at least two statements, one per line.",reply_markup=_manual_keyboard(flow)); return True
-                m["question_structure"]={"statements":statements}
-            elif qtype=="match_following":
-                match1=re.search(r"list\s*i\s*:?\s*(.*?)(?=list\s*ii\s*:?)",value,re.I|re.S)
-                match2=re.search(r"list\s*ii\s*:?\s*(.*)$",value,re.I|re.S)
-                if not match1 or not match2:
-                    await msg.reply_text("Use this format:\\nList I:\\n1. Item one\\n2. Item two\\nList II:\\nA. Match one\\nB. Match two",reply_markup=_manual_keyboard(flow)); return True
-                left=_as_text_list(match1.group(1)); right=_as_text_list(match2.group(1))
-                if len(left)<2 or len(left)!=len(right):
-                    await msg.reply_text("Both lists must contain the same number of at least two items.",reply_markup=_manual_keyboard(flow)); return True
-                m["question_structure"]={"list_i":left,"list_ii":right}
-            elif qtype=="assertion_reason":
-                ma=re.search(r"assertion\s*:?\s*(.*?)(?=reason\s*:?)",value,re.I|re.S); mr=re.search(r"reason\s*:?\s*(.*)$",value,re.I|re.S)
-                if not ma or not mr or not ma.group(1).strip() or not mr.group(1).strip():
-                    await msg.reply_text("Use this format:\\nAssertion: ...\\nReason: ...",reply_markup=_manual_keyboard(flow)); return True
-                m["question_structure"]={"assertion":ma.group(1).strip(),"reason":mr.group(1).strip()}
-            nxt="manual_option_count"
-        elif current.startswith("manual_option_en_"):
-            letter=current.rsplit("_",1)[1]; m.setdefault("options_en",{})[letter]=value; nxt=f"manual_option_hi_{letter}"
-        elif current.startswith("manual_option_hi_"):
-            letter=current.rsplit("_",1)[1]; m.setdefault("options_hi",{})[letter]=value
-            idx=LETTERS.index(letter); count=int(m.get("option_count",4))
-            nxt=f"manual_option_en_{LETTERS[idx+1]}" if idx+1<count else "manual_correct"
-        elif current=="manual_explanation_en":
-            m["explanation_en"]=value; nxt="manual_explanation_hi"
-        elif current=="manual_explanation_hi":
-            m["explanation_hi"]=value; nxt="manual_preview"
-        else:
-            await msg.reply_text("Entry state is invalid. Cancel and restart this question.",reply_markup=_manual_keyboard(flow)); return True
-        flow.setdefault("history",[]).append(current); flow["step"]=nxt; context.user_data["qb_flow"]=flow
-        if nxt=="manual_option_count":
-            await msg.reply_text("How many options?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("4 options",callback_data="qb:manualcount:4"),InlineKeyboardButton("5 options",callback_data="qb:manualcount:5")],[InlineKeyboardButton("← Edit previous field",callback_data="qb:manualback")],[InlineKeyboardButton("Cancel",callback_data="qb:manualcancel")]])); return True
-        if nxt=="manual_correct":
-            await msg.reply_text(_manual_prompt(flow),reply_markup=_manual_keyboard(flow)); return True
-        if nxt=="manual_preview":
-            record=_manual_record(flow,user.id)
-            if not record:
-                await msg.reply_text("Question validation failed. Use Edit previous field to correct the entry.",reply_markup=_manual_keyboard(flow)); return True
-            context.user_data["qb_manual_preview"]={"record":record}
-            async with pool.connection() as conn:
-                cur=await conn.execute("SELECT id FROM question_bank WHERE question_hash=%s LIMIT 1",(record["question_hash"],)); duplicate=await cur.fetchone()
-            buttons=[[InlineKeyboardButton("Save question",callback_data="qb:manualsave")],[InlineKeyboardButton("Edit previous field",callback_data="qb:manualback")],[InlineKeyboardButton("Discard",callback_data="qb:manualdiscard")]]
-            if duplicate:
-                buttons[0]=[InlineKeyboardButton("Save anyway (duplicate)",callback_data="qb:manualsaveforce")]
-                await msg.reply_text(f"⚠️ Possible duplicate detected: existing question #{duplicate['id']}.\\nReview carefully. You may save anyway or discard.\\n\\n"+_manual_preview_text(record)[:3500],reply_markup=InlineKeyboardMarkup(buttons)); return True
-            await msg.reply_text(_manual_preview_text(record)[:3500],reply_markup=InlineKeyboardMarkup(buttons)); return True
-        await msg.reply_text(_manual_prompt(flow),reply_markup=_manual_keyboard(flow)); return True
+    if step == "reset_confirm":
+        context.user_data.pop("qb_flow",None)
+        if msg.text.strip() != RESET_CONFIRM_WORD:
+            await msg.reply_text("Reset cancelled. Nothing was deleted.",reply_markup=admin_keyboard()); return True
+        try:
+            n=await reset_question_bank(pool)
+        except Exception:
+            log.exception("Question bank reset failed")
+            await msg.reply_text("❌ Reset failed and was rolled back. Nothing was deleted. Check the server log.",reply_markup=admin_keyboard()); return True
+        for k in ("qb_import_preview","qb_forward_preview","qb_attempt","qb_bulk_merge_target"): context.user_data.pop(k,None)
+        log.warning("Question bank reset by admin %s (%s tables cleared)",user.id,n)
+        await msg.reply_text(f"✅ Question bank reset. {n} tables cleared.\n\nYou can now add questions from scratch.",reply_markup=admin_keyboard()); return True
     if step == "bulk_merge_subjects":
         target=flow.get("target") or context.user_data.get("qb_bulk_merge_target")
         names=[_norm(x) for x in re.split(r"[,\n;]+",msg.text) if _norm(x)]
@@ -1897,21 +1811,6 @@ async def publish_quiz(q,context,pool,quiz_id):
         if not quiz or quiz["created_by_telegram_id"]!=q.from_user.id or quiz["is_published"]:
             await q.edit_message_text("Draft not found, not owned by you, or already published.",reply_markup=admin_keyboard()); return
         cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_questions WHERE quiz_id=%s",(quiz_id,)); n=(await cur.fetchone())["n"]
-        cur=await conn.execute("""SELECT
-            COUNT(*) FILTER (WHERE qb.question_hi IS NULL OR BTRIM(qb.question_hi)='') AS no_question_hi,
-            COUNT(*) FILTER (WHERE qb.explanation_en IS NULL OR BTRIM(qb.explanation_en)='') AS no_explanation_en,
-            COUNT(*) FILTER (WHERE qb.explanation_hi IS NULL OR BTRIM(qb.explanation_hi)='') AS no_explanation_hi,
-            COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM jsonb_each_text(qb.options) o WHERE POSITION(' / ' IN o.value)=0)) AS options_not_bilingual
-            FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id WHERE qq.quiz_id=%s""",(quiz_id,))
-        checks=await cur.fetchone()
-        issues=[]
-        if int(checks["no_question_hi"] or 0): issues.append(f"Hindi question missing: {checks['no_question_hi']}")
-        if int(checks["options_not_bilingual"] or 0): issues.append(f"Options without Hindi translation: {checks['options_not_bilingual']}")
-        if int(checks["no_explanation_en"] or 0): issues.append(f"English explanation missing: {checks['no_explanation_en']}")
-        if int(checks["no_explanation_hi"] or 0): issues.append(f"Hindi explanation missing: {checks['no_explanation_hi']}")
-        if not n: issues.append("The test has no questions.")
-        if issues:
-            await q.edit_message_text("⚠️ This test cannot be published yet. Complete the bilingual requirements for every question:\n\n"+"\n".join("• "+x for x in issues),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage questions",callback_data=f"qb:manageview:{quiz_id}")],[InlineKeyboardButton("Back to Question Bank",callback_data="qb:home")]])); return
         await conn.execute("UPDATE bank_quizzes SET is_published=TRUE,published_at=NOW() WHERE id=%s",(quiz_id,))
     username=getattr(context.bot,"username",None)
     share=f"https://t.me/{username}?start=quiz_{quiz_id}" if username else "Open /quiz in a private chat with the bot."
@@ -1920,7 +1819,7 @@ async def publish_quiz(q,context,pool,quiz_id):
 
 async def show_student_quizzes(q,pool):
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title,subject,(SELECT COUNT(*) FROM bank_quiz_questions bqq WHERE bqq.quiz_id=bq.id) AS n FROM bank_quizzes bq WHERE is_published=TRUE  ORDER BY id DESC LIMIT 20"); rows=await cur.fetchall()
+        cur=await conn.execute("SELECT id,title,subject,(SELECT COUNT(*) FROM bank_quiz_questions bqq WHERE bqq.quiz_id=bq.id) AS n FROM bank_quizzes bq WHERE is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s) ORDER BY id DESC LIMIT 20", (q.from_user.id,)); rows=await cur.fetchall()
     if not rows:
         await q.edit_message_text("No quizzes are published yet."); return
     lines=["📚 Available quizzes",""]; buttons=[]
@@ -1932,179 +1831,65 @@ async def show_student_quizzes(q,pool):
 
 async def choose_mode(q,context,pool,quiz_id):
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE",(quiz_id,)); quiz=await cur.fetchone()
+        cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,q.from_user.id)); quiz=await cur.fetchone()
     if not quiz: await q.edit_message_text("Quiz not found or not published."); return
-    await q.edit_message_text(f"{quiz['title']}\n\nChoose a mode:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Practice (instant explanation)",callback_data=f"play:mode:practice:{quiz_id}")],[InlineKeyboardButton("⏱ Exam (answer key at finish)",callback_data=f"play:mode:exam:{quiz_id}")],[InlineKeyboardButton("Back to quizzes",callback_data="play:list")]]))
+    await q.edit_message_text(f"{quiz['title']}\n\nChoose a mode:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Practice (instant explanation)",callback_data=f"play:mode:practice:{quiz_id}")],[InlineKeyboardButton("⏱ Exam (results after submission)",callback_data=f"play:mode:exam:{quiz_id}")],[InlineKeyboardButton("Back to quizzes",callback_data="play:list")]]))
 
 
 async def start_attempt(q,context,pool,quiz_id,mode):
     if mode not in ("practice","exam"): return
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks FROM bank_quizzes WHERE id=%s AND is_published=TRUE",(quiz_id,)); quiz=await cur.fetchone()
+        cur=await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,q.from_user.id)); quiz=await cur.fetchone()
         if not quiz: await q.edit_message_text("Quiz unavailable."); return
-        cur=await conn.execute("SELECT qb.id,qb.question_en,qb.question_hi,qb.question_type,qb.question_structure,qb.options,qb.correct_option,qb.explanation_en,qb.explanation_hi FROM bank_quiz_questions bqq JOIN question_bank qb ON qb.id=bqq.question_id WHERE bqq.quiz_id=%s ORDER BY bqq.position",(quiz_id,)); questions=await cur.fetchall()
+        cur=await conn.execute("SELECT qb.id,qb.question_en,qb.question_hi,qb.options,qb.correct_option,qb.explanation_en,qb.explanation_hi FROM bank_quiz_questions bqq JOIN question_bank qb ON qb.id=bqq.question_id WHERE bqq.quiz_id=%s ORDER BY bqq.position",(quiz_id,)); questions=await cur.fetchall()
+        cur=await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions) VALUES(%s,%s,%s,%s) RETURNING id",(quiz_id,q.from_user.id,mode,len(questions))); attempt_id=(await cur.fetchone())["id"]
     if not questions: await q.edit_message_text("This quiz has no available questions."); return
-    await q.edit_message_text("Quiz started. Each question will appear as a new message below.")
-    prepared=[]
-    question_rows=[dict(row) for row in questions]
-    random.shuffle(question_rows)
-    for row in question_rows:
-        raw_options=row["options"] if isinstance(row["options"],dict) else json.loads(row["options"] or "{}")
-        pairs=[(str(k),str(v)) for k,v in raw_options.items() if str(v).strip()]
-        random.shuffle(pairs)
-        remapped={}
-        new_correct=None
-        for idx,(old_letter,value) in enumerate(pairs):
-            new_letter=LETTERS[idx]
-            remapped[new_letter]=value
-            if old_letter == row["correct_option"]:
-                new_correct=new_letter
-        row["options"]=remapped
-        row["correct_option"]=new_correct or row["correct_option"]
-        prepared.append(row)
-    async with pool.connection() as conn:
-        cur=await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions) VALUES(%s,%s,%s,%s) RETURNING id",(quiz_id,q.from_user.id,mode,len(prepared))); attempt_id=(await cur.fetchone())["id"]
-    context.user_data["qb_attempt"]={"attempt_id":attempt_id,"quiz":quiz,"questions":prepared,"index":0,"answers":{},"mode":mode,"started":datetime.now(timezone.utc).isoformat()}
+    context.user_data["qb_attempt"]={"attempt_id":attempt_id,"quiz":quiz,"questions":[dict(x) for x in questions],"index":0,"answers":{},"mode":mode,"started":datetime.now(timezone.utc).isoformat()}
     if mode == "exam":
         context.application.create_task(_exam_timeout(context.application, q.from_user.id, q.message.chat_id, attempt_id, pool, int(quiz["duration_minutes"])))
     await send_current_question(q,context)
 
 
-def _question_layout_text(r):
-    """Render the four supported exam layouts without repeating structural text in the stem."""
-    stem = str(r.get("question_en") or "")
-    stem_hi = str(r.get("question_hi") or "")
-    qtype = str(r.get("question_type") or "standard")
-    structure = r.get("question_structure") or {}
-    if isinstance(structure, str):
-        try: structure = json.loads(structure)
-        except Exception: structure = {}
-    structure = structure if isinstance(structure, dict) else {}
-    structured=[]
-    if qtype=="statement_based": structured=structure.get("statements") or []
-    elif qtype=="match_following": structured=(structure.get("list_i") or [])+(structure.get("list_ii") or [])
-    for item in structured:
-        if isinstance(item,dict): item=item.get("en") or item.get("text") or ""
-        item=str(item).strip()
-        if item: stem=re.sub(r"(?im)^\s*(?:\(?[0-9ivx]+[.)]?)?\s*"+re.escape(item)+r"\s*$", "", stem)
-    chunks = [stem.strip()]
-    if stem_hi: chunks.append(stem_hi)
-    if qtype == "statement_based":
-        statements = structure.get("statements") or []
-        if statements:
-            chunks.append("\nSTATEMENTS")
-            for i, item in enumerate(statements, 1):
-                if isinstance(item, dict): item = str(item.get("en") or item.get("text") or "")+((" / "+str(item.get("hi"))) if item.get("hi") else "")
-                chunks.append(f"┌────────────────────\n│ Statement {i}\n│ {item}\n└────────────────────")
-    elif qtype == "match_following":
-        left = structure.get("list_i") or []
-        right = structure.get("list_ii") or []
-        if left or right:
-            chunks.append("\nMATCH THE FOLLOWING")
-            chunks.append("LIST I                         LIST II")
-            for i in range(max(len(left), len(right))):
-                a = left[i] if i < len(left) else ""
-                b = right[i] if i < len(right) else ""
-                if isinstance(a,dict): a=str(a.get("en") or a.get("text") or "")+((" / "+str(a.get("hi"))) if a.get("hi") else "")
-                if isinstance(b,dict): b=str(b.get("en") or b.get("text") or "")+((" / "+str(b.get("hi"))) if b.get("hi") else "")
-                a=str(a); b=str(b)
-                chunks.append(f"{i+1}. {a[:38]:<38}  {chr(65+i)}. {b}")
-    elif qtype == "assertion_reason":
-        assertion = structure.get("assertion")
-        reason = structure.get("reason")
-        if assertion: chunks.append(f"\n┌─ ASSERTION (A) ─────────────\n│ {assertion}\n└────────────────────────────")
-        if reason: chunks.append(f"┌─ REASON (R) ────────────────\n│ {reason}\n└────────────────────────────")
-    return "\n".join(chunks)
-
-
 async def send_current_question(q,context):
     a=context.user_data.get("qb_attempt")
-    if not a: return
+    if not a: await q.edit_message_text("No active quiz attempt."); return
     idx=a["index"]
     if idx>=len(a["questions"]):
-        await submit_attempt(q,context,context.application.bot_data["db_pool"])
-        return
-    r=a["questions"][idx]
-    opts=r["options"] if isinstance(r["options"],dict) else json.loads(r["options"])
-    text=(f"BPSC NEXUS  ·  {a['quiz']['title']}\n"
-          f"QUESTION {idx+1} / {len(a['questions'])}  ·  {a['mode'].upper()}\n\n"
-          f"{_question_layout_text(r)}\n\nOPTIONS\n" +
-          "\n".join(f"{k}. {v}" for k,v in opts.items()))
+        await q.edit_message_text("You have reached the end. Submit your answers to see the result.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Submit quiz",callback_data="play:submit")]])); return
+    r=a["questions"][idx]; opts=r["options"] if isinstance(r["options"],dict) else json.loads(r["options"])
+    selected=a["answers"].get(str(r["id"]))
+    text=f"{a['quiz']['title']} · {idx+1}/{len(a['questions'])}\nMode: {a['mode'].title()}" + (f" · {a['quiz']['duration_minutes']} min limit" if a['mode']=='exam' else "") + f"\n\n{r['question_en']}"
+    if r.get("question_hi"): text+="\n"+r["question_hi"]
+    text+="\n\n"+"\n".join(f"{k}. {v}" for k,v in opts.items())
+    if selected: text+=f"\n\nYour answer: {selected}"
+    if a.get("feedback") and a["mode"]=="practice": text+="\n\n"+a["feedback"]
     rows=[]
-    letters=list(opts)
-    for i in range(0,len(letters),2):
-        rows.append([InlineKeyboardButton(f"{k}. {str(opts[k])[:34]}",callback_data=f"play:ans:{idx}:{k}") for k in letters[i:i+2]])
-    rows.append([InlineKeyboardButton("Skip question",callback_data=f"play:skip:{idx}")])
-    rows.append([InlineKeyboardButton("Finish quiz",callback_data="play:submit")])
-    msg=await context.bot.send_message(chat_id=q.message.chat_id,text=text[:3900],reply_markup=InlineKeyboardMarkup(rows))
-    a["current_message_id"]=msg.message_id
+    for i in range(0,len(opts),2): rows.append([InlineKeyboardButton(f"{k}{' ✓' if selected==k else ''}",callback_data=f"play:ans:{k}") for k in list(opts)[i:i+2]])
+    rows.append([InlineKeyboardButton("⏭ Not Attempted",callback_data="play:skip")])
+    if idx>0: rows.append([InlineKeyboardButton("⬅ Previous",callback_data="play:prev"),InlineKeyboardButton("Next ➡",callback_data="play:next")])
+    else: rows.append([InlineKeyboardButton("Next ➡",callback_data="play:next")])
+    rows.append([InlineKeyboardButton("Submit Quiz",callback_data="play:submit")])
+    await q.edit_message_text(text[:3900],reply_markup=InlineKeyboardMarkup(rows))
 
 
-async def _send_practice_feedback(q,context,r,idx,letter):
-    correct = letter == r["correct_option"]
-    opts=r["options"] if isinstance(r["options"],dict) else json.loads(r["options"] or "{}")
-    correct_label=f"{r['correct_option']}. {opts.get(r['correct_option'],'')}"
-    selected_label=f"{letter}. {opts.get(letter,'')}" if letter else "Not attempted"
-    if letter is None:
-        heading=f"⏭ NOT ATTEMPTED · Correct answer: {correct_label}"
-        expanded=True
-    elif correct:
-        heading=f"✅ CORRECT · Your answer: {selected_label}"
-        expanded=False
-    else:
-        heading=f"❌ INCORRECT · Your answer: {selected_label} · Correct: {correct_label}"
-        expanded=True
-    body=f"BPSC NEXUS · ANSWER REVIEW\nQuestion {idx+1}\n\n{heading}"
-    explanation="\n\nEXPLANATION\n"+"\n".join(x for x in (r.get("explanation_en"),r.get("explanation_hi")) if x)
-    if expanded and explanation.strip(): body+=explanation
-    buttons=[]
-    if not expanded and explanation.strip():
-        buttons.append([InlineKeyboardButton("View explanation",callback_data=f"play:explain:{idx}:open")])
-    elif expanded and explanation.strip():
-        buttons.append([InlineKeyboardButton("Hide explanation",callback_data=f"play:explain:{idx}:close")])
-    await context.bot.send_message(chat_id=q.message.chat_id,text=body[:3900],reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
-
-
-async def answer_question(q,context,pool,letter,question_index=None):
+async def answer_question(q,context,pool,letter):
     a=context.user_data.get("qb_attempt")
     if not a: await q.answer("No active quiz.",show_alert=True); return
-    idx=a["index"]
-    if question_index is not None and int(question_index)!=idx:
-        await q.answer("This question is no longer active.",show_alert=True); return
-    if idx>=len(a["questions"]): await q.answer("Quiz already completed.",show_alert=True); return
-    r=a["questions"][idx]
-    opts=r["options"] if isinstance(r["options"],dict) else json.loads(r["options"])
-    if letter is not None and letter not in opts: return
-    if str(r["id"]) in a["answers"]:
-        await q.answer("Your answer is already recorded.",show_alert=True); return
+    r=a["questions"][a["index"]]; opts=r["options"] if isinstance(r["options"],dict) else json.loads(r["options"])
+    if letter is not None and letter not in opts: await q.answer("Invalid option.",show_alert=True); return
     a["answers"][str(r["id"])]=letter
     async with pool.connection() as conn:
         await conn.execute("INSERT INTO bank_quiz_attempt_answers(attempt_id,question_id,selected_option,is_correct) VALUES(%s,%s,%s,%s) ON CONFLICT(attempt_id,question_id) DO UPDATE SET selected_option=EXCLUDED.selected_option,is_correct=EXCLUDED.is_correct",(a["attempt_id"],r["id"],letter,(letter==r["correct_option"]) if letter else None))
-    await q.answer("Answer recorded.")
     if a["mode"]=="practice":
-        await _send_practice_feedback(q,context,r,idx,letter)
-    a["index"] += 1
-    if a["index"] >= len(a["questions"]):
-        await submit_attempt(q,context,pool)
-    else:
-        await send_current_question(q,context)
-
-
-async def toggle_explanation(q,context,index,action):
-    a=context.user_data.get("qb_attempt") or context.user_data.get("qb_last_review")
-    if not a or not 0<=int(index)<len(a["questions"]):
-        await q.answer("This explanation is no longer available.",show_alert=True); return
-    r=a["questions"][int(index)]
-    explanation="\n\nEXPLANATION\n"+"\n".join(x for x in (r.get("explanation_en"),r.get("explanation_hi")) if x)
-    current=q.message.text or ""
-    if action=="open":
-        if "EXPLANATION" not in current: current+=explanation
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton("Hide explanation",callback_data=f"play:explain:{index}:close")]])
-    else:
-        current=current.split("\n\nEXPLANATION",1)[0]
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton("View explanation",callback_data=f"play:explain:{index}:open")]])
-    await q.answer()
-    await q.edit_message_text(current[:3900],reply_markup=kb)
+        if letter is None: feedback=f"⏭ Not attempted. Correct answer: {r['correct_option']}."
+        elif letter==r["correct_option"]: feedback="✅ Correct."
+        else: feedback=f"❌ Incorrect. Correct answer: {r['correct_option']}."
+        if r.get("explanation_en"): feedback+="\n\n"+r["explanation_en"]
+        if r.get("explanation_hi"): feedback+="\n"+r["explanation_hi"]
+        a["feedback"]=feedback
+        await q.answer("Answer saved.")
+    else: await q.answer("Answer saved.")
+    await send_current_question(q,context)
 
 
 async def _exam_timeout(application, user_id, chat_id, attempt_id, pool, duration_minutes):
@@ -2124,25 +1909,19 @@ async def _exam_timeout(application, user_id, chat_id, attempt_id, pool, duratio
     async with pool.connection() as conn:
         cur=await conn.execute("UPDATE bank_quiz_attempts SET submitted_at=NOW(),correct_count=%s,incorrect_count=%s,skipped_count=%s,score=%s WHERE id=%s AND submitted_at IS NULL RETURNING id",(correct,incorrect,skipped,round(score,2),attempt_id))
         if await cur.fetchone(): await lb.record_bank_attempt(conn,attempt_id,user_id,"Student")
-    accuracy=(correct/(correct+incorrect)*100) if correct+incorrect else 0
-    started=datetime.fromisoformat(attempt["started"])
-    if started.tzinfo is None: started=started.replace(tzinfo=timezone.utc)
-    elapsed=max(0,int((datetime.now(timezone.utc)-started).total_seconds())); minutes,seconds=divmod(elapsed,60)
-    report=(f"BPSC NEXUS  ·  PERFORMANCE REPORT\n{quiz['title']}\n\n"
-            f"SCORE: {score:.2f} / {len(qs)*pos:.2f}\nCorrect: {correct}\nIncorrect: {incorrect}\n"
-            f"Unattempted: {skipped}\nAttempted: {correct+incorrect}/{len(qs)}\n"
-            f"Accuracy: {accuracy:.1f}%\nTime taken: {minutes}m {seconds}s\nTime limit reached.")
-    user_data["qb_last_review"]={"questions":qs,"answers":answers,"quiz":quiz,"attempt_id":attempt_id}
     user_data.pop("qb_attempt",None)
-    await application.bot.send_message(chat_id=chat_id,text=report,reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("Review All Answers",callback_data=f"play:review:{attempt_id}")],
-        [InlineKeyboardButton("Return to Quizzes",callback_data="play:list")]
-    ]))
+    accuracy=(correct/(correct+incorrect)*100) if correct+incorrect else 0
+    text=f"⏱ Time is up — {quiz['title']}\n\nTotal: {len(qs)}\nCorrect: {correct}\nIncorrect: {incorrect}\nNot attempted: {skipped}\nAccuracy (attempted): {accuracy:.1f}%\nScore: {score:.2f} / {len(qs)*pos:.2f}\n\nAnswer review:"
+    for i,r in enumerate(qs,1):
+        text+=f"\n\n{i}. Your answer: {answers.get(str(r['id'])) or 'Not attempted'} · Correct: {r['correct_option']}"
+        if r.get("explanation_en"): text+="\n"+r["explanation_en"][:120]
+        if r.get("explanation_hi"): text+="\n"+r["explanation_hi"][:120]
+    await application.bot.send_message(chat_id=chat_id,text=text[:4000],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Take another quiz",callback_data="play:list")]]))
 
 
 async def submit_attempt(q,context,pool):
     a=context.user_data.get("qb_attempt")
-    if not a: return
+    if not a: await q.edit_message_text("No active quiz attempt."); return
     qs=a["questions"]; answers=a["answers"]; correct=incorrect=skipped=0; score=0.0
     quiz=a["quiz"]; pos=float(quiz["positive_marks"]); neg=float(quiz["negative_marks"])
     for r in qs:
@@ -2154,42 +1933,16 @@ async def submit_attempt(q,context,pool):
         cur=await conn.execute("UPDATE bank_quiz_attempts SET submitted_at=NOW(),correct_count=%s,incorrect_count=%s,skipped_count=%s,score=%s WHERE id=%s AND submitted_at IS NULL RETURNING id",(correct,incorrect,skipped,round(score,2),a["attempt_id"]))
         if await cur.fetchone(): await lb.record_bank_attempt(conn,a["attempt_id"],q.from_user.id,q.from_user.first_name or "Student")
     accuracy=(correct/(correct+incorrect)*100) if correct+incorrect else 0
-    started=datetime.fromisoformat(a["started"])
-    if started.tzinfo is None: started=started.replace(tzinfo=timezone.utc)
-    elapsed=max(0,int((datetime.now(timezone.utc)-started).total_seconds()))
-    minutes,seconds=divmod(elapsed,60)
-    report=(f"BPSC NEXUS  ·  PERFORMANCE REPORT\n{quiz['title']}\n\n"
-            f"SCORE: {score:.2f} / {len(qs)*pos:.2f}\n"
-            f"Correct: {correct}\nIncorrect: {incorrect}\nUnattempted: {skipped}\n"
-            f"Attempted: {correct+incorrect}/{len(qs)}\nAccuracy: {accuracy:.1f}%\n"
-            f"Time taken: {minutes}m {seconds}s\nNegative marking: −{neg:g}")
-    user_id=q.from_user.id
+    text=(f"📊 Quiz Result — {quiz['title']}\n\nTotal: {len(qs)}\nCorrect: {correct}\nIncorrect: {incorrect}\nNot attempted: {skipped}\nAccuracy (attempted): {accuracy:.1f}%\nScore: {score:.2f} / {len(qs)*pos:.2f}\nNegative marking: −{neg:g} per wrong answer")
+    if a["mode"]=="exam":
+        text+="\n\nAnswer review:\n"
+        for i,r in enumerate(qs,1):
+            ans=answers.get(str(r["id"]))
+            text+=f"\n{i}. Your answer: {ans or 'Not attempted'} · Correct: {r['correct_option']}"
+            if r.get("explanation_en"): text+="\n   "+r["explanation_en"][:180]
+            if r.get("explanation_hi"): text+="\n   "+r["explanation_hi"][:180]
     context.user_data.pop("qb_attempt",None)
-    await context.bot.send_message(chat_id=q.message.chat_id,text=report,reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("Review All Answers",callback_data=f"play:review:{a['attempt_id']}")],
-        [InlineKeyboardButton("Return to Quizzes",callback_data="play:list")]
-    ]))
-    # Keep the in-memory answer snapshot only for this chat's immediate review session.
-    context.user_data["qb_last_review"]={"questions":qs,"answers":answers,"quiz":quiz,"attempt_id":a["attempt_id"]}
-
-
-async def show_answer_review(q,context):
-    review=context.user_data.get("qb_last_review")
-    if not review:
-        await q.answer("Review is no longer available in this session.",show_alert=True); return
-    await q.answer()
-    lines=[f"BPSC NEXUS · ANSWER REVIEW — {review['quiz']['title']}"]
-    for i,r in enumerate(review["questions"],1):
-        selected=review["answers"].get(str(r["id"]))
-        opts=r["options"] if isinstance(r["options"],dict) else json.loads(r["options"] or "{}")
-        selected_text=f"{selected}. {opts.get(selected,'')}" if selected else "Not attempted"
-        correct_text=f"{r['correct_option']}. {opts.get(r['correct_option'],'')}"
-        lines.append(f"\n{i}. {_question_layout_text(r)}\nYour answer: {selected_text}\nCorrect answer: {correct_text}")
-        if r.get("explanation_en"): lines.append("Explanation: "+r["explanation_en"])
-        if r.get("explanation_hi"): lines.append(r["explanation_hi"])
-    payload="\n".join(lines)
-    for i in range(0,len(payload),3800):
-        await context.bot.send_message(chat_id=q.message.chat_id,text=payload[i:i+3800])
+    await q.edit_message_text(text[:4000],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Take another quiz",callback_data="play:list")]]))
 
 
 async def admin_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, pool, is_authorized: bool) -> bool:
@@ -2199,8 +1952,6 @@ async def admin_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, pool, is_authorized: bool):
     q=update.callback_query; data=(q.data or "") if q else ""
     if not data.startswith(("qb:","play:")): return False
-    if data.startswith("play:") and (not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE):
-        await q.answer("Please take quizzes in a private chat with the bot.",show_alert=True); return True
     if data == "qb:confirmimport":
         if not is_authorized: await q.answer("Not authorized.",show_alert=True); return True
         await q.answer(); await confirm_import(q,context,pool,update.effective_user.id); return True
@@ -2215,16 +1966,13 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
         await q.answer(); await q.edit_message_text(f"Question saved. Added: {result['imported']}; duplicates skipped: {result['duplicates']}; pending verification: {result['pending']}.",reply_markup=admin_keyboard()); return True
     if data == "qb:cancelforward":
         context.user_data.pop("qb_forward_preview",None); await q.answer(); await q.edit_message_text("Forwarded question discarded.",reply_markup=admin_keyboard()); return True
-    if data.startswith("play:ans:"):
-        parts=data.split(":",3)
-        if len(parts)==4: await answer_question(q,context,pool,parts[3],parts[2])
-        else: await q.answer("Invalid answer action.",show_alert=True)
-        return True
-    if data.startswith("play:skip:"):
-        await answer_question(q,context,pool,None,data.rsplit(":",1)[1]); return True
-    if data.startswith("play:explain:"):
-        _,_,idx,action=data.split(":",3); await toggle_explanation(q,context,idx,action); return True
-    if data.startswith("play:review:"):
-        await show_answer_review(q,context); return True
+    if data.startswith("play:prev") or data.startswith("play:next"):
+        if not q: return True
+        a=context.user_data.get("qb_attempt")
+        if not a: await q.answer("No active quiz.",show_alert=True); return True
+        if data=="play:prev": a["index"]=max(0,a["index"]-1)
+        else: a["index"]=min(len(a["questions"])-1,a["index"]+1)
+        a.pop("feedback",None)
+        await q.answer(); await send_current_question(q,context); return True
     await handle_callback(update,context,pool,is_authorized)
     return True

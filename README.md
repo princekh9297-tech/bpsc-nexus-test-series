@@ -1,71 +1,30 @@
-# BPSC NEXUS — Telegram Quiz Bot
+# BPSC Nexus — Telegram quiz bot (Phase 1)
 
-A native Telegram quiz bot with private personal quizzes, native group quiz polls, and an admin-managed bilingual question bank. This package intentionally excludes Mini App, payment, membership-pass, and AI question-generation components.
+A Telegram-only quiz bot for BPSC preparation. No Mini App, no payments: every quiz is free for every user.
 
-## Included
+## What it does now
+- **Personal quizzes** in private chat: `/quiz` → pick a quiz → Practice or Exam → answer with buttons → score and review.
+- **Group quizzes** in any group: `/startquiz`, `/pausequiz`, `/resumequiz`, `/stopquiz`, `/schedulequiz`, `/leaderboard`, `/quizstatus`, `/quizbrand` (group admins only). Any group can use them; the bot registers the group automatically.
+- **Admin panel** (`/admin`, private chat, `ADMIN_TELEGRAM_IDS` only): Question Bank & Quiz Studio (HTML/JSON/CSV/forwarded-poll import, review, quiz builder) and Nexus Intel (PIB news).
+- **Reset Question Bank** (`/admin` → Question Bank & Quiz Studio → ☢️ Reset Question Bank): shows counts, then requires you to type `RESET`. Permanently deletes questions, quizzes, personal attempts, group quiz history and the leaderboard. Keeps users, subjects, group names/branding and Nexus Intel news.
+- `/myanalysis`: private analysis of your group quiz performance.
 
-- `bot.py` — Telegram application, commands, permissions, database lifecycle.
-- `question_bank.py` — admin question bank, guided bilingual question entry, imports, test creation, personal quizzes and review.
-- `group_quiz.py` — native Telegram group quiz polls, scheduling, per-question timing, answer explanations and group reports.
-- `leaderboard.py` — score ingestion and leaderboard reporting.
-- `requirements.txt`, `.env.example`, `render.yaml`, `run_local.sh` — runtime and deployment configuration.
+## Environment variables (Render → Environment)
+| Name | Required | Notes |
+|---|---|---|
+| `BOT_TOKEN` | yes | from @BotFather |
+| `DATABASE_URL` | yes | Neon/Postgres connection string |
+| `WEBHOOK_SECRET` | yes | random string, 16+ chars |
+| `ADMIN_TELEGRAM_IDS` | yes | comma-separated numeric Telegram IDs |
+| `RENDER_EXTERNAL_URL` | auto | set by Render |
 
-## Confirmed quiz experience
+Removed in Phase 1 (you can delete them from Render): `MINI_APP_URL`, `ADMIN_LOGIN_ID`, `ADMIN_LOGIN_PASSWORD`, `ADMIN_LOGIN_TELEGRAM_ID`, `ADMIN_SESSION_SECRET`.
 
-### Personal quizzes
+## Deploy
+1. Back up your current repo, then replace its files with this folder.
+2. Delete the separate Mini App web service on Render (not needed any more).
+3. Redeploy the bot service. Startup migrations are additive; old tables (passes, payments, tests) stay in the database untouched and are simply unused.
+4. In Telegram, send `/start`, `/quiz`, then `/admin` to confirm.
 
-- Custom inline-button answers; no native poll in private quizzes.
-- One question per new Telegram message. Previous question messages remain visible.
-- No countdown or Next button between questions; the next question is sent automatically after answer feedback.
-- Practice mode: correct answers show a collapsed explanation button; incorrect or skipped answers show the explanation automatically.
-- Exam mode: answers are withheld until the attempt ends.
-- Final performance report is sent automatically, including score, correct, incorrect, unattempted, attempted count, accuracy and elapsed time.
-- `Review All Answers` displays the selected answer, correct answer and explanations.
-
-### Group quizzes
-
-- Native Telegram quiz polls, with bilingual English/Hindi question content and options.
-- Fixed branding: **BPSC NEXUS**.
-- Full question card before each poll, including subject/topic/exam-series labels and structured layouts for standard, statement-based, matching and assertion–reason questions.
-- Poll duration is selected by the quiz organiser. A default duration can be used for all questions, with individual overrides by original test question number.
-- Poll closes automatically; Telegram reveals the correct option and the bot immediately publishes a separate bilingual explanation message before the next question.
-- Poll responses are non-anonymous so individual results can be recorded.
-- Group members can schedule published quizzes. Immediate start/pause/resume/stop controls remain group-admin restricted.
-
-### Admin question bank
-
-- Admin access is restricted to Telegram numeric IDs in `ADMIN_TELEGRAM_IDS`.
-- Guided manual question entry supports 4 or 5 bilingual options and all four question layouts.
-- English and Hindi question text, options and explanations are required for publication.
-- Manual duplicate detection warns the admin and offers an explicit save-anyway or discard choice.
-- Tests are drafted, populated, reviewed and then manually published. Incomplete bilingual tests cannot be published.
-
-## Database safety
-
-- The bot uses the existing PostgreSQL/Neon database through `DATABASE_URL`.
-- Startup performs additive, idempotent schema setup for the quiz engine.
-- **This package does not reset, truncate or delete existing user accounts, tests, question banks, attempts, group sessions, results or leaderboards.**
-- No destructive database reset script is included. Back up the database before deploying any future data-cleanup operation.
-
-## Configure
-
-Copy `.env.example` to `.env` and set:
-
-- `BOT_TOKEN`
-- `DATABASE_URL` — use the existing Neon connection string.
-- `ADMIN_TELEGRAM_IDS` — comma-separated Telegram numeric IDs.
-- `BOT_MODE=polling` for Termux/Linux, or `BOT_MODE=webhook` for a webhook host.
-
-Install and run:
-
-```bash
-python -m pip install -r requirements.txt
-chmod +x run_local.sh
-./run_local.sh
-```
-
-See `LOCAL_SETUP.md` for Android/Termux and Render deployment notes.
-
-## Important runtime rule
-
-Only one active process should consume a bot token at a time. Stop the Render process before starting local polling with the same token. Telegram and Neon both require an internet connection.
+## Files
+`bot.py` entry point · `question_bank.py` question bank + personal quiz · `group_quiz.py` group polls/scheduler · `leaderboard.py` · `intel.py`, `intel_worker.py` news feed (optional cron: `render-intel-cron.yaml`).

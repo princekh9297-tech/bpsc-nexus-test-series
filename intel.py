@@ -157,5 +157,5 @@ async def route_callback(update, context, pool, admin_only):
                 if approved:
                     await conn.execute("INSERT INTO intel_publications(article_id,content_version_id,destination,idempotency_key,status) VALUES(%s,%s,'telegram','intel:%s:v%s:telegram','queued') ON CONFLICT DO NOTHING",(aid,vid,aid,vid))
                     await conn.execute("INSERT INTO intel_publications(article_id,content_version_id,destination,idempotency_key,status) VALUES(%s,%s,'miniapp','intel:%s:v%s:miniapp','published') ON CONFLICT DO NOTHING",(aid,vid,aid,vid))
-        await q.edit_message_text(('✅ Approved' if approved else '❌ Rejected')+f' article #{aid}. '+('Telegram publication has been queued; Mini App API visibility is enabled.' if approved else 'This item will not be published.'),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Review next',callback_data='intel:queue:0')],[InlineKeyboardButton('Intel home',callback_data='intel:home')]])); return True
+        await q.edit_message_text(('✅ Approved' if approved else '❌ Rejected')+f' article #{aid}. '+('Telegram publication has been queued.' if approved else 'This item will not be published.'),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Review next',callback_data='intel:queue:0')],[InlineKeyboardButton('Intel home',callback_data='intel:home')]])); return True
     return True

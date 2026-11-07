@@ -55,8 +55,6 @@ DDL = [
         session_id BIGINT NOT NULL REFERENCES group_quiz_sessions(id) ON DELETE CASCADE,
         position INTEGER NOT NULL,
         question_id BIGINT NOT NULL,
-        subject TEXT,
-        topic TEXT,
         question_en TEXT NOT NULL,
         question_hi TEXT,
         options JSONB NOT NULL,
@@ -64,10 +62,6 @@ DDL = [
         correct_option TEXT NOT NULL,
         explanation_en TEXT,
         explanation_hi TEXT,
-        question_type TEXT NOT NULL DEFAULT 'standard',
-        question_structure JSONB NOT NULL DEFAULT '{}'::jsonb,
-        duration_seconds INTEGER,
-        explanation_sent BOOLEAN NOT NULL DEFAULT FALSE,
         poll_id TEXT,
         message_id BIGINT,
         status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','posting','open','closed','failed')),
@@ -87,12 +81,6 @@ DDL = [
         FOREIGN KEY(session_id,position) REFERENCES group_quiz_session_questions(session_id,position) ON DELETE CASCADE
     )""",
     "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS message_id BIGINT",
-    "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS subject TEXT",
-    "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS topic TEXT",
-    "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS question_type TEXT NOT NULL DEFAULT 'standard'",
-    "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS question_structure JSONB NOT NULL DEFAULT '{}'::jsonb",
-    "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS duration_seconds INTEGER",
-    "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS explanation_sent BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
     "ALTER TABLE group_quiz_session_questions ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ",
     "CREATE INDEX IF NOT EXISTS idx_group_quiz_answers_session ON group_quiz_answers(session_id,telegram_id)",
@@ -125,12 +113,23 @@ async def ensure_schema(pool):
 
 
 async def _group_is_authorized(pool, chat_id: int) -> bool:
-    """Group quiz access is open; legacy membership rows are retained only for branding."""
+    """Every group may use BPSC Nexus group quizzes (no membership gate)."""
     return True
 
 
 async def _require_group_membership(message, pool, chat) -> bool:
-    """Compatibility shim: paid group membership is no longer required."""
+    """Register the group automatically (used for branding) and allow access."""
+    try:
+        async with pool.connection() as conn:
+            await conn.execute(
+                """INSERT INTO group_quiz_memberships(chat_id,chat_title,is_active,granted_by,granted_at)
+                   VALUES(%s,%s,TRUE,0,NOW())
+                   ON CONFLICT(chat_id) DO UPDATE
+                   SET chat_title=EXCLUDED.chat_title,is_active=TRUE,revoked_at=NULL,expires_at=NULL""",
+                (int(chat.id), chat.title or "Telegram Group"),
+            )
+    except Exception:
+        log.exception("Could not auto-register group %s", getattr(chat, "id", None))
     return True
 
 
@@ -226,10 +225,44 @@ async def _reconcile_chat_quizzes(conn, chat_id: int) -> int | None:
 
 
 async def group_brand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Branding is fixed globally to BPSC NEXUS for a consistent group experience."""
-    message=update.effective_message
-    if message:
-        await message.reply_text("Group quiz branding is fixed to BPSC NEXUS across all groups.")
+    """Set a per-group quiz brand shown on every poll and the live progress card."""
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.effective_message
+    pool = context.application.bot_data.get("db_pool")
+    if not chat or not user or not message or pool is None:
+        return
+    if chat.type == ChatType.PRIVATE:
+        await message.reply_text("Use /quizbrand inside the group whose quiz branding you want to customise.")
+        return
+    if not await _require_group_membership(message, pool, chat):
+        return
+    if not await _is_chat_admin(context, chat.id, user.id):
+        await message.reply_text("Only this group's administrators can change its quiz branding.")
+        return
+
+    value = " ".join(context.args).strip()
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT brand_name FROM group_quiz_memberships WHERE chat_id=%s AND is_active=TRUE", (int(chat.id),))
+        row = await cur.fetchone()
+        current = (row or {}).get("brand_name") or (chat.title or "Telegram Group")
+        if not value:
+            await message.reply_text(
+                f"🏷 Current quiz branding: {current}\n\n"
+                "Set a custom label with /quizbrand Your Academy Name\n"
+                "Reset to the Telegram group name with /quizbrand reset"
+            )
+            return
+        if value.lower() == "reset":
+            await conn.execute("UPDATE group_quiz_memberships SET brand_name=NULL,chat_title=%s WHERE chat_id=%s AND is_active=TRUE", (chat.title or "Telegram Group", int(chat.id)))
+            new_brand = chat.title or "Telegram Group"
+        else:
+            new_brand = value[:48].strip()
+            await conn.execute("UPDATE group_quiz_memberships SET brand_name=%s,chat_title=%s WHERE chat_id=%s AND is_active=TRUE", (new_brand, chat.title or "Telegram Group", int(chat.id)))
+    await message.reply_text(
+        f"✅ Quiz branding updated: {new_brand}\n\n"
+        "This group's name will appear on each quiz poll and its live progress card."
+    )
 
 
 async def group_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -251,7 +284,7 @@ async def group_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         cur = await conn.execute("""SELECT q.id,q.title,q.subject,COUNT(qq.question_id) AS n
             FROM bank_quizzes q JOIN bank_quiz_questions qq ON qq.quiz_id=q.id
             JOIN question_bank b ON b.id=qq.question_id AND b.status='ready'
-            WHERE q.is_published=TRUE  GROUP BY q.id ORDER BY q.id DESC LIMIT 20""")
+            WHERE q.is_published=TRUE AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s) GROUP BY q.id ORDER BY q.id DESC LIMIT 20""", (user.id,))
         quizzes = await cur.fetchall()
     buttons = [[InlineKeyboardButton("🧩 Choose Subject + Fixed Question Range", callback_data="gq:bank")]]
     buttons += [[InlineKeyboardButton(f"📚 #{r['id']} · {r['title'][:30]} ({r['n']} Q)", callback_data=f"gq:quiz:{r['id']}")] for r in quizzes]
@@ -312,11 +345,9 @@ async def group_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text("ℹ️ There is no active or scheduled group quiz right now. A group admin can start one with /groupquiz.")
         return
     starts = row["next_at"].strftime("%Y-%m-%d %H:%M UTC") if row["next_at"] else "soon"
-    scheduled = bool(row["next_at"] and row["next_at"] > datetime.now(timezone.utc) and row.get("status") == "active")
-    status_label = "Scheduled" if scheduled else ("Paused" if row.get("status") == "paused" else "Live")
     await message.reply_text(
         f"🧩 Group Quiz Status · #{row['id']}\n\n{row['quiz_title']}\n"
-        f"Status: {status_label}\n"
+        f"Status: {'Paused' if row.get('status') == 'paused' else 'Active'}\n"
         f"Mode: {row['mode'].title()}\nQuestions: {row['questions_count']}\n"
         f"Progress: {min(int(row['current_index']) + 1, int(row['questions_count']))}/{row['questions_count']}\n"
         f"Voting window: {row['interval_seconds']} seconds\nNext activity: {starts}"
@@ -440,17 +471,19 @@ async def group_resume_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def group_quiz_schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Schedule an admin-published group quiz in UTC; any group member may schedule it."""
+    """Schedule a group quiz in UTC: /groupquiz_schedule <quiz_id> <YYYY-MM-DDTHH:MMZ> [15|30|60|120|300] [learning|exam]."""
     chat=update.effective_chat; user=update.effective_user; message=update.effective_message
     pool=context.application.bot_data.get("db_pool")
     if not chat or not user or not message or pool is None: return
     if chat.type==ChatType.PRIVATE:
-        await message.reply_text("Run /schedulequiz inside the destination group. Example: /schedulequiz 12 2026-11-08T18:00Z 30 exam (UTC).")
+        await message.reply_text("Run this command in the destination group. Syntax: /groupquiz_schedule 12 2026-10-12T18:00Z 30 exam (time is UTC).")
         return
     if not await _require_group_membership(message, pool, chat):
         return
+    if not await _is_chat_admin(context,chat.id,user.id):
+        await message.reply_text("Only this group's administrators can schedule a quiz."); return
     if len(context.args)<2:
-        await message.reply_text("Syntax: /schedulequiz <quiz_id> <YYYY-MM-DDTHH:MMZ> [15|30|60|120|300] [learning|exam]\nExample: /schedulequiz 12 2026-11-08T18:00Z 30 exam\nAny group member can schedule a published test. Times are UTC."); return
+        await message.reply_text("Syntax: /groupquiz_schedule <quiz_id> <YYYY-MM-DDTHH:MMZ> [15|30|60|120|300] [learning|exam]\nExample: /groupquiz_schedule 12 2026-10-12T18:00Z 30 exam\nAll scheduled times are UTC."); return
     try:
         quiz_id=int(context.args[0]); when_text=context.args[1].replace("Z","+00:00")
         when=datetime.fromisoformat(when_text)
@@ -464,84 +497,32 @@ async def group_quiz_schedule_command(update: Update, context: ContextTypes.DEFA
     except (ValueError,TypeError) as exc:
         await message.reply_text(f"Invalid schedule: {exc}\nUse UTC, e.g. /groupquiz_schedule 12 2026-10-12T18:00Z 30 exam"); return
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE",(quiz_id,)); quiz=await cur.fetchone()
+        cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,user.id)); quiz=await cur.fetchone()
         if not quiz:
             await message.reply_text("Published quiz not found."); return
         await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 741923))", (f"bpsc_nexus_group_quiz:{int(chat.id)}",))
         active_id = await _reconcile_chat_quizzes(conn, chat.id)
         if active_id is not None:
             await message.reply_text(f"This group already has live or scheduled quiz session #{active_id}. Finish it before scheduling another."); return
-        cur=await conn.execute("""SELECT b.id,qq.position AS source_position,b.subject,b.topic,b.question_en,b.question_hi,b.question_type,b.question_structure,b.options,b.correct_option,b.explanation_en,b.explanation_hi
+        cur=await conn.execute("""SELECT b.id,b.question_en,b.question_hi,b.options,b.correct_option,b.explanation_en,b.explanation_hi
             FROM bank_quiz_questions qq JOIN question_bank b ON b.id=qq.question_id WHERE qq.quiz_id=%s AND b.status='ready' ORDER BY qq.position""",(quiz_id,))
         source=await cur.fetchall(); prepared=[]
         for row in source:
             opts=row["options"] if isinstance(row["options"],dict) else json.loads(row["options"] or "{}")
-            letters=[letter for letter in "ABCDE" if str(opts.get(letter,"")).strip()]
-            if len(letters)>=2 and row["correct_option"] in letters:
-                random.shuffle(letters)
-                prepared.append((row,opts,letters))
-        random.shuffle(prepared)
+            letters=[letter for letter in "ABCD" if str(opts.get(letter,"")).strip()]
+            if len(letters)>=2 and row["correct_option"] in letters: prepared.append((row,opts,letters))
         if not prepared:
             await message.reply_text("This quiz has no questions valid for Telegram polls."); return
         cur=await conn.execute("SELECT brand_name FROM group_quiz_memberships WHERE chat_id=%s", (int(chat.id),))
         brand_row=await cur.fetchone()
-        brand_name="BPSC NEXUS"
+        brand_name=(brand_row or {}).get("brand_name")
         cur=await conn.execute("""INSERT INTO group_quiz_sessions(chat_id,chat_title,brand_name,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at)
             VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,0,'active',%s) RETURNING id""",(chat.id,chat.title or "Telegram group",brand_name,quiz_id,quiz["title"],user.id,interval,len(prepared),mode,when))
         session_id=int((await cur.fetchone())["id"])
         for position,(row,opts,letters) in enumerate(prepared):
-            await conn.execute("""INSERT INTO group_quiz_session_questions(session_id,position,question_id,subject,topic,question_en,question_hi,options,option_letters,correct_option,explanation_en,explanation_hi,question_type,question_structure,duration_seconds)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s::jsonb,%s)""",(session_id,position,row["id"],row.get("subject"),row.get("topic"),row["question_en"],row["question_hi"],json.dumps(opts,ensure_ascii=False),json.dumps(letters),row["correct_option"],row["explanation_en"],row["explanation_hi"],row.get("question_type") or "standard",json.dumps(row.get("question_structure") or {},ensure_ascii=False),None))
+            await conn.execute("""INSERT INTO group_quiz_session_questions(session_id,position,question_id,question_en,question_hi,options,option_letters,correct_option,explanation_en,explanation_hi)
+                VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)""",(session_id,position,row["id"],row["question_en"],row["question_hi"],json.dumps(opts,ensure_ascii=False),json.dumps(letters),row["correct_option"],row["explanation_en"],row["explanation_hi"]))
     await message.reply_text(f"📅 Quiz scheduled\n\n#{session_id} · {quiz['title']}\nStarts: {when.isoformat()} (UTC)\nMode: {mode.title()}\nQuestions: {len(prepared)}\nVoting window: {interval}s per question")
-
-
-
-async def group_quiz_cancel_schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel a future scheduled quiz if the caller created it or is a group admin."""
-    chat = update.effective_chat
-    user = update.effective_user
-    message = update.effective_message
-    pool = context.application.bot_data.get("db_pool")
-    if not chat or not user or not message or pool is None:
-        return
-    if chat.type == ChatType.PRIVATE:
-        await message.reply_text("Run /cancelschedule inside the group where the quiz was scheduled.")
-        return
-    session_id = None
-    if context.args:
-        try:
-            session_id = int(context.args[0])
-        except ValueError:
-            await message.reply_text("Usage: /cancelschedule [session_id]")
-            return
-    async with pool.connection() as conn:
-        if session_id is None:
-            cur = await conn.execute(
-                """SELECT id,started_by FROM group_quiz_sessions
-                   WHERE chat_id=%s AND status='active' AND next_at>NOW()
-                   ORDER BY next_at,id DESC LIMIT 1""",
-                (chat.id,),
-            )
-        else:
-            cur = await conn.execute(
-                """SELECT id,started_by FROM group_quiz_sessions
-                   WHERE chat_id=%s AND id=%s AND status='active' AND next_at>NOW()""",
-                (chat.id, session_id),
-            )
-        row = await cur.fetchone()
-        if not row:
-            await message.reply_text("No future scheduled quiz was found.")
-            return
-        is_admin = await _is_chat_admin(context, chat.id, user.id)
-        if int(row["started_by"]) != int(user.id) and not is_admin:
-            await message.reply_text("Only the person who scheduled this quiz or a group admin can cancel it.")
-            return
-        await conn.execute(
-            """UPDATE group_quiz_sessions SET status='cancelled',completed_at=NOW()
-               WHERE id=%s AND status='active' AND next_at>NOW()""",
-            (row["id"],),
-        )
-    await message.reply_text(f"🗓️ Scheduled quiz #{row['id']} cancelled.")
 
 
 async def _create_range_quiz(pool, pending, user, startpos: int, endpos: int):
@@ -607,7 +588,7 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
         await q.answer("Use group quiz controls inside the destination group.", show_alert=True)
         return True
     if not await _group_is_authorized(pool, chat.id):
-        await q.answer("Group quizzes are available in this group.", show_alert=True)
+        await q.answer("This group does not have BPSC Nexus Quiz membership.", show_alert=True)
         return True
     if not await _is_chat_admin(context, chat.id, user.id):
         await q.answer("Only this group's administrators can control its quiz.", show_alert=True)
@@ -752,7 +733,7 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
         context.user_data["group_quiz_pending"]=pending
         await q.answer()
         mode_text="Learning Mode — answer and explanation after each poll" if mode=="learning" else "Exam Mode — answers hidden until final submission"
-        await q.edit_message_text(f"Mode: {mode_text}\n\nChoose the default poll duration. You can override individual questions next.",reply_markup=InlineKeyboardMarkup([
+        await q.edit_message_text(f"Mode: {mode_text}\n\nChoose time per question.",reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("15 sec",callback_data="gq:interval:15"),InlineKeyboardButton("20 sec",callback_data="gq:interval:20")],
             [InlineKeyboardButton("25 sec",callback_data="gq:interval:25"),InlineKeyboardButton("30 sec",callback_data="gq:interval:30")],
             [InlineKeyboardButton("Custom time…",callback_data="gq:interval:custom")],
@@ -776,21 +757,8 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
         try: interval=int(raw)
         except ValueError: await q.answer("Invalid duration.",show_alert=True); return True
         if interval not in (15,20,25,30): await q.answer("Choose 15, 20, 25 or 30 seconds, or Custom.",show_alert=True); return True
-        pending["interval_seconds"]=interval; pending["stage"]="question_timer_choice"; context.user_data["group_quiz_pending"]=pending
-        await q.answer(); await q.edit_message_text(f"Default poll duration: {interval}s. Would you like to customise selected questions?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Set individual timings",callback_data="gq:questiontimers:custom")],[InlineKeyboardButton("Use default for all",callback_data="gq:questiontimers:default")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
-    if data.startswith("gq:questiontimers:"):
-        pending=context.user_data.get("group_quiz_pending")
-        if not pending or pending.get("chat_id")!=chat.id: await q.answer("Setup expired.",show_alert=True); return True
-        choice=data.rsplit(":",1)[1]
-        if choice=="custom":
-            pending["stage"]="custom_question_timers"; context.user_data["group_quiz_pending"]=pending
-            await q.answer(); await q.edit_message_text(
-                "Enter per-question overrides as question=seconds, separated by commas. "
-                "Example: 3=45, 8=60. Question numbers refer to the original published test order; the quiz may shuffle its display order. "
-                "Allowed duration: 5–600 seconds. Leave no question out unless it should use the default.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Use default for all",callback_data="gq:questiontimers:default")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
-        pending["question_timers"]={}; pending["stage"]="positive_marks"; context.user_data["group_quiz_pending"]=pending
-        await q.answer(); await q.edit_message_text("Using the default poll duration for every question. Choose marks for a correct answer.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("+1",callback_data="gq:positive:1"),InlineKeyboardButton("+2",callback_data="gq:positive:2"),InlineKeyboardButton("+3",callback_data="gq:positive:3")],[InlineKeyboardButton("Custom…",callback_data="gq:positive:custom")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
+        pending["interval_seconds"]=interval; pending["stage"]="positive_marks"; context.user_data["group_quiz_pending"]=pending
+        await q.answer(); await q.edit_message_text(f"Time per question: {interval}s. Choose marks for a correct answer.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("+1",callback_data="gq:positive:1"),InlineKeyboardButton("+2",callback_data="gq:positive:2"),InlineKeyboardButton("+3",callback_data="gq:positive:3")],[InlineKeyboardButton("Custom…",callback_data="gq:positive:custom")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
     if data.startswith("gq:positive:"):
         pending=context.user_data.get("group_quiz_pending")
         if not pending or pending.get("chat_id")!=chat.id: await q.answer("Setup expired.",show_alert=True); return True
@@ -825,8 +793,7 @@ def _pending_preview(pending):
         f"Question range: {range_label}\n"
         f"Questions: {count_label}\n"
         f"Mode: {str(pending.get('mode','learning')).title()}\n"
-        f"Default poll duration: {pending.get('interval_seconds',20)} seconds\n"
-        f"Individual timing overrides: {len(pending.get('question_timers') or {})}\n"
+        f"Time per question: {pending.get('interval_seconds',20)} seconds\n"
         f"Scoring: +{float(pending.get('positive_marks',1)):g} correct / −{float(pending.get('negative_marks',0.333)):g} wrong\n"
         "Question order: shuffled\n\nConfirm to start. The timer begins when each poll is published.")
 
@@ -837,14 +804,12 @@ async def _launch_pending_quiz(q,context,pool,pending,user):
     async with pool.connection() as conn:
         cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND (is_published=TRUE OR (is_custom=TRUE AND custom_owner_telegram_id=%s))",(pending["quiz_id"],user.id)); quiz=await cur.fetchone()
         if not quiz: await q.answer("Quiz is no longer available.",show_alert=True); return True
-        cur=await conn.execute("SELECT b.id,qq.position AS source_position,b.subject,b.topic,b.question_en,b.question_hi,b.question_type,b.question_structure,b.options,b.correct_option,b.explanation_en,b.explanation_hi FROM bank_quiz_questions qq JOIN question_bank b ON b.id=qq.question_id WHERE qq.quiz_id=%s AND b.status='ready' ORDER BY qq.position",(quiz["id"],)); source=await cur.fetchall()
+        cur=await conn.execute("SELECT b.id,b.question_en,b.question_hi,b.options,b.correct_option,b.explanation_en,b.explanation_hi FROM bank_quiz_questions qq JOIN question_bank b ON b.id=qq.question_id WHERE qq.quiz_id=%s AND b.status='ready' ORDER BY qq.position",(quiz["id"],)); source=await cur.fetchall()
         prepared=[]
         for row in source:
             opts=row["options"] if isinstance(row["options"],dict) else json.loads(row["options"] or "{}")
             letters=[letter for letter in "ABCDE" if str(opts.get(letter,"")).strip() and not (letter=="E" and (str(opts.get(letter,"")).lower().startswith("not attempted") or str(opts.get(letter,"")).startswith("प्रयास नहीं किया")))]
-            if len(letters)>=2 and row["correct_option"] in letters:
-                random.shuffle(letters)
-                prepared.append((row,opts,letters))
+            if len(letters)>=2 and row["correct_option"] in letters: prepared.append((row,opts,letters))
         if not prepared: await q.answer("No valid questions available for Telegram polls.",show_alert=True); return True
         expected_count=pending.get("count")
         if pending.get("source_type")!="range" or expected_count is None:
@@ -858,19 +823,17 @@ async def _launch_pending_quiz(q,context,pool,pending,user):
             await q.answer(f"This group already has live or scheduled quiz session #{active_id}. Finish it first.",show_alert=True); return True
         cur=await conn.execute("SELECT brand_name FROM group_quiz_memberships WHERE chat_id=%s", (chat_id,))
         brand_row=await cur.fetchone()
-        brand_name="BPSC NEXUS"
+        brand_name=(brand_row or {}).get("brand_name")
         cur=await conn.execute("INSERT INTO group_quiz_sessions(chat_id,chat_title,brand_name,quiz_id,quiz_title,started_by,interval_seconds,questions_count,mode,current_index,status,next_at,positive_marks,negative_marks,started_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,0,'active',NOW(),%s,%s,NOW()) RETURNING id",(chat_id,pending.get("chat_title","Telegram group"),brand_name,quiz["id"],quiz["title"],user.id,interval,len(prepared),mode,positive,negative)); sid=int((await cur.fetchone())["id"])
         # Batch snapshot all questions in one database operation; large quizzes no longer
         # incur hundreds of serial insert round-trips before the first poll can appear.
         async with conn.cursor() as insert_cur:
             await insert_cur.executemany(
-                "INSERT INTO group_quiz_session_questions(session_id,position,question_id,subject,topic,question_en,question_hi,options,option_letters,correct_option,explanation_en,explanation_hi,question_type,question_structure,duration_seconds) VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s::jsonb,%s)",
+                "INSERT INTO group_quiz_session_questions(session_id,position,question_id,question_en,question_hi,options,option_letters,correct_option,explanation_en,explanation_hi) VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)",
                 [
-                    (sid, position, row["id"], row.get("subject"), row.get("topic"), row["question_en"], row["question_hi"],
+                    (sid, position, row["id"], row["question_en"], row["question_hi"],
                      json.dumps(opts, ensure_ascii=False), json.dumps(letters),
-                     row["correct_option"], row["explanation_en"], row["explanation_hi"],
-                     row.get("question_type") or "standard", json.dumps(row.get("question_structure") or {}, ensure_ascii=False),
-                     (pending.get("question_timers") or {}).get(str(row.get("source_position") or position+1)))
+                     row["correct_option"], row["explanation_en"], row["explanation_hi"])
                     for position, (row, opts, letters) in enumerate(prepared)
                 ],
             )
@@ -878,7 +841,7 @@ async def _launch_pending_quiz(q,context,pool,pending,user):
     await q.answer("Quiz launched.")
     range_text=f"\n𝗤𝗨𝗘𝗦𝗧𝗜𝗢𝗡 𝗥𝗔𝗡𝗚𝗘  {pending.get('range_start','?')}–{pending.get('range_end','?')}" if pending.get("range_start") is not None else ""
     confirmation = (
-        f"BPSC NEXUS  ·  QUIZ #{sid}\n\n"
+        f"✅ 𝗕𝗣𝗦𝗖 𝗡𝗘𝗫𝗨𝗦  ·  𝗤𝗨𝗜𝗭 #{sid}\n\n"
         f"𝗤𝗨𝗜𝗭 𝗟𝗜𝗩𝗘\n{quiz['title']}{range_text}\n\n"
         f"𝗤𝗨𝗘𝗦𝗧𝗜𝗢𝗡𝗦   {len(prepared)}\n"
         f"𝗠𝗢𝗗𝗘   {mode.title()}\n"
@@ -909,7 +872,7 @@ async def group_quiz_text_input(update: Update,context: ContextTypes.DEFAULT_TYP
     message=update.effective_message; chat=update.effective_chat; user=update.effective_user; pending=context.user_data.get("group_quiz_pending")
     if not message or not message.text or not chat or not user or not pending or int(pending.get("chat_id",0))!=chat.id: return False
     stage=pending.get("stage")
-    if stage not in {"range_start","range_end","custom_timer","custom_positive","custom_negative","custom_question_timers"}: return False
+    if stage not in {"range_start","range_end","custom_timer","custom_positive","custom_negative"}: return False
     pool=context.application.bot_data.get("db_pool")
     if pool is None or chat.type==ChatType.PRIVATE or not await _is_chat_admin(context,chat.id,user.id): return False
     raw=message.text.strip()
@@ -930,26 +893,12 @@ async def group_quiz_text_input(update: Update,context: ContextTypes.DEFAULT_TYP
             await message.reply_text(f"Could not find all {count} eligible questions in that range. Please choose a valid range."); return True
         pending.update(created); pending["stage"]=None; context.user_data["group_quiz_pending"]=pending
         await message.reply_text(f"✅ Fixed range confirmed: questions {startpos}–{value} ({count} questions).\nOnly these questions will be used; order is shuffled within this range.\n\nChoose mode:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Learning Mode",callback_data="gq:mode:learning")],[InlineKeyboardButton("📝 Exam Mode",callback_data="gq:mode:exam")],[InlineKeyboardButton("Cancel",callback_data="gq:cancel")]])); return True
-    if stage=="custom_question_timers":
-        try:
-            overrides={}
-            for item in raw.split(","):
-                if not item.strip(): continue
-                qno,seconds=item.split("=",1); qno=int(qno.strip()); seconds=int(seconds.strip())
-                if qno<1 or qno>int(pending.get("count") or pending.get("eligible") or 500): raise ValueError("Question number is outside the selected range.")
-                if not 5<=seconds<=600: raise ValueError("Each duration must be between 5 and 600 seconds.")
-                overrides[str(qno)]=seconds
-            if not overrides: raise ValueError("Enter at least one override, e.g. 3=45,8=60.")
-        except Exception as exc:
-            await message.reply_text(f"Invalid timing overrides: {exc}\nExample: 3=45, 8=60"); return True
-        pending["question_timers"]=overrides; pending["stage"]="positive_marks"; context.user_data["group_quiz_pending"]=pending
-        await message.reply_text(f"Saved {len(overrides)} individual timing override(s). All other questions use {pending.get('interval_seconds')} seconds. Choose correct-answer marks:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("+1",callback_data="gq:positive:1"),InlineKeyboardButton("+2",callback_data="gq:positive:2"),InlineKeyboardButton("+3",callback_data="gq:positive:3")],[InlineKeyboardButton("Custom…",callback_data="gq:positive:custom")]])); return True
     try: value=float(raw)
     except ValueError: await message.reply_text("Enter a valid number."); return True
     if stage=="custom_timer":
         if not value.is_integer() or not 5<=value<=600: await message.reply_text("Enter whole seconds from 5 to 600."); return True
-        pending["interval_seconds"]=int(value); pending["stage"]="question_timer_choice"; context.user_data["group_quiz_pending"]=pending
-        await message.reply_text(f"Default poll duration: {int(value)}s. Would you like to customise selected questions?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Set individual timings",callback_data="gq:questiontimers:custom")],[InlineKeyboardButton("Use default for all",callback_data="gq:questiontimers:default")]])); return True
+        pending["interval_seconds"]=int(value); pending["stage"]="positive_marks"; context.user_data["group_quiz_pending"]=pending
+        await message.reply_text("Choose correct-answer marks:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("+1",callback_data="gq:positive:1"),InlineKeyboardButton("+2",callback_data="gq:positive:2"),InlineKeyboardButton("+3",callback_data="gq:positive:3")],[InlineKeyboardButton("Custom…",callback_data="gq:positive:custom")]])); return True
     if stage=="custom_positive":
         if not 0.01<=value<=100: await message.reply_text("Enter marks from 0.01 to 100."); return True
         pending["positive_marks"]=value; pending["stage"]="negative_marks"; context.user_data["group_quiz_pending"]=pending
@@ -977,7 +926,7 @@ async def _update_live_progress(application, pool, session_id: int, position: in
         total = max(1, int(session["questions_count"] or 1))
         done = total if completed else min(total, max(0, int(position)) + 1)
         pct = 100 if completed else int((done / total) * 100)
-        brand = "BPSC NEXUS"
+        brand = str(session.get("brand_name") or session.get("chat_title") or "Telegram Group").strip()[:48]
         participants = int((participants_row or {}).get("participants") or 0)
         responses = int((responses_row or {}).get("responses") or 0)
         if completed:
@@ -1103,7 +1052,7 @@ async def _post_question(application, pool, session, question):
     if promo_row and not promo_row["announcement_sent"]:
         try:
             launch_text = (
-                f"BPSC NEXUS  ·  GROUP QUIZ #{sid}\n\n"
+                f"🚀 𝗕𝗣𝗦𝗖 𝗡𝗘𝗫𝗨𝗦  ·  𝗚𝗥𝗢𝗨𝗣 𝗤𝗨𝗜𝗭 #{sid}\n\n"
                 f"𝗡𝗔𝗧𝗜𝗢𝗡𝗔𝗟 𝗘𝗩𝗘𝗡𝗧𝗦\n{session.get('quiz_title','Group Quiz')}\n\n"
                 f"𝗤𝗨𝗘𝗦𝗧𝗜𝗢𝗡𝗦   {int(session['questions_count'])}\n"
                 f"𝗠𝗢𝗗𝗘   {str(session.get('mode','learning')).title()}\n"
@@ -1126,30 +1075,34 @@ async def _post_question(application, pool, session, question):
     await _update_live_progress(application, pool, sid, position, create_if_missing=True, force=True)
     opts = question["options"] if isinstance(question["options"], dict) else json.loads(question["options"] or "{}")
     letters = question["option_letters"] if isinstance(question["option_letters"], list) else json.loads(question["option_letters"] or "[]")
-    duration = int(question.get("duration_seconds") or session.get("interval_seconds") or 30)
-    subject = str(question.get("subject") or "GENERAL STUDIES")
-    topic = str(question.get("topic") or "")
-    full_card = (f"BPSC NEXUS  ·  QUESTION {position + 1}/{int(session['questions_count'])}\n"
-                 f"{subject}" + (f"  ·  {topic}" if topic else "") +
-                 f"\n{str(session.get('quiz_title') or 'BPSC PRELIMS SERIES')}  ·  {duration}s\n\n" + _group_layout_text(question))
-    # Send the complete bilingual/structured question card before Telegram's native poll.
     base_question_text = str(question["question_en"] or "Question")
     if question.get("question_hi"):
         base_question_text += "\n" + str(question["question_hi"])
-    question_text = f"BPSC NEXUS · Q{position + 1}/{int(session['questions_count'])}\n{base_question_text}"[:300]
+    brand = str(session.get("brand_name") or session.get("chat_title") or "Telegram Group").strip()[:48]
+    identity = f"🏷 {brand} · Q{position + 1}/{int(session['questions_count'])} · ⏱ {int(session['interval_seconds'])}s\n\n"
+    question_text = identity + base_question_text
+    # Telegram limits poll questions to 300 characters; preserve the branding header first.
+    question_text = question_text[:300]
     poll_options = [str(opts.get(letter, letter))[:100] for letter in letters]
+    explanation = "\n".join(x for x in (question.get("explanation_en"), question.get("explanation_hi")) if x)
     poll = None
     try:
-        await application.bot.send_message(chat_id=int(session["chat_id"]), text=full_card[:3900])
-        poll = await _send_poll_with_rate_limit_retry(application.bot,
-            chat_id=session["chat_id"], question=question_text[:300], options=poll_options,
-            type="quiz", correct_option_id=letters.index(question["correct_option"]),
-            is_anonymous=False, allows_multiple_answers=False,
-            open_period=duration,
-        )
+        if session.get("mode","learning")=="exam":
+            poll = await _send_poll_with_rate_limit_retry(application.bot,
+                chat_id=session["chat_id"], question=question_text[:300], options=poll_options,
+                type="regular", is_anonymous=False, allows_multiple_answers=False,
+                open_period=int(session["interval_seconds"]),
+            )
+        else:
+            poll = await _send_poll_with_rate_limit_retry(application.bot,
+                chat_id=session["chat_id"], question=question_text[:300], options=poll_options,
+                type="quiz", correct_option_id=letters.index(question["correct_option"]),
+                is_anonymous=False, explanation=explanation[:200] if explanation else None,
+                open_period=int(session["interval_seconds"]),
+            )
         async with pool.connection() as conn:
             await conn.execute("UPDATE group_quiz_session_questions SET poll_id=%s,message_id=%s,status='open',opened_at=NOW(),updated_at=NOW() WHERE session_id=%s AND position=%s", (str(poll.poll.id), int(poll.message_id), sid, position))
-            await conn.execute("UPDATE group_quiz_sessions SET next_at=NOW()+(%s * INTERVAL '1 second') WHERE id=%s", (duration, sid))
+            await conn.execute("UPDATE group_quiz_sessions SET next_at=NOW()+(%s * INTERVAL '1 second') WHERE id=%s", (int(session["interval_seconds"]), sid))
         # Confirmation is sent before this function; delete the launch notice only
         # after the first question was successfully published and persisted.
         if position == 0:
@@ -1209,7 +1162,7 @@ async def _post_question(application, pool, session, question):
                         )
                         await conn.execute(
                             "UPDATE group_quiz_sessions SET next_at=NOW()+(%s * INTERVAL '1 second') WHERE id=%s",
-                            (duration, sid),
+                            (int(session["interval_seconds"]), sid),
                         )
                     log.warning("Recovered poll persistence after error for session %s position %s", sid, position)
                     return
@@ -1493,9 +1446,9 @@ async def _finish_session(application, pool, session):
         try:
             group_html = _build_group_html(sid, finished["quiz_title"], total, participants, votes,
                 correct, wrong, unanswered, positive, negative, average_score, median_score,
-                high_score, low_score, question_stats, answer_key, scores, "BPSC NEXUS")
+                high_score, low_score, question_stats, answer_key, scores, finished.get("brand_name") or "BPSC Nexus")
             report_file = BytesIO(group_html.encode("utf-8"))
-            brand_slug = re.sub(r'[^A-Za-z0-9_-]+', '_', str("BPSC NEXUS")).strip('_')[:40] or "BPSC_Nexus"
+            brand_slug = re.sub(r'[^A-Za-z0-9_-]+', '_', str(finished.get("brand_name") or "BPSC Nexus")).strip('_')[:40] or "BPSC_Nexus"
             report_file.name = f"{brand_slug}_Quiz_{sid}_Group_Report.html"
             await application.bot.send_document(
                 chat_id=int(finished["chat_id"]), document=report_file, filename=report_file.name,
@@ -1518,65 +1471,6 @@ async def _finish_session(application, pool, session):
         await conn.execute("""UPDATE group_quiz_sessions SET report_sent=(summary_sent AND group_report_sent)
             WHERE id=%s""", (sid,))
     await _update_live_progress(application, pool, sid, max(0, total - 1), force=True, completed=True)
-
-def _group_layout_text(question):
-    qtype=str(question.get("question_type") or "standard")
-    structure=question.get("question_structure") or {}
-    if isinstance(structure,str):
-        try: structure=json.loads(structure)
-        except Exception: structure={}
-    structure=structure if isinstance(structure,dict) else {}
-    stem=str(question.get("question_en") or "")
-    structured=[]
-    if qtype=="statement_based": structured=structure.get("statements") or []
-    elif qtype=="match_following": structured=(structure.get("list_i") or [])+(structure.get("list_ii") or [])
-    for item in structured:
-        if isinstance(item,dict): item=item.get("en") or item.get("text") or ""
-        item=str(item).strip()
-        if item:
-            stem=re.sub(r"(?im)^\s*(?:\(?[0-9ivx]+[.)]?)?\s*"+re.escape(item)+r"\s*$", "", stem)
-    lines=[stem.strip()]
-    if question.get("question_hi"): lines.append(str(question["question_hi"]))
-    if qtype=="statement_based":
-        statements=structure.get("statements") or []
-        if statements:
-            lines.append("STATEMENTS / कथन")
-            for i,item in enumerate(statements,1):
-                if isinstance(item,dict): item=item.get("en") or item.get("text") or str(item)
-                lines.append(f"┌─ STATEMENT {i} ───────────────\n│ {item}\n└────────────────────────────")
-    elif qtype=="match_following":
-        left=structure.get("list_i") or []; right=structure.get("list_ii") or []
-        if left or right:
-            lines.append("LIST I / सूची I                         LIST II / सूची II")
-            for i in range(max(len(left),len(right))):
-                a=left[i] if i<len(left) else ""; b=right[i] if i<len(right) else ""
-                if isinstance(a,dict): a=str(a.get("en") or a.get("text") or "")+((" / "+str(a.get("hi"))) if a.get("hi") else "")
-                if isinstance(b,dict): b=str(b.get("en") or b.get("text") or "")+((" / "+str(b.get("hi"))) if b.get("hi") else "")
-                a=str(a); b=str(b)
-                lines.append(f"{i+1}. {a[:34]:<34}  {chr(65+i)}. {b}")
-    elif qtype=="assertion_reason":
-        if structure.get("assertion"): lines.append(f"┌─ ASSERTION (A) / अभिकथन ───\n│ {structure['assertion']}\n└────────────────────────────")
-        if structure.get("reason"): lines.append(f"┌─ REASON (R) / कारण ─────────\n│ {structure['reason']}\n└────────────────────────────")
-    return "\n".join(lines)
-
-
-async def _publish_group_explanation(application,pool,session,question):
-    """Publish a separate bilingual answer/explanation immediately after poll closure."""
-    sid=int(session["id"]); position=int(question["position"])
-    async with pool.connection() as conn:
-        cur=await conn.execute("SELECT * FROM group_quiz_session_questions WHERE session_id=%s AND position=%s AND explanation_sent=FALSE",(sid,position))
-        claimed=await cur.fetchone()
-    if not claimed: return
-    opts=claimed["options"] if isinstance(claimed["options"],dict) else json.loads(claimed["options"] or "{}")
-    correct=str(claimed["correct_option"] or "")
-    answer=str(opts.get(correct,""))
-    parts=[f"BPSC NEXUS  ·  ANSWER & EXPLANATION",f"QUESTION {position+1}/{int(session['questions_count'])}","",f"CORRECT ANSWER: {correct}. {answer}"]
-    if claimed.get("explanation_en"): parts.extend(["","EXPLANATION (ENGLISH)",str(claimed["explanation_en"])])
-    if claimed.get("explanation_hi"): parts.extend(["","व्याख्या (हिन्दी)",str(claimed["explanation_hi"])])
-    await application.bot.send_message(chat_id=int(session["chat_id"]),text="\n".join(parts)[:3900])
-    async with pool.connection() as conn:
-        await conn.execute("UPDATE group_quiz_session_questions SET explanation_sent=TRUE WHERE session_id=%s AND position=%s",(sid,position))
-
 
 async def scheduler(application, pool):
     """Persisted scheduler. Poll state and due times survive service restarts."""
@@ -1622,6 +1516,14 @@ async def scheduler(application, pool):
                 if position >= int(session["questions_count"]):
                     await _finish_session(application, pool, session)
                     continue
+                if not await _group_is_authorized(pool, int(session["chat_id"])):
+                    async with pool.connection() as conn:
+                        await conn.execute("UPDATE group_quiz_sessions SET status='cancelled',completed_at=NOW() WHERE id=%s AND status='active'", (sid,))
+                    try:
+                        await application.bot.send_message(chat_id=int(session["chat_id"]), text="🔒 BPSC Nexus Quiz membership is inactive for this group. This quiz has been stopped.")
+                    except Exception:
+                        log.info("Could not notify group %s about inactive membership", session["chat_id"])
+                    continue
                 async with pool.connection() as conn:
                     cur = await conn.execute("SELECT * FROM group_quiz_session_questions WHERE session_id=%s AND position=%s", (sid, position))
                     question = await cur.fetchone()
@@ -1639,11 +1541,7 @@ async def scheduler(application, pool):
                         # Telegram may have auto-closed the poll at open_period; that is expected.
                         log.debug("Poll already closed or message unavailable for session %s", sid)
                     async with pool.connection() as conn:
-                        cur = await conn.execute("UPDATE group_quiz_session_questions SET status='closed',updated_at=NOW() WHERE session_id=%s AND position=%s RETURNING *", (sid, position))
-                        closed_question = await cur.fetchone()
-                    if closed_question:
-                        await _publish_group_explanation(application, pool, session, closed_question)
-                    async with pool.connection() as conn:
+                        await conn.execute("UPDATE group_quiz_session_questions SET status='closed',updated_at=NOW() WHERE session_id=%s AND position=%s", (sid, position))
                         next_pos = position + 1
                         await conn.execute("UPDATE group_quiz_sessions SET current_index=%s,next_at=NOW() WHERE id=%s AND status='active'", (next_pos, sid))
                     if next_pos >= int(session["questions_count"]):
@@ -1651,9 +1549,8 @@ async def scheduler(application, pool):
                             cur = await conn.execute("SELECT * FROM group_quiz_sessions WHERE id=%s", (sid,)); fresh = await cur.fetchone()
                         await _finish_session(application, pool, fresh)
                 elif question["status"] == "closed":
-                    # Retry a bilingual explanation if a prior delivery failed after poll closure.
-                    await _publish_group_explanation(application, pool, session, question)
-                    # Backward-compatible recovery for sessions that closed a poll but did not advance.
+                    # Backward-compatible recovery for sessions from older code that
+                    # closed the poll but failed to advance current_index.
                     async with pool.connection() as conn:
                         await conn.execute("UPDATE group_quiz_sessions SET current_index=GREATEST(current_index,%s),next_at=NOW() WHERE id=%s AND status='active'", (position + 1, sid))
                         cur = await conn.execute("SELECT * FROM group_quiz_sessions WHERE id=%s", (sid,))

@@ -14,5 +14,3 @@ services:
         sync: false
       - key: ADMIN_TELEGRAM_IDS
         sync: false
-      - key: BOT_MODE
-        value: webhook
