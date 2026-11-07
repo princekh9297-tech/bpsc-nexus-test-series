@@ -1,21 +1,5 @@
-# Optional cleanup after applying the patch
+This final package is a clean native Telegram bot distribution. It intentionally does not include legacy Mini App, payment, membership-pass, web dashboard, or static frontend files.
 
-These files belong to the retired Mini App, payment/membership, or Nexus Intel surfaces.
-They are no longer imported or used by the updated Telegram bot (`render.yaml` starts `python bot.py`).
+When replacing an older project checkout, back it up first. Deploy this package as a separate clean project or replace the old application code only after confirming that the hosting start command points to `python bot.py` and the existing DATABASE_URL is retained.
 
-After making a backup, you may remove these from the full project:
-- main.py (old FastAPI/Mini App wrapper)
-- miniapp.py
-- index.html
-- membership.html
-- premium_pass_migration.sql (do not run this migration again)
-- render-miniapp.yaml
-- intel.py
-- intel_worker.py
-- render-intel-cron.yaml
-- static/ (old Mini App static assets; delete only if nothing else in your project uses them)
-
-Database safety:
-- The patch does not drop or alter legacy payment/pass tables.
-- Do not delete existing PostgreSQL tables or reset Neon.
-- Existing question-bank, published-test, attempt, and group-quiz data are retained.
+Do not drop or truncate the existing Neon database. This package performs additive schema setup and does not execute the previously discussed data reset.
