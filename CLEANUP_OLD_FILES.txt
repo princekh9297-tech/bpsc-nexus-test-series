@@ -1,0 +1,21 @@
+# Optional cleanup after applying the patch
+
+These files belong to the retired Mini App, payment/membership, or Nexus Intel surfaces.
+They are no longer imported or used by the updated Telegram bot (`render.yaml` starts `python bot.py`).
+
+After making a backup, you may remove these from the full project:
+- main.py (old FastAPI/Mini App wrapper)
+- miniapp.py
+- index.html
+- membership.html
+- premium_pass_migration.sql (do not run this migration again)
+- render-miniapp.yaml
+- intel.py
+- intel_worker.py
+- render-intel-cron.yaml
+- static/ (old Mini App static assets; delete only if nothing else in your project uses them)
+
+Database safety:
+- The patch does not drop or alter legacy payment/pass tables.
+- Do not delete existing PostgreSQL tables or reset Neon.
+- Existing question-bank, published-test, attempt, and group-quiz data are retained.

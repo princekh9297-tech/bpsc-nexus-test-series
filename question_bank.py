@@ -1731,7 +1731,7 @@ async def publish_quiz(q,context,pool,quiz_id):
 
 async def show_student_quizzes(q,pool):
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title,subject,(SELECT COUNT(*) FROM bank_quiz_questions bqq WHERE bqq.quiz_id=bq.id) AS n FROM bank_quizzes bq WHERE is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s) ORDER BY id DESC LIMIT 20", (q.from_user.id,)); rows=await cur.fetchall()
+        cur=await conn.execute("SELECT id,title,subject,(SELECT COUNT(*) FROM bank_quiz_questions bqq WHERE bqq.quiz_id=bq.id) AS n FROM bank_quizzes bq WHERE is_published=TRUE  ORDER BY id DESC LIMIT 20"); rows=await cur.fetchall()
     if not rows:
         await q.edit_message_text("No quizzes are published yet."); return
     lines=["📚 Available quizzes",""]; buttons=[]
@@ -1743,7 +1743,7 @@ async def show_student_quizzes(q,pool):
 
 async def choose_mode(q,context,pool,quiz_id):
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,q.from_user.id)); quiz=await cur.fetchone()
+        cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE",(quiz_id,)); quiz=await cur.fetchone()
     if not quiz: await q.edit_message_text("Quiz not found or not published."); return
     await q.edit_message_text(f"{quiz['title']}\n\nChoose a mode:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Practice (instant explanation)",callback_data=f"play:mode:practice:{quiz_id}")],[InlineKeyboardButton("⏱ Exam (results after submission)",callback_data=f"play:mode:exam:{quiz_id}")],[InlineKeyboardButton("Back to quizzes",callback_data="play:list")]]))
 
@@ -1751,12 +1751,30 @@ async def choose_mode(q,context,pool,quiz_id):
 async def start_attempt(q,context,pool,quiz_id,mode):
     if mode not in ("practice","exam"): return
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,q.from_user.id)); quiz=await cur.fetchone()
+        cur=await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks FROM bank_quizzes WHERE id=%s AND is_published=TRUE",(quiz_id,)); quiz=await cur.fetchone()
         if not quiz: await q.edit_message_text("Quiz unavailable."); return
         cur=await conn.execute("SELECT qb.id,qb.question_en,qb.question_hi,qb.options,qb.correct_option,qb.explanation_en,qb.explanation_hi FROM bank_quiz_questions bqq JOIN question_bank qb ON qb.id=bqq.question_id WHERE bqq.quiz_id=%s ORDER BY bqq.position",(quiz_id,)); questions=await cur.fetchall()
-        cur=await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions) VALUES(%s,%s,%s,%s) RETURNING id",(quiz_id,q.from_user.id,mode,len(questions))); attempt_id=(await cur.fetchone())["id"]
     if not questions: await q.edit_message_text("This quiz has no available questions."); return
-    context.user_data["qb_attempt"]={"attempt_id":attempt_id,"quiz":quiz,"questions":[dict(x) for x in questions],"index":0,"answers":{},"mode":mode,"started":datetime.now(timezone.utc).isoformat()}
+    prepared=[]
+    question_rows=[dict(row) for row in questions]
+    random.shuffle(question_rows)
+    for row in question_rows:
+        raw_options=row["options"] if isinstance(row["options"],dict) else json.loads(row["options"] or "{}")
+        pairs=[(str(k),str(v)) for k,v in raw_options.items() if str(v).strip()]
+        random.shuffle(pairs)
+        remapped={}
+        new_correct=None
+        for idx,(old_letter,value) in enumerate(pairs):
+            new_letter=LETTERS[idx]
+            remapped[new_letter]=value
+            if old_letter == row["correct_option"]:
+                new_correct=new_letter
+        row["options"]=remapped
+        row["correct_option"]=new_correct or row["correct_option"]
+        prepared.append(row)
+    async with pool.connection() as conn:
+        cur=await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions) VALUES(%s,%s,%s,%s) RETURNING id",(quiz_id,q.from_user.id,mode,len(prepared))); attempt_id=(await cur.fetchone())["id"]
+    context.user_data["qb_attempt"]={"attempt_id":attempt_id,"quiz":quiz,"questions":prepared,"index":0,"answers":{},"mode":mode,"started":datetime.now(timezone.utc).isoformat()}
     if mode == "exam":
         context.application.create_task(_exam_timeout(context.application, q.from_user.id, q.message.chat_id, attempt_id, pool, int(quiz["duration_minutes"])))
     await send_current_question(q,context)
