@@ -5,8 +5,9 @@ A Telegram-only quiz bot for BPSC preparation. No Mini App, no payments: every q
 ## What it does now
 - **Personal quizzes** in private chat: `/quiz` → pick a quiz → Practice or Exam → answer with buttons → score and review.
 - **Group quizzes** in any group: `/startquiz`, `/pausequiz`, `/resumequiz`, `/stopquiz`, `/schedulequiz`, `/leaderboard`, `/quizstatus`, `/quizbrand` (group admins only). Any group can use them; the bot registers the group automatically.
-- **Admin panel** (`/admin`, private chat, `ADMIN_TELEGRAM_IDS` only): Question Bank & Quiz Studio (HTML/JSON/CSV/forwarded-poll import, review, quiz builder) and Nexus Intel (PIB news).
-- **Reset Question Bank** (`/admin` → Question Bank & Quiz Studio → ☢️ Reset Question Bank): shows counts, then requires you to type `RESET`. Permanently deletes questions, quizzes, personal attempts, group quiz history and the leaderboard. Keeps users, subjects, group names/branding and Nexus Intel news.
+- **Admin workspace** (`/admin`, private chat, `ADMIN_TELEGRAM_IDS` only): compact Quiz Studio with Create Quiz, Manage Quizzes, Question Bank, Subjects & Collections, and Tools & Maintenance. Personal quizzes support automatic random or manual question selection, including mixed-subject pools. Group quizzes continue through `/startquiz` and `/schedulequiz` in the target group.
+- **Telegram menu button**: startup explicitly resets the chat menu button to Telegram Commands, removing any previously configured Web App/Mini App menu button.
+- **Reset Question Bank** (`/admin` → Quiz Studio → Tools & Maintenance → ☢️ Reset Question Bank): shows counts, then requires you to type `RESET`. Permanently deletes questions, quizzes, personal attempts, group quiz history and the leaderboard. Keeps users, subjects, group names/branding and Nexus Intel news.
 - `/myanalysis`: private analysis of your group quiz performance.
 
 ## Environment variables (Render → Environment)

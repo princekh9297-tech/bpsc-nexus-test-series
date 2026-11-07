@@ -645,6 +645,92 @@ def _html_to_records(raw: str) -> list[dict]:
     raise ValueError("Could not identify a usable question set in this HTML. The importer tried embedded JSON, JavaScript arrays/objects, nested chapter data and visible HTML question blocks. This file may use an unsupported layout, encrypted data, or dynamically fetched questions. No uploaded JavaScript was executed.")
 
 
+
+def _txt_to_records(text: str) -> list[dict]:
+    """Parse plain-text MCQs with A-E options and optional answer/explanation labels."""
+    lines = [line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    records = []
+    current = None
+    section = "question"
+    active_option = None
+    q_start = re.compile(r"^\s*(?:(?:Q(?:uestion)?\s*)?\d{1,5}\s*[.)\-:]\s*|Q(?:uestion)?\s*\d{1,5}\s*[:.)\-]\s*)(.*)$", re.I)
+    option_line = re.compile(r"^\s*([A-E])\s*[).:\-]\s*(.*?)\s*$", re.I)
+    standalone_option = re.compile(r"^\s*([A-E])\s*$", re.I)
+    answer_line = re.compile(r"^\s*(?:correct\s*)?(?:answer|ans|key)\s*[:：\-]\s*(.+?)\s*$", re.I)
+    explanation_line = re.compile(r"^\s*(?:explanation|solution|reason|व्याख्या)\s*[:：\-]?\s*(.*)$", re.I)
+
+    def finish():
+        nonlocal current
+        if not current: return
+        question = "\n".join(x for x in current["question"] if x.strip()).strip()
+        options = {k: "\n".join(v).strip() for k, v in current["options"].items()}
+        options = {k: v for k, v in options.items() if v}
+        if question and options:
+            records.append({"question": question, "options": options,
+                            "correct_answer": current.get("answer"),
+                            "explanation": "\n".join(current["explanation"]).strip()})
+        current = None
+
+    def begin(question_text=""):
+        nonlocal current, section, active_option
+        current = {"question": [], "options": {k: [] for k in "ABCDE"}, "answer": None, "explanation": []}
+        if question_text.strip(): current["question"].append(question_text.strip())
+        section, active_option = "question", None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if current and any(current["options"].values()) and section in ("answer", "explanation"):
+                finish()
+            continue
+        numbered = q_start.match(raw_line)
+        if numbered and current and any(current["options"].values()): finish()
+        if current is None:
+            begin(numbered.group(1) if numbered else line)
+            if numbered: continue
+        if section == "explanation":
+            current["explanation"].append(line); continue
+        em = explanation_line.match(raw_line)
+        if em:
+            section, active_option = "explanation", None
+            if em.group(1).strip(): current["explanation"].append(em.group(1).strip())
+            continue
+        am = answer_line.match(raw_line)
+        if am:
+            m = re.search(r"(?i)\b(?:option\s*)?([A-E])\b", am.group(1))
+            if m: current["answer"] = m.group(1).upper()
+            section, active_option = "answer", None
+            continue
+        om = option_line.match(raw_line)
+        if om:
+            letter, value = om.group(1).upper(), om.group(2).strip()
+            correct = bool(re.search(r"[✓✔☑✅]", value))
+            value = re.sub(r"\s*[✓✔☑✅]+\s*$", "", value).strip()
+            current["options"][letter] = [value] if value else []
+            active_option, section = letter, "options"
+            if correct: current["answer"] = letter
+            continue
+        sm = standalone_option.match(raw_line)
+        if sm:
+            active_option = sm.group(1).upper(); current["options"][active_option] = []; section = "options"; continue
+        if active_option and section == "options":
+            correct = bool(re.search(r"[✓✔☑✅]", line))
+            value = re.sub(r"\s*[✓✔☑✅]+\s*$", "", line).strip()
+            if value: current["options"][active_option].append(value)
+            if correct: current["answer"] = active_option
+            continue
+        if section == "answer":
+            m = re.fullmatch(r"\s*(?:OPTION\s*)?\(?([A-E])\)?[.)]?\s*", line, re.I)
+            if m: current["answer"] = m.group(1).upper(); continue
+            section = "options" if any(current["options"].values()) else "question"
+        if section == "question": current["question"].append(line)
+        elif section == "options" and active_option: current["options"][active_option].append(line)
+        elif section == "options": current["question"].append(line)
+    finish()
+    if not records:
+        raise ValueError("Could not identify MCQs in this TXT file. Use numbered questions followed by A)–E) options. Mark the correct option with ✓/✅ or add an 'Answer: D' line. Optional explanations can start with 'Explanation:'.")
+    return records
+
 def parse_file(filename: str, raw: bytes, subject: str, owner_id: int) -> tuple[list[dict], str]:
     if len(raw) > MAX_FILE_BYTES: raise ValueError("File exceeds the 20 MB import limit.")
     ext=filename.rsplit(".",1)[-1].lower() if "." in filename else ""
@@ -656,7 +742,8 @@ def parse_file(filename: str, raw: bytes, subject: str, owner_id: int) -> tuple[
         except Exception as e: raise ValueError(f"Could not read CSV: {e}")
         if not records: raise ValueError("CSV is empty or has no header row.")
     elif ext in ("html", "htm"): records=_html_to_records(text)
-    else: raise ValueError("Supported file formats are .html, .htm, .json and .csv.")
+    elif ext == "txt": records=_txt_to_records(text)
+    else: raise ValueError("Supported file formats are .html, .htm, .json, .csv and .txt.")
     if len(records) > MAX_QUESTIONS_PER_IMPORT: raise ValueError(f"Import is limited to {MAX_QUESTIONS_PER_IMPORT:,} questions per file.")
     normalized=[]; invalid=0
     for record in records:
@@ -767,21 +854,48 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
 
 def admin_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add One Question", callback_data="qb:addone"), InlineKeyboardButton("📥 Bulk Import File", callback_data="qb:import")],
-        [InlineKeyboardButton("➕ Create Subject", callback_data="qb:newsubject"), InlineKeyboardButton("📚 Create Collection", callback_data="qb:newcollection")],
-        [InlineKeyboardButton("🗂 Manage / Merge Subjects", callback_data="qb:subjects")],
-        [InlineKeyboardButton("🧪 Create Test Series", callback_data="qb:build")],
-        [InlineKeyboardButton("🗃 Browse / Edit", callback_data="qb:browse"), InlineKeyboardButton("🗑 Delete Questions", callback_data="qb:deletehub")],
-        [InlineKeyboardButton("🧹 Bulk Delete by IDs", callback_data="qb:bulkdelete"), InlineKeyboardButton("📦 Import History / Undo", callback_data="qb:history")],
-        [InlineKeyboardButton("🗂 Manage Test Series", callback_data="qb:manage")],
-        [InlineKeyboardButton("🕵️ Verify Pending", callback_data="qb:pending"), InlineKeyboardButton("🧪 Quality Audit", callback_data="qb:audit")],
-        [InlineKeyboardButton("☢️ Reset Question Bank", callback_data="qb:reset")],
+        [InlineKeyboardButton("🧪 Create Quiz", callback_data="qb:build")],
+        [InlineKeyboardButton("🗂 Manage Quizzes", callback_data="qb:manage")],
+        [InlineKeyboardButton("📚 Question Bank", callback_data="qb:questionbank")],
+        [InlineKeyboardButton("📁 Subjects & Collections", callback_data="qb:subjects_menu")],
+        [InlineKeyboardButton("⚙️ Tools & Maintenance", callback_data="qb:tools")],
         [InlineKeyboardButton("↩ Main Admin Panel", callback_data="adm:home")],
+    ])
+
+
+def question_bank_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Question", callback_data="qb:addone"), InlineKeyboardButton("📥 Bulk Import", callback_data="qb:import")],
+        [InlineKeyboardButton("🗃 Browse / Edit Questions", callback_data="qb:browse")],
+        [InlineKeyboardButton("🗑 Delete / Archive Questions", callback_data="qb:deletehub")],
+        [InlineKeyboardButton("📦 Import History", callback_data="qb:history")],
+        [InlineKeyboardButton("⬅ Quiz Studio", callback_data="qb:home")],
+    ])
+
+
+def subjects_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Create Subject", callback_data="qb:newsubject"), InlineKeyboardButton("📚 Create Collection", callback_data="qb:newcollection")],
+        [InlineKeyboardButton("🗂 Manage Subjects & Collections", callback_data="qb:subjects")],
+        [InlineKeyboardButton("🏷 Manage Topics", callback_data="qb:topicmanage")],
+        [InlineKeyboardButton("⬅ Quiz Studio", callback_data="qb:home")],
+    ])
+
+
+def tools_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🕵️ Verify Pending Questions", callback_data="qb:pending")],
+        [InlineKeyboardButton("🧪 Quality Audit", callback_data="qb:audit")],
+        [InlineKeyboardButton("🧹 Bulk Delete", callback_data="qb:bulkdelete")],
+        [InlineKeyboardButton("☢️ Reset Question Bank", callback_data="qb:reset")],
+        [InlineKeyboardButton("⬅ Quiz Studio", callback_data="qb:home")],
     ])
 
 
 def subject_keyboard(prefix: str, page: int = 0):
     rows=[]
+    if prefix == "qb:quizsubject":
+        rows.append([InlineKeyboardButton("🌐 Mixed subjects", callback_data="qb:quizsubject:all")])
     page=max(0,int(page)); start=page*20; visible=SUBJECTS[start:start+20]
     for i in range(0,len(visible),2):
         rows.append([InlineKeyboardButton(visible[j][:40],callback_data=f"{prefix}:{start+j}") for j in range(i,min(i+2,len(visible)))])
@@ -873,6 +987,33 @@ async def show_reset_prompt(q, context, pool):
     await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data="qb:home")]]))
 
 
+async def show_manual_quiz_picker(q, pool, context, page=0):
+    flow=context.user_data.get("qb_flow",{})
+    if flow.get("step") != "quiz_manual":
+        await q.edit_message_text("Manual selection expired. Start again.",reply_markup=admin_keyboard()); return
+    page=max(0,int(page)); flow["manual_page"]=page; context.user_data["qb_flow"]=flow
+    subject=flow.get("subject"); limit=10; offset=page*limit
+    async with pool.connection() as conn:
+        if subject:
+            cur=await conn.execute("SELECT id,question_en FROM question_bank WHERE status='ready' AND subject=%s ORDER BY id DESC LIMIT %s OFFSET %s",(subject,limit,offset))
+            total_cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status='ready' AND subject=%s",(subject,))
+        else:
+            cur=await conn.execute("SELECT id,question_en FROM question_bank WHERE status='ready' ORDER BY id DESC LIMIT %s OFFSET %s",(limit,offset))
+            total_cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status='ready'")
+        rows=await cur.fetchall(); total=int((await total_cur.fetchone())["n"])
+    selected=set(flow.get("manual_ids",[])); buttons=[]
+    for row in rows:
+        mark="☑" if int(row["id"]) in selected else "☐"
+        label=f"{mark} #{row['id']} · {row['question_en'][:38]}"
+        buttons.append([InlineKeyboardButton(label,callback_data=f"qb:manualtoggle:{row['id']}")])
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton("← Previous",callback_data=f"qb:manualpage:{page-1}"))
+    if offset+limit<total: nav.append(InlineKeyboardButton("Next →",callback_data=f"qb:manualpage:{page+1}"))
+    if nav: buttons.append(nav)
+    buttons += [[InlineKeyboardButton(f"✅ Finish · {len(selected)} selected",callback_data="qb:manualfinish")],[InlineKeyboardButton("Cancel",callback_data="qb:home")]]
+    await q.edit_message_text(f"🖐 MANUAL QUESTION SELECTION\nPool: {subject or 'Mixed subjects'}\nSelected: {len(selected)} / 100\nPage {page+1} · {total} verified questions\n\nTap questions to select or deselect them.",reply_markup=InlineKeyboardMarkup(buttons))
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, pool, is_authorized: bool):
     q=update.callback_query
     if not q: return
@@ -883,6 +1024,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
     if data.startswith("qb:") and not is_authorized:
         await q.answer("Not authorized.",show_alert=True); return
     await q.answer()
+    if data == "qb:questionbank":
+        await q.edit_message_text("📚 QUESTION BANK\n\nManage the question records used to build quizzes.", reply_markup=question_bank_keyboard()); return
+    if data == "qb:subjects_menu":
+        await q.edit_message_text("📁 SUBJECTS & COLLECTIONS\n\nOrganize the question bank structure.", reply_markup=subjects_keyboard()); return
+    if data == "qb:tools":
+        await q.edit_message_text("⚙️ TOOLS & MAINTENANCE\n\nAdministrative and database operations.", reply_markup=tools_keyboard()); return
     if data.startswith("qb:subpage:"):
         try:
             _,_,prefix,page_raw=data.split(":",3); page=max(0,int(page_raw))
@@ -1243,8 +1390,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
         if not rows:
             await q.edit_message_text("No quizzes exist yet.",reply_markup=admin_keyboard()); return
         buttons=[[InlineKeyboardButton(f"{'🟢' if r['is_published'] else '📝'} #{r['id']} · {r['title'][:30]} ({r['n']} Q)",callback_data=f"qb:manageview:{r['id']}")] for r in rows]
-        buttons.append([InlineKeyboardButton("Back",callback_data="qb:home")])
-        await q.edit_message_text("🛠 Quiz Manager\n\nChoose a quiz to edit its settings, publication status or sharing link.",reply_markup=InlineKeyboardMarkup(buttons)); return
+        buttons += [[InlineKeyboardButton("📝 Drafts",callback_data="qb:managefilter:drafts"), InlineKeyboardButton("🟢 Published",callback_data="qb:managefilter:published")], [InlineKeyboardButton("⬅ Quiz Studio",callback_data="qb:home")]]
+        await q.edit_message_text("🗂 MANAGE QUIZZES\n\nChoose a quiz to edit its settings, question set or publication status.",reply_markup=InlineKeyboardMarkup(buttons)); return
+    if data.startswith("qb:managefilter:"):
+        state=data.rsplit(":",1)[1]
+        if state not in {"drafts","published"}:
+            await q.edit_message_text("Invalid quiz filter.",reply_markup=admin_keyboard()); return
+        published = state == "published"
+        async with pool.connection() as conn:
+            cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.is_published,COUNT(qq.question_id) AS n
+                FROM bank_quizzes q LEFT JOIN bank_quiz_questions qq ON qq.quiz_id=q.id
+                WHERE q.is_published=%s GROUP BY q.id ORDER BY q.id DESC LIMIT 30""",(published,))
+            rows=await cur.fetchall()
+        buttons=[[InlineKeyboardButton(f"#{r['id']} · {r['title'][:32]} ({r['n']} Q)",callback_data=f"qb:manageview:{r['id']}")] for r in rows]
+        buttons.append([InlineKeyboardButton("⬅ All quizzes",callback_data="qb:manage")])
+        await q.edit_message_text(f"{'🟢 PUBLISHED' if published else '📝 DRAFT'} QUIZZES\n\n{len(rows)} shown.",reply_markup=InlineKeyboardMarkup(buttons)); return
     if data.startswith("qb:manageview:"):
         quiz_id=int(data.rsplit(":",1)[1])
         async with pool.connection() as conn:
@@ -1253,8 +1413,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
             await q.edit_message_text("Quiz not found.",reply_markup=admin_keyboard()); return
         state="Published" if r['is_published'] else "Draft"
         text=f"🛠 Quiz #{r['id']}\n\nTitle: {r['title']}\nSubject: {r['subject']}\nQuestions: {r['n']}\nStatus: {state}\nDuration: {r['duration_minutes']} minutes\nScoring: +{r['positive_marks']} / −{r['negative_marks']}\nQuestion timer: {r['question_time_seconds']} seconds\nShuffle options: {'Yes' if r['shuffle_options'] else 'No'}"
-        buttons=[[InlineKeyboardButton("✏️ Edit title",callback_data=f"qb:editquiztitle:{quiz_id}"),InlineKeyboardButton("⏱ Duration",callback_data=f"qb:editquizduration:{quiz_id}")],[InlineKeyboardButton("⚖️ Scoring",callback_data=f"qb:editquizmarks:{quiz_id}")],[InlineKeyboardButton("🧩 Edit question set",callback_data=f"qb:managequestions:{quiz_id}")],[InlineKeyboardButton("🔒 Unpublish" if r['is_published'] else "🚀 Publish",callback_data=f"qb:togglepublish:{quiz_id}")],[InlineKeyboardButton("Back to quizzes",callback_data="qb:manage")]]
+        buttons=[[InlineKeyboardButton("✏️ Edit title",callback_data=f"qb:editquiztitle:{quiz_id}"),InlineKeyboardButton("⏱ Duration",callback_data=f"qb:editquizduration:{quiz_id}")],[InlineKeyboardButton("⚖️ Scoring",callback_data=f"qb:editquizmarks:{quiz_id}")],[InlineKeyboardButton("🧩 Edit question set",callback_data=f"qb:managequestions:{quiz_id}")],[InlineKeyboardButton("🔒 Unpublish" if r['is_published'] else "🚀 Publish",callback_data=f"qb:togglepublish:{quiz_id}")],[InlineKeyboardButton("🗑 Delete quiz",callback_data=f"qb:deletequizask:{quiz_id}")],[InlineKeyboardButton("Back to quizzes",callback_data="qb:manage")]]
         await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup(buttons)); return
+    if data.startswith("qb:deletequizask:"):
+        quiz_id=int(data.rsplit(":",1)[1])
+        async with pool.connection() as conn:
+            cur=await conn.execute("""SELECT q.title,q.is_published,
+                (SELECT COUNT(*) FROM bank_quiz_attempts a WHERE a.quiz_id=q.id) AS attempts
+                FROM bank_quizzes q WHERE q.id=%s""",(quiz_id,))
+            row=await cur.fetchone()
+        if not row:
+            await q.edit_message_text("Quiz not found.",reply_markup=admin_keyboard()); return
+        if row["attempts"]:
+            await q.edit_message_text(f"Deletion blocked for quiz #{quiz_id}.\n\nThis quiz has {row['attempts']} attempt(s). Historical results must be preserved. Unpublish it instead.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to quiz",callback_data=f"qb:manageview:{quiz_id}")]])); return
+        await q.edit_message_text(
+            f"⚠️ DELETE QUIZ CONFIRMATION\n\n#{quiz_id} · {row['title']}\nStatus: {'Published' if row['is_published'] else 'Draft'}\n\nThis permanently deletes the quiz and its question links. No attempts are recorded. Continue?",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Confirm permanent deletion",callback_data=f"qb:deletequizconfirm:{quiz_id}")],[InlineKeyboardButton("Cancel",callback_data=f"qb:manageview:{quiz_id}")]])
+        ); return
+    if data.startswith("qb:deletequizconfirm:"):
+        quiz_id=int(data.rsplit(":",1)[1])
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_attempts WHERE quiz_id=%s",(quiz_id,))
+                attempts=int((await cur.fetchone())["n"])
+                if attempts:
+                    await q.edit_message_text("Deletion cancelled: this quiz now has attempts. Historical results are protected.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to quiz",callback_data=f"qb:manageview:{quiz_id}")]])); return
+                cur=await conn.execute("DELETE FROM bank_quizzes WHERE id=%s RETURNING title",(quiz_id,))
+                deleted=await cur.fetchone()
+        await q.edit_message_text(f"Quiz #{quiz_id} {'deleted' if deleted else 'was not found'}.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage quizzes",callback_data="qb:manage")],[InlineKeyboardButton("Quiz Studio",callback_data="qb:home")]])); return
     if data.startswith("qb:editquiztitle:"):
         quiz_id=int(data.rsplit(":",1)[1]); context.user_data["qb_flow"]={"step":"edit_quiz_title","quiz_id":quiz_id}
         await q.edit_message_text("Send the new quiz title (1–160 characters).",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data=f"qb:manageview:{quiz_id}")]])); return
@@ -1310,7 +1496,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
         await q.edit_message_text(f"Choose the destination subject · {len(SUBJECTS)} subjects\nEmbedded labels map only to subjects you created; all other labels use this selected subject.",reply_markup=subject_keyboard("qb:importsubject")); return
     if data.startswith("qb:importsubject:"):
         idx=int(data.rsplit(":",1)[1]); context.user_data["qb_flow"]={"step":"await_file","subject":SUBJECTS[idx]}
-        await q.edit_message_text(f"Default subject: {SUBJECTS[idx]}\nNow send one .html, .json or .csv file in this private chat. The bot will preview import counts before saving.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
+        await q.edit_message_text(f"Default subject: {SUBJECTS[idx]}\nNow send one .txt, .html, .json or .csv file in this private chat. The bot will preview import counts before saving.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
     if data == "qb:browse":
         await q.edit_message_text("Send a search phrase, or type *all* to show the latest 15 questions.\n\nSearch covers question text and subject.",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("All recent questions",callback_data="qb:searchall")],[InlineKeyboardButton("⬅ Question Bank menu",callback_data="qb:home")]])); context.user_data["qb_flow"]={"step":"search"}; return
     if data == "qb:searchall":
@@ -1393,11 +1579,77 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
             cur=await conn.execute("UPDATE question_bank SET correct_option=%s,status=CASE WHEN jsonb_object_length(options)>=2 THEN 'ready' ELSE 'pending' END,updated_at=NOW() WHERE id=%s AND status='pending' RETURNING id",(letter,qid)); row=await cur.fetchone()
         await q.edit_message_text(f"Question #{qid} answer {'saved and marked ready' if row else 'was not changed (it may already be reviewed)' }.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Verify next",callback_data="qb:pending")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
     if data == "qb:build":
-        context.user_data["qb_flow"]={"step":"quiz_title"}
-        await q.edit_message_text("Send a title for the quiz. The next step lets you choose a subject and question count.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
+        await q.edit_message_text(
+            "🧪 CREATE QUIZ\n\nChoose the quiz destination.\n\nPersonal quizzes are created here. Group quizzes use the dedicated group quiz engine: open the target Telegram group and use /startquiz.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👤 Personal Quiz", callback_data="qb:quiztype:personal")],
+                [InlineKeyboardButton("👥 Group Quiz · Open group workflow", callback_data="qb:quiztype:group")],
+                [InlineKeyboardButton("⬅ Quiz Studio", callback_data="qb:home")],
+            ])
+        ); return
+    if data == "qb:quiztype:personal":
+        context.user_data["qb_flow"]={"step":"quiz_title","quiz_type":"personal"}
+        await q.edit_message_text("👤 PERSONAL QUIZ\n\nSend a title for the quiz. Next, choose a subject and question count.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
+    if data == "qb:quiztype:group":
+        await q.edit_message_text(
+            "👥 GROUP QUIZ\n\nGroup quizzes are managed by the group quiz engine. Add the bot to the target Telegram group with permission to send messages and create polls, then run /startquiz there. Use /schedulequiz to schedule a group quiz.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Quiz Studio",callback_data="qb:home")]])
+        ); return
     if data.startswith("qb:quizsubject:"):
-        idx=int(data.rsplit(":",1)[1]); flow=context.user_data.get("qb_flow",{}); flow.update({"step":"quiz_count","subject":SUBJECTS[idx]}); context.user_data["qb_flow"]=flow
-        await q.edit_message_text(f"Subject: {SUBJECTS[idx]}\nHow many questions? Send a number from 1 to 100.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
+        raw=data.rsplit(":",1)[1]
+        subject=None if raw == "all" else SUBJECTS[int(raw)]
+        flow=context.user_data.get("qb_flow",{}); flow.update({"step":"quiz_selection","subject":subject,"manual_ids":[]}); context.user_data["qb_flow"]=flow
+        label=subject or "Mixed subjects"
+        await q.edit_message_text(
+            f"Question pool: {label}\n\nChoose how to select questions:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎲 Automatic random selection",callback_data="qb:quizselection:auto")],
+                [InlineKeyboardButton("🖐 Manual question selection",callback_data="qb:quizselection:manual")],
+                [InlineKeyboardButton("Cancel",callback_data="qb:home")],
+            ])
+        ); return
+    if data == "qb:quizselection:auto":
+        flow=context.user_data.get("qb_flow",{})
+        if flow.get("step") != "quiz_selection":
+            await q.edit_message_text("Quiz setup expired. Start again.",reply_markup=admin_keyboard()); return
+        flow["step"]="quiz_count"; context.user_data["qb_flow"]=flow
+        await q.edit_message_text(f"Question pool: {flow.get('subject') or 'Mixed subjects'}\nHow many questions? Send a number from 1 to 100.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel",callback_data="qb:home")]])); return
+    if data == "qb:quizselection:manual":
+        flow=context.user_data.get("qb_flow",{})
+        if flow.get("step") != "quiz_selection":
+            await q.edit_message_text("Quiz setup expired. Start again.",reply_markup=admin_keyboard()); return
+        flow["step"]="quiz_manual"; flow["manual_ids"]=[]; context.user_data["qb_flow"]=flow
+        await show_manual_quiz_picker(q,pool,context,0); return
+    if data.startswith("qb:manualpage:"):
+        await show_manual_quiz_picker(q,pool,context,max(0,int(data.rsplit(":",1)[1]))); return
+    if data.startswith("qb:manualtoggle:"):
+        qid=int(data.rsplit(":",1)[1]); flow=context.user_data.get("qb_flow",{})
+        if flow.get("step") != "quiz_manual":
+            await q.edit_message_text("Manual selection expired. Start again.",reply_markup=admin_keyboard()); return
+        selected=flow.setdefault("manual_ids",[])
+        if qid in selected: selected.remove(qid)
+        elif len(selected)<100: selected.append(qid)
+        else:
+            await q.answer("Maximum 100 questions per quiz.",show_alert=True); return
+        context.user_data["qb_flow"]=flow
+        await show_manual_quiz_picker(q,pool,context,int(flow.get("manual_page",0))); return
+    if data == "qb:manualfinish":
+        flow=context.user_data.get("qb_flow",{}); ids=flow.get("manual_ids",[])
+        if flow.get("step") != "quiz_manual" or not ids:
+            await q.answer("Select at least one question first.",show_alert=True); return
+        subject=flow.get("subject") or "Mixed subjects"
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                cur=await conn.execute("INSERT INTO bank_quizzes(title,subject,created_by_telegram_id) VALUES(%s,%s,%s) RETURNING id",(flow["title"],subject,update.effective_user.id)); quiz_id=(await cur.fetchone())["id"]
+                for pos,qid in enumerate(ids,1):
+                    cur=await conn.execute("SELECT id FROM question_bank WHERE id=%s AND status='ready'",(qid,))
+                    if await cur.fetchone(): await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)",(quiz_id,pos,qid))
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_questions WHERE quiz_id=%s",(quiz_id,)); count=int((await cur.fetchone())["n"])
+                if count == 0: await conn.execute("DELETE FROM bank_quizzes WHERE id=%s",(quiz_id,))
+        context.user_data.pop("qb_flow",None)
+        if count == 0:
+            await q.edit_message_text("None of the selected questions are still verified. No quiz was created.",reply_markup=admin_keyboard()); return
+        await q.edit_message_text(f"🧩 Draft quiz created\n\nID: #{quiz_id}\nTitle: {flow['title']}\nQuestion pool: {subject}\nQuestions: {count}\n\nPublish it or manage the draft.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Publish",callback_data=f"qb:quizpublish:{quiz_id}")],[InlineKeyboardButton("🛠 Manage quiz",callback_data=f"qb:manageview:{quiz_id}")],[InlineKeyboardButton("Quiz Studio",callback_data="qb:home")]])); return
     if data.startswith("qb:quizpublish:"):
         quiz_id=int(data.rsplit(":",1)[1]); await publish_quiz(q,context,pool,quiz_id); return
     if data.startswith("qb:quizdiscard:"):
@@ -1517,8 +1769,8 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE, pool,
     if flow.get("step")!="await_file": return False
     filename=doc.file_name or "questions"
     ext=filename.rsplit(".",1)[-1].lower() if "." in filename else ""
-    if ext not in ("html","htm","json","csv"):
-        await message.reply_text("Unsupported file. Send .html, .htm, .json or .csv. Photo/PDF import is intentionally disabled in this phase."); return True
+    if ext not in ("html","htm","json","csv","txt"):
+        await message.reply_text("Unsupported file. Send .txt, .html, .htm, .json or .csv. Photo/PDF import is intentionally disabled in this phase."); return True
     if doc.file_size and doc.file_size>MAX_FILE_BYTES:
         await message.reply_text("File exceeds the 20 MB import limit."); return True
     try:
@@ -1768,15 +2020,20 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
         try: n=int(msg.text.strip())
         except ValueError: await msg.reply_text("Send a whole number from 1 to 100."); return True
         if not 1<=n<=100: await msg.reply_text("Question count must be from 1 to 100."); return True
-        subject=flow["subject"]
+        subject=flow.get("subject")
         async with pool.connection() as conn:
-            cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' AND subject=%s ORDER BY RANDOM() LIMIT %s",(subject,n)); rows=await cur.fetchall()
+            if subject:
+                cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' AND subject=%s ORDER BY RANDOM() LIMIT %s",(subject,n))
+            else:
+                cur=await conn.execute("SELECT id FROM question_bank WHERE status='ready' ORDER BY RANDOM() LIMIT %s",(n,))
+            rows=await cur.fetchall()
             if len(rows)<n:
-                await msg.reply_text(f"Only {len(rows)} verified questions are available in {subject}. Choose a smaller number or import more questions."); return True
-            cur=await conn.execute("INSERT INTO bank_quizzes(title,subject,created_by_telegram_id) VALUES(%s,%s,%s) RETURNING id",(flow["title"],subject,user.id)); quiz_id=(await cur.fetchone())["id"]
+                await msg.reply_text(f"Only {len(rows)} verified questions are available in {subject or 'the full question bank'}. Choose a smaller number or import more questions."); return True
+            quiz_subject=subject or "Mixed subjects"
+            cur=await conn.execute("INSERT INTO bank_quizzes(title,subject,created_by_telegram_id) VALUES(%s,%s,%s) RETURNING id",(flow["title"],quiz_subject,user.id)); quiz_id=(await cur.fetchone())["id"]
             for pos,row in enumerate(rows,1): await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,position,question_id) VALUES(%s,%s,%s)",(quiz_id,pos,row["id"]))
         context.user_data.pop("qb_flow",None)
-        await msg.reply_text(f"🧩 Draft quiz created\n\nID: #{quiz_id}\nTitle: {flow['title']}\nSubject: {subject}\nQuestions: {n}\nScoring: +1 correct, −1/3 incorrect, 0 skipped\n\nPublish it for students or discard the draft.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Publish for students",callback_data=f"qb:quizpublish:{quiz_id}")],[InlineKeyboardButton("🗑 Discard draft",callback_data=f"qb:quizdiscard:{quiz_id}")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return True
+        await msg.reply_text(f"🧩 Draft quiz created\n\nID: #{quiz_id}\nTitle: {flow['title']}\nQuestion pool: {subject or 'Mixed subjects'}\nQuestions: {n}\nScoring: +1 correct, −1/3 incorrect, 0 skipped\n\nPublish it for students or discard the draft.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Publish for students",callback_data=f"qb:quizpublish:{quiz_id}")],[InlineKeyboardButton("🗑 Discard draft",callback_data=f"qb:quizdiscard:{quiz_id}")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return True
     # Handle forwarded text as a question draft only if no other admin flow is active.
     forwarded=bool(getattr(msg,"forward_origin",None) or getattr(msg,"forward_from",None) or getattr(msg,"forward_from_chat",None))
     if not step:

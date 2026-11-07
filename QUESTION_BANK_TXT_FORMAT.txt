@@ -1,0 +1,26 @@
+BPSC NEXUS — TXT QUESTION BANK FORMAT
+
+Question 1. What is the capital of India?
+A) Mumbai
+B) New Delhi ✓
+C) Kolkata
+D) Chennai
+Explanation: New Delhi is the capital of India.
+
+Question 2. Which planet is known as the Red Planet?
+A) Earth
+B) Mars
+C) Venus
+D) Jupiter
+Answer: B
+Explanation: Mars appears red due to iron oxide on its surface.
+
+RULES
+- Use one question per block. Numbering is recommended.
+- Use A) through E) for options. Standalone labels (A on one line, option text on the next) are also supported.
+- Mark the correct option with ✓, ✔, ☑ or ✅, OR add Answer: B.
+- Start explanations with Explanation:, Solution: or Reason:.
+- Blank lines between questions are recommended.
+- Question, option and explanation text may span multiple lines.
+- If no correct answer is detected, the question is imported as pending verification.
+- Questions need at least two options to be recognized as MCQs.

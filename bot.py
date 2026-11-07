@@ -4,7 +4,7 @@ import os
 
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, MenuButtonCommands
 from telegram.ext import PollAnswerHandler
 import question_bank as qb
 import group_quiz as gq
@@ -132,6 +132,11 @@ async def post_init(application: Application) -> None:
     if application.bot_data.get("group_quiz_scheduler_task") is None:
         application.bot_data["group_quiz_scheduler_task"] = asyncio.create_task(gq.scheduler(application, pool))
     try:
+        # Replace any previously configured Telegram Web App menu button with the native Commands menu.
+        # Reset both the bot-wide default and any per-admin private-chat overrides.
+        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        for admin_id in ADMIN_TELEGRAM_IDS:
+            await application.bot.set_chat_menu_button(chat_id=int(admin_id), menu_button=MenuButtonCommands())
         await application.bot.set_my_commands([
             BotCommand("start", "Start BPSC Nexus"),
             BotCommand("quiz", "Take a quiz in this chat"),
