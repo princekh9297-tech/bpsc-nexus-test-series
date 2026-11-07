@@ -3296,6 +3296,15 @@ loadAdminSession().finally(()=>{loadAccess().catch(()=>{}).finally(()=>{loadQuiz
  });
  document.querySelectorAll('[data-home-route]').forEach(b=>b.addEventListener('click',()=>{const tab=b.dataset.homeRoute;document.querySelector(`[data-tab="${tab}"]`)?.click()}));
 })();
+
+// Deep-link support for the Telegram /admin command and Admin Panel menu button.
+// Authentication and every admin API remain enforced by the backend.
+try {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('admin') === '1') {
+    switchTab('admin', false);
+  }
+} catch (e) { /* Keep normal workspace startup unaffected. */ }
 </script>
 </body>
 </html>
