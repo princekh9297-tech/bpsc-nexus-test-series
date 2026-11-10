@@ -135,6 +135,18 @@ DDL = [
     "ALTER TABLE bank_quiz_attempts ADD COLUMN IF NOT EXISTS question_time_seconds INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE bank_quiz_attempts ADD COLUMN IF NOT EXISTS quiz_settings JSONB NOT NULL DEFAULT '{}'::jsonb",
     "CREATE INDEX IF NOT EXISTS idx_bank_attempts_user ON bank_quiz_attempts(telegram_id, started_at DESC)",
+    """CREATE TABLE IF NOT EXISTS bank_quiz_attempt_polls (
+        poll_id TEXT PRIMARY KEY,
+        attempt_id BIGINT NOT NULL REFERENCES bank_quiz_attempts(id) ON DELETE CASCADE,
+        telegram_id BIGINT NOT NULL,
+        question_id BIGINT NOT NULL REFERENCES question_bank(id) ON DELETE RESTRICT,
+        position INTEGER NOT NULL,
+        option_letters JSONB NOT NULL,
+        message_id BIGINT,
+        answered_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_bank_quiz_attempt_polls_user ON bank_quiz_attempt_polls(telegram_id, answered_at)",
     """CREATE TABLE IF NOT EXISTS bank_quiz_attempt_question_snapshots (
         attempt_id BIGINT NOT NULL REFERENCES bank_quiz_attempts(id) ON DELETE CASCADE,
         position INTEGER NOT NULL,
@@ -1161,19 +1173,90 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
             idx=start+i
             label = "Collection" if r.get("subject_type") == "collection" else "Subject"
             type_label = "Make Subject" if r.get("subject_type") == "collection" else "Make Collection"
-            buttons.append([InlineKeyboardButton(f"{r['name'][:22]} · {int(r['n'])} Q", callback_data=f"qb:mergefrom:{idx}"),
+            selected = set(context.user_data.get("qb_subject_bulk_selected", []))
+            mark = "☑" if r["name"] in selected else "☐"
+            buttons.append([InlineKeyboardButton(f"{mark} {r['name'][:20]} · {int(r['n'])} Q", callback_data=f"qb:subjectselect:{idx}"),
                             InlineKeyboardButton(type_label, callback_data=f"qb:typeflip:{idx}"),
                             InlineKeyboardButton("Archive", callback_data=f"qb:archiveone:{idx}")])
+            buttons.append([InlineKeyboardButton(f"🗑 Delete {r['name'][:35]}", callback_data=f"qb:deleteone:{idx}")])
         nav=[]
         if page > 0: nav.append(InlineKeyboardButton("← Previous", callback_data=f"qb:subjectspage:{page-1}"))
         if start+20 < len(rows): nav.append(InlineKeyboardButton("Next →", callback_data=f"qb:subjectspage:{page+1}"))
         if nav: buttons.append(nav)
+        selected_count = len(context.user_data.get("qb_subject_bulk_selected", []))
+        buttons.append([InlineKeyboardButton(f"🧺 Archive selected ({selected_count})", callback_data="qb:subjectbulkarchive") , InlineKeyboardButton(f"🗑 Delete selected empty ({selected_count})", callback_data="qb:subjectbulkdelete")])
+        buttons.append([InlineKeyboardButton("Clear selection", callback_data="qb:subjectselectclear")])
         buttons.append([InlineKeyboardButton("🔀 Bulk merge into one collection/subject", callback_data="qb:mergebulk")])
         buttons.append([InlineKeyboardButton("🧺 Bulk archive subjects/collections", callback_data="qb:archivebulk")])
         buttons.append([InlineKeyboardButton("🧹 Delete empty subjects", callback_data="qb:deleteempty")])
         buttons.append([InlineKeyboardButton("🗂 Manage topics in a subject", callback_data="qb:topicmanage")])
         buttons.append([InlineKeyboardButton("⬅ Question Bank menu", callback_data="qb:home")])
-        await q.edit_message_text(f"🗂 Manage Subjects & Collections · Page {page+1}\n\nTap a name to merge it into a canonical subject/collection. Archive hides it from import and student selectors without deleting questions or historical attempts.\nActive items: {len(rows)}", reply_markup=InlineKeyboardMarkup(buttons)); return
+        await q.edit_message_text(f"🗂 Manage Subjects & Collections · Page {page+1}\n\nTap a name to merge it into a canonical subject/collection. Archive hides it without deleting data. Delete permanently removes only an EMPTY subject/collection; populated or historically referenced subjects must be merged or archived first.\nActive items: {len(rows)}", reply_markup=InlineKeyboardMarkup(buttons)); return
+    if data.startswith("qb:subjectselect:"):
+        try:
+            idx=int(data.rsplit(":",1)[1]); options=context.user_data.get("qb_subject_manage_options", SUBJECTS); name=options[idx]
+        except (ValueError,TypeError,IndexError):
+            await q.edit_message_text("Selection expired. Reopen Manage Subjects.",reply_markup=admin_keyboard()); return
+        selected=set(context.user_data.get("qb_subject_bulk_selected", []))
+        if name in selected: selected.remove(name)
+        else: selected.add(name)
+        context.user_data["qb_subject_bulk_selected"]=sorted(selected,key=str.casefold)
+        await q.edit_message_text("Selection updated. Reopen the subject list to refresh checkmarks.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↻ Refresh selection",callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
+    if data == "qb:subjectselectclear":
+        context.user_data.pop("qb_subject_bulk_selected",None)
+        await q.edit_message_text("Selection cleared.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage subjects",callback_data="qb:subjects")]])); return
+    if data == "qb:subjectbulkarchive":
+        selected=context.user_data.get("qb_subject_bulk_selected", [])
+        if not selected:
+            await q.answer("Select at least one subject first.",show_alert=True); return
+        context.user_data["qb_subject_bulk_archive_preview"]=selected[:]
+        await q.edit_message_text("🧺 Confirm bulk archive\n\n"+"\n".join("• "+n for n in selected[:50])+f"\n\nItems: {len(selected)}. Questions, quizzes and historical attempts will be preserved. Confirm?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧺 Confirm archive",callback_data="qb:subjectbulkarchiveconfirm")],[InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return
+    if data == "qb:subjectbulkarchiveconfirm":
+        pending=context.user_data.pop("qb_subject_bulk_archive_preview",None)
+        if not pending:
+            await q.edit_message_text("Selection expired. No subjects were archived.",reply_markup=admin_keyboard()); return
+        async with pool.connection() as conn:
+            cur=await conn.execute("UPDATE question_bank_subjects SET archived_at=NOW() WHERE name = ANY(%s) AND archived_at IS NULL RETURNING name",(pending,)); changed=[r["name"] for r in await cur.fetchall()]
+            cur=await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name),name"); SUBJECTS[:]=[r["name"] for r in await cur.fetchall()]
+        context.user_data.pop("qb_subject_bulk_selected",None)
+        await q.edit_message_text(f"Archived {len(changed)} selected subject(s)/collection(s). All question and attempt data was preserved.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage subjects",callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
+    if data == "qb:subjectbulkdelete":
+        selected=context.user_data.get("qb_subject_bulk_selected", [])
+        if not selected:
+            await q.answer("Select at least one subject first.",show_alert=True); return
+        eligible=[]; blocked=[]
+        async with pool.connection() as conn:
+            series_cur=await conn.execute("SELECT to_regclass('public.bpsc_nexus_test_series') AS t"); has_series=bool((await series_cur.fetchone())["t"])
+            for name in selected:
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE subject=%s",(name,)); questions=int((await cur.fetchone())["n"])
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quizzes WHERE subject=%s",(name,)); quizzes=int((await cur.fetchone())["n"])
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_attempt_question_snapshots WHERE subject=%s",(name,)); snapshots=int((await cur.fetchone())["n"])
+                series=0
+                if has_series:
+                    cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_test_series WHERE subject=%s",(name,)); series=int((await cur.fetchone())["n"])
+                (eligible if not (questions or quizzes or snapshots or series) else blocked).append(name)
+        if not eligible:
+            await q.edit_message_text("None of the selected items are empty. Merge populated items into a canonical subject or archive them instead.\n\nBlocked: "+", ".join(blocked[:30]),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Archive selected",callback_data="qb:subjectbulkarchive")],[InlineKeyboardButton("Manage subjects",callback_data="qb:subjects")]])); return
+        context.user_data["qb_subject_bulk_delete_preview"]=eligible
+        await q.edit_message_text("🗑 Bulk delete preview\n\nEligible empty items:\n"+"\n".join("• "+n for n in eligible)+("\n\nNot eligible (linked data exists):\n"+"\n".join("• "+n for n in blocked) if blocked else "")+"\n\nOnly empty subject/collection records will be deleted. No question or attempt rows will be removed. Confirm?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Confirm delete empty",callback_data="qb:subjectbulkdeleteconfirm")],[InlineKeyboardButton("Cancel",callback_data="qb:subjects")]])); return
+    if data == "qb:subjectbulkdeleteconfirm":
+        pending=context.user_data.pop("qb_subject_bulk_delete_preview",None)
+        if not pending:
+            await q.edit_message_text("Delete selection expired. Nothing was deleted.",reply_markup=admin_keyboard()); return
+        deleted=[]; blocked=[]
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                has_series=bool((await (await conn.execute("SELECT to_regclass('public.bpsc_nexus_test_series') AS t")).fetchone())["t"])
+                for name in pending:
+                    cur=await conn.execute("SELECT (SELECT COUNT(*) FROM question_bank WHERE subject=%s)+(SELECT COUNT(*) FROM bank_quizzes WHERE subject=%s)+(SELECT COUNT(*) FROM bank_quiz_attempt_question_snapshots WHERE subject=%s) AS n",(name,name,name)); linked=int((await cur.fetchone())["n"])
+                    if has_series:
+                        cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_test_series WHERE subject=%s",(name,)); linked+=int((await cur.fetchone())["n"])
+                    if linked: blocked.append(name); continue
+                    cur=await conn.execute("DELETE FROM question_bank_subjects WHERE name=%s RETURNING name",(name,)); row=await cur.fetchone()
+                    if row: deleted.append(name)
+                cur=await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name),name"); SUBJECTS[:]=[r["name"] for r in await cur.fetchall()]
+        context.user_data.pop("qb_subject_bulk_selected",None)
+        await q.edit_message_text(f"Permanently deleted {len(deleted)} empty item(s).\n"+("No longer empty (skipped): "+", ".join(blocked) if blocked else "All selected eligible items were deleted.")+"\nNo question or attempt data was deleted.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage subjects",callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
     if data.startswith("qb:typeflip:"):
         try: idx=int(data.rsplit(":",1)[1]); options=context.user_data.get("qb_subject_manage_options", SUBJECTS); name=options[idx]
         except (ValueError,TypeError,IndexError):
@@ -1186,6 +1269,78 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
         if row:
             await q.edit_message_text(f"Updated {name} to {'Question Collection' if row['subject_type']=='collection' else 'Subject'}.\n\nIf this is a multi-set bundle such as Eduteria 7500, merge its Set 1–150 subjects into this collection. Missing topic labels will be preserved as the original set names.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage more",callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]])); return
         await q.edit_message_text("Subject/collection not found.",reply_markup=admin_keyboard()); return
+    if data.startswith("qb:deleteone:"):
+        try:
+            idx=int(data.rsplit(":",1)[1])
+            options=context.user_data.get("qb_subject_manage_options",SUBJECTS)
+            name=options[idx]
+        except (ValueError,TypeError,IndexError):
+            await q.edit_message_text("Subject selection expired. Open Manage Subjects again.",reply_markup=admin_keyboard()); return
+        async with pool.connection() as conn:
+            cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE subject=%s",(name,)); question_count=int((await cur.fetchone())["n"])
+            cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quizzes WHERE subject=%s",(name,)); quiz_count=int((await cur.fetchone())["n"])
+            cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_attempt_question_snapshots WHERE subject=%s",(name,)); snapshot_count=int((await cur.fetchone())["n"])
+            cur=await conn.execute("SELECT to_regclass('public.bpsc_nexus_test_series') AS t")
+            test_series_exists=bool((await cur.fetchone())["t"])
+            test_series_count=0
+            if test_series_exists:
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_test_series WHERE subject=%s",(name,))
+                test_series_count=int((await cur.fetchone())["n"])
+        linked=question_count+quiz_count+snapshot_count+test_series_count
+        if linked:
+            await q.edit_message_text(
+                f"⚠️ Cannot permanently delete: {name}\\n\\n"
+                f"Questions (including archived): {question_count}\\n"
+                f"Quizzes: {quiz_count}\\n"
+                f"Historical attempt snapshots: {snapshot_count}\\n"
+                f"Test-series references: {test_series_count}\\n\\n"
+                "To remove a populated subject safely, merge it into the correct destination first. "
+                "Or archive it to hide it from future imports and student selectors. No data has been deleted.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔀 Merge this subject",callback_data=f"qb:mergefrom:{idx}")],
+                    [InlineKeyboardButton("🧺 Archive instead",callback_data=f"qb:archiveone:{idx}")],
+                    [InlineKeyboardButton("Back to subjects",callback_data="qb:subjects")]
+                ])
+            )
+            return
+        context.user_data["qb_delete_subject_name"]=name
+        await q.edit_message_text(
+            f"🗑 Permanently delete empty subject?\\n\\n{name}\\n\\n"
+            "No questions, quizzes, historical snapshots or test-series references are attached. "
+            "Only the subject/collection record will be removed. This cannot be undone.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Confirm delete",callback_data="qb:deleteoneconfirm")],
+                [InlineKeyboardButton("Cancel",callback_data="qb:subjects")]
+            ])
+        )
+        return
+    if data == "qb:deleteoneconfirm":
+        name=context.user_data.pop("qb_delete_subject_name",None)
+        if not name:
+            await q.edit_message_text("Delete selection expired. Open Manage Subjects again.",reply_markup=admin_keyboard()); return
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE subject=%s",(name,)); question_count=int((await cur.fetchone())["n"])
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quizzes WHERE subject=%s",(name,)); quiz_count=int((await cur.fetchone())["n"])
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_attempt_question_snapshots WHERE subject=%s",(name,)); snapshot_count=int((await cur.fetchone())["n"])
+                cur=await conn.execute("SELECT to_regclass('public.bpsc_nexus_test_series') AS t")
+                test_series_exists=bool((await cur.fetchone())["t"])
+                test_series_count=0
+                if test_series_exists:
+                    cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_test_series WHERE subject=%s",(name,))
+                    test_series_count=int((await cur.fetchone())["n"])
+                if question_count or quiz_count or snapshot_count or test_series_count:
+                    deleted=False
+                else:
+                    cur=await conn.execute("DELETE FROM question_bank_subjects WHERE name=%s RETURNING name",(name,))
+                    deleted=bool(await cur.fetchone())
+                cur=await conn.execute("SELECT name FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name),name")
+                SUBJECTS[:]=[r["name"] for r in await cur.fetchall()]
+        if deleted:
+            await q.edit_message_text(f"✅ Empty subject/collection permanently deleted: {name}. No question or attempt data was removed.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage more subjects",callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]]))
+        else:
+            await q.edit_message_text(f"Deletion cancelled: {name} now has linked records. No data was deleted. Merge it into another subject or archive it instead.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage subjects",callback_data="qb:subjects")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]]))
+        return
     if data.startswith("qb:archiveone:"):
         try: idx=int(data.rsplit(":",1)[1]); options=context.user_data.get("qb_subject_manage_options", SUBJECTS); name=options[idx]
         except (ValueError,TypeError,IndexError):
@@ -1405,6 +1560,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
         buttons=[[InlineKeyboardButton(f"#{r['id']} · {r['title'][:32]} ({r['n']} Q)",callback_data=f"qb:manageview:{r['id']}")] for r in rows]
         buttons.append([InlineKeyboardButton("⬅ All quizzes",callback_data="qb:manage")])
         await q.edit_message_text(f"{'🟢 PUBLISHED' if published else '📝 DRAFT'} QUIZZES\n\n{len(rows)} shown.",reply_markup=InlineKeyboardMarkup(buttons)); return
+    if data.startswith("qb:shuffleoptions:"):
+        quiz_id=int(data.rsplit(":",1)[1])
+        async with pool.connection() as conn:
+            cur=await conn.execute("UPDATE bank_quizzes SET shuffle_options=NOT shuffle_options WHERE id=%s RETURNING shuffle_options",(quiz_id,))
+            row=await cur.fetchone()
+        if not row:
+            await q.answer("Quiz not found.",show_alert=True); return
+        await q.answer("Option shuffle enabled." if row["shuffle_options"] else "Option shuffle disabled.")
+        await q.edit_message_text(
+            ("Option shuffle is now enabled." if row["shuffle_options"] else "Option shuffle is now disabled.")+"\\n\\nOpen quiz settings to review the current configuration.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open quiz settings",callback_data=f"qb:manageview:{quiz_id}")],[InlineKeyboardButton("Back to quizzes",callback_data="qb:manage")]])
+        )
+        return
     if data.startswith("qb:manageview:"):
         quiz_id=int(data.rsplit(":",1)[1])
         async with pool.connection() as conn:
@@ -1412,8 +1580,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
         if not r:
             await q.edit_message_text("Quiz not found.",reply_markup=admin_keyboard()); return
         state="Published" if r['is_published'] else "Draft"
-        text=f"🛠 Quiz #{r['id']}\n\nTitle: {r['title']}\nSubject: {r['subject']}\nQuestions: {r['n']}\nStatus: {state}\nDuration: {r['duration_minutes']} minutes\nScoring: +{r['positive_marks']} / −{r['negative_marks']}\nQuestion timer: {r['question_time_seconds']} seconds\nShuffle options: {'Yes' if r['shuffle_options'] else 'No'}"
-        buttons=[[InlineKeyboardButton("✏️ Edit title",callback_data=f"qb:editquiztitle:{quiz_id}"),InlineKeyboardButton("⏱ Duration",callback_data=f"qb:editquizduration:{quiz_id}")],[InlineKeyboardButton("⚖️ Scoring",callback_data=f"qb:editquizmarks:{quiz_id}")],[InlineKeyboardButton("🧩 Edit question set",callback_data=f"qb:managequestions:{quiz_id}")],[InlineKeyboardButton("🔒 Unpublish" if r['is_published'] else "🚀 Publish",callback_data=f"qb:togglepublish:{quiz_id}")],[InlineKeyboardButton("🗑 Delete quiz",callback_data=f"qb:deletequizask:{quiz_id}")],[InlineKeyboardButton("Back to quizzes",callback_data="qb:manage")]]
+        text=(f"🛠 Quiz #{r['id']}\\n\\nTitle: {r['title']}\\nSubject: {r['subject']}\\nQuestions: {r['n']}\\nStatus: {state}\\n"
+              f"Delivery: Native Telegram quiz polls\\nMode: Practice only\\nFeedback: Immediate\\n"
+              f"Scoring: +{r['positive_marks']} / −{r['negative_marks']}\\n"
+              f"Shuffle options: {'Yes' if r['shuffle_options'] else 'No'}\\n"
+              "Question timer / total duration: Not applied to native polls.")
+        buttons=[[InlineKeyboardButton("✏️ Edit title",callback_data=f"qb:editquiztitle:{quiz_id}")],
+                 [InlineKeyboardButton("⚖️ Scoring",callback_data=f"qb:editquizmarks:{quiz_id}")],
+                 [InlineKeyboardButton("🔀 Toggle option shuffle",callback_data=f"qb:shuffleoptions:{quiz_id}")],
+                 [InlineKeyboardButton("🧩 Edit question set",callback_data=f"qb:managequestions:{quiz_id}")],
+                 [InlineKeyboardButton("🔒 Unpublish" if r['is_published'] else "🚀 Publish",callback_data=f"qb:togglepublish:{quiz_id}")],
+                 [InlineKeyboardButton("🗑 Delete quiz",callback_data=f"qb:deletequizask:{quiz_id}")],
+                 [InlineKeyboardButton("Back to quizzes",callback_data="qb:manage")]]
         await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup(buttons)); return
     if data.startswith("qb:deletequizask:"):
         quiz_id=int(data.rsplit(":",1)[1])
@@ -1738,25 +1916,38 @@ async def show_pending(q,pool,exclude_id=None):
 
 
 async def receive_poll(update: Update, context: ContextTypes.DEFAULT_TYPE, is_authorized: bool):
-    """Import a Telegram quiz poll sent/forwarded by an authorized admin; always preview first."""
+    """Import Telegram quiz polls from an admin private chat; require explicit subject selection."""
     message=update.effective_message; user=update.effective_user
     if not message or not user or not is_authorized or message.chat.type!=ChatType.PRIVATE or not message.poll:
         return False
-    if not SUBJECTS:
-        await message.reply_text("Create a subject first in Admin Panel → Question Bank → Create Subject. Poll imports cannot create subjects automatically.", reply_markup=admin_keyboard())
-        return True
     poll=message.poll
-    opts={LETTERS[i]: option.text for i,option in enumerate(poll.options[:5]) if _norm(option.text)}
-    correct=LETTERS[poll.correct_option_id] if poll.type=="quiz" and poll.correct_option_id is not None and poll.correct_option_id<len(LETTERS) else None
-    record=_normalize_record({"question":poll.question,"options":opts,"correct_option":correct,
-        "explanation":getattr(poll,"explanation",None),"subject":SUBJECTS[-1],"source":"Telegram quiz poll"},SUBJECTS[-1],"Telegram quiz poll",user.id)
-    if not record:
-        await message.reply_text("I couldn't read this poll as a multiple-choice question. Send a poll with at least two options.")
+    if len(poll.options)<2 or len(poll.options)>5:
+        await message.reply_text("This Question Bank supports 2–5 options (A–E). This poll has "+str(len(poll.options))+". No data was saved.")
         return True
-    context.user_data["qb_forward_preview"]=record
-    warning="" if record["correct_option"] else "\n\n⚠️ This is a regular poll without a visible answer key, so it will be saved as pending and must be verified."
-    await message.reply_text("📥 Telegram poll import preview\n\nThe poll has not been saved yet. Review the question and confirm below.\n\n"+format_question(record)+warning,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Save question",callback_data="qb:saveforward")],[InlineKeyboardButton("Discard",callback_data="qb:cancelforward")]]))
+    opts={LETTERS[i]: option.text for i,option in enumerate(poll.options) if _norm(option.text)}
+    correct=LETTERS[poll.correct_option_id] if poll.type=="quiz" and poll.correct_option_id is not None and poll.correct_option_id<len(LETTERS) else None
+    if len(opts)<2:
+        await message.reply_text("I couldn't read this poll. At least two non-empty options are required.")
+        return True
+    if not SUBJECTS:
+        await message.reply_text("Create a subject first in Admin Panel → Question Bank → Create Subject.")
+        return True
+    context.user_data["qb_poll_import_raw"]={
+        "question":poll.question,"options":opts,"correct_option":correct,
+        "explanation":getattr(poll,"explanation",None),"source":"Telegram quiz poll",
+        "owner_id":user.id
+    }
+    buttons=[]
+    for i,name in enumerate(SUBJECTS):
+        buttons.append([InlineKeyboardButton(name[:60],callback_data=f"qb:forwardsubject:{i}")])
+    buttons.append([InlineKeyboardButton("Discard",callback_data="qb:cancelforward")])
+    await message.reply_text(
+        "📥 Telegram poll detected. Select the destination subject.\\n\\n"
+        "Question: "+poll.question[:500]+"\\n"
+        f"Options detected: {len(opts)}\\n"
+        +("Answer key detected from Telegram quiz poll." if correct else "No answer key detected; this will require verification."),
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
     return True
 
 
@@ -2045,17 +2236,42 @@ async def receive_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 def parse_forwarded_text(text: str, owner_id: int) -> dict | None:
-    lines=[_norm(x) for x in text.splitlines() if _norm(x)]
-    if len(lines)<3: return None
-    rec={"question":lines[0],"options":{}}
-    for line in lines[1:]:
-        m=re.match(r"^\(?([A-E])\)?[.)\-:]\s*(.+)$",line)
-        if m: rec["options"][m.group(1)]=m.group(2); continue
-        m=re.match(r"^(?:answer|correct answer|ans)\s*[:\-]\s*([A-E])\b",line,re.I)
-        if m: rec["correct_answer"]=m.group(1)
-        m=re.match(r"^(?:explanation|solution)\s*[:\-]\s*(.+)$",line,re.I)
-        if m: rec["explanation"]=m.group(1)
-    return _normalize_record(rec,SUBJECTS[-1],"Forwarded Telegram message",owner_id) if SUBJECTS and len(rec["options"])>=2 else None
+    """Parse common plain-text MCQ layouts without silently guessing an answer."""
+    raw_lines=[str(x).strip() for x in (text or "").replace("\\r","").splitlines()]
+    lines=[_norm(x) for x in raw_lines if _norm(x)]
+    if len(lines)<3 or not SUBJECTS:
+        return None
+    question_parts=[]; options={}; correct=None; explanation_parts=[]; in_explanation=False
+    option_re=re.compile(r"^(?:option\\s*)?\\(?([A-E])\\)?\\s*[).:\-–]\\s*(.+)$",re.I)
+    answer_re=re.compile(r"^(?:correct\\s+answer|answer|ans|उत्तर|सही\\s+उत्तर)\\s*[:：=\-–.]?\\s*([A-E])\\b",re.I)
+    explanation_re=re.compile(r"^(?:explanation|solution|व्याख्या|स्पष्टीकरण)\\s*[:：\-–]?\\s*(.*)$",re.I)
+    for line in lines:
+        am=answer_re.match(line)
+        if am:
+            correct=am.group(1).upper(); in_explanation=False; continue
+        em=explanation_re.match(line)
+        if em:
+            in_explanation=True
+            if em.group(1): explanation_parts.append(em.group(1))
+            continue
+        if in_explanation:
+            explanation_parts.append(line); continue
+        om=option_re.match(line)
+        if om:
+            key=om.group(1).upper()
+            if key not in options: options[key]=om.group(2).strip()
+            continue
+        if options:
+            # Continuation lines belong to the preceding option when formatting wraps.
+            last=list(options)[-1]
+            options[last]+=" "+line
+        else:
+            question_parts.append(line)
+    if len(options)<2 or not question_parts:
+        return None
+    rec={"question":" ".join(question_parts),"options":options,"correct_option":correct,"explanation":" ".join(explanation_parts)}
+    return _normalize_record(rec,SUBJECTS[-1],"Forwarded Telegram message",owner_id)
+
 
 
 def format_question(r):
@@ -2089,44 +2305,151 @@ async def show_student_quizzes(q,pool):
 async def choose_mode(q,context,pool,quiz_id):
     async with pool.connection() as conn:
         cur=await conn.execute("SELECT id,title FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,q.from_user.id)); quiz=await cur.fetchone()
-    if not quiz: await q.edit_message_text("Quiz not found or not published."); return
-    await q.edit_message_text(f"{quiz['title']}\n\nChoose a mode:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 Practice (instant explanation)",callback_data=f"play:mode:practice:{quiz_id}")],[InlineKeyboardButton("⏱ Exam (results after submission)",callback_data=f"play:mode:exam:{quiz_id}")],[InlineKeyboardButton("Back to quizzes",callback_data="play:list")]]))
+    if not quiz:
+        await q.edit_message_text("Quiz not found or not published.")
+        return
+    await q.edit_message_text(
+        f"{quiz['title']}\\n\\n🧠 Practice Mode\\nEach question will appear as a native Telegram quiz poll. Vote to reveal the correct answer and explanation; the next question will then be sent automatically.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶ Start Practice",callback_data=f"play:mode:practice:{quiz_id}")],[InlineKeyboardButton("Back to quizzes",callback_data="play:list")]])
+    )
 
 
 async def start_attempt(q,context,pool,quiz_id,mode):
-    if mode not in ("practice","exam"): return
+    active=context.user_data.get("qb_attempt")
+    if active and active.get("poll_id"):
+        await q.answer("You already have an active practice poll. Answer it before starting another quiz.",show_alert=True)
+        return
+    if mode != "practice":
+        await q.answer("Only Practice Mode is available.", show_alert=True)
+        return
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,q.from_user.id)); quiz=await cur.fetchone()
-        if not quiz: await q.edit_message_text("Quiz unavailable."); return
-        cur=await conn.execute("SELECT qb.id,qb.question_en,qb.question_hi,qb.options,qb.correct_option,qb.explanation_en,qb.explanation_hi FROM bank_quiz_questions bqq JOIN question_bank qb ON qb.id=bqq.question_id WHERE bqq.quiz_id=%s ORDER BY bqq.position",(quiz_id,)); questions=await cur.fetchall()
-        cur=await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions) VALUES(%s,%s,%s,%s) RETURNING id",(quiz_id,q.from_user.id,mode,len(questions))); attempt_id=(await cur.fetchone())["id"]
-    if not questions: await q.edit_message_text("This quiz has no available questions."); return
-    context.user_data["qb_attempt"]={"attempt_id":attempt_id,"quiz":quiz,"questions":[dict(x) for x in questions],"index":0,"answers":{},"mode":mode,"started":datetime.now(timezone.utc).isoformat()}
-    if mode == "exam":
-        context.application.create_task(_exam_timeout(context.application, q.from_user.id, q.message.chat_id, attempt_id, pool, int(quiz["duration_minutes"])))
-    await send_current_question(q,context)
+        cur=await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks,question_time_seconds,shuffle_options FROM bank_quizzes WHERE id=%s AND is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s)",(quiz_id,q.from_user.id)); quiz=await cur.fetchone()
+        if not quiz:
+            await q.edit_message_text("Quiz unavailable.")
+            return
+        cur=await conn.execute("SELECT qb.id,qb.question_en,qb.question_hi,qb.options,qb.correct_option,qb.explanation_en,qb.explanation_hi FROM bank_quiz_questions bqq JOIN question_bank qb ON qb.id=bqq.question_id WHERE bqq.quiz_id=%s AND qb.status='ready' ORDER BY bqq.position",(quiz_id,)); questions=await cur.fetchall()
+        if not questions:
+            await q.edit_message_text("This quiz has no verified questions available.")
+            return
+        cur=await conn.execute("INSERT INTO bank_quiz_attempts(quiz_id,telegram_id,mode,total_questions,question_time_seconds,quiz_settings) VALUES(%s,%s,'practice',%s,%s,%s) RETURNING id",
+            (quiz_id,q.from_user.id,len(questions),int(quiz.get("question_time_seconds") or 0),json.dumps({"delivery":"telegram_quiz_poll","feedback":"immediate","shuffle_options":bool(quiz.get("shuffle_options"))})))
+        attempt_id=(await cur.fetchone())["id"]
+    context.user_data["qb_attempt"]={"attempt_id":attempt_id,"quiz":dict(quiz),"questions":[dict(x) for x in questions],"index":0,"answers":{},"mode":"practice","poll_id":None}
+    await q.answer()
+    try:
+        await q.edit_message_text(f"🚀 Practice started: {quiz['title']}\\nQuestions: {len(questions)}\\n\\nEach question will arrive as a native Telegram quiz poll.")
+    except Exception:
+        pass
+    await send_next_private_poll(context.application,pool,q.from_user.id)
 
 
-async def send_current_question(q,context):
-    a=context.user_data.get("qb_attempt")
-    if not a: await q.edit_message_text("No active quiz attempt."); return
-    idx=a["index"]
-    if idx>=len(a["questions"]):
-        await q.edit_message_text("You have reached the end. Submit your answers to see the result.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Submit quiz",callback_data="play:submit")]])); return
-    r=a["questions"][idx]; opts=r["options"] if isinstance(r["options"],dict) else json.loads(r["options"])
-    selected=a["answers"].get(str(r["id"]))
-    text=f"{a['quiz']['title']} · {idx+1}/{len(a['questions'])}\nMode: {a['mode'].title()}" + (f" · {a['quiz']['duration_minutes']} min limit" if a['mode']=='exam' else "") + f"\n\n{r['question_en']}"
-    if r.get("question_hi"): text+="\n"+r["question_hi"]
-    text+="\n\n"+"\n".join(f"{k}. {v}" for k,v in opts.items())
-    if selected: text+=f"\n\nYour answer: {selected}"
-    if a.get("feedback") and a["mode"]=="practice": text+="\n\n"+a["feedback"]
-    rows=[]
-    for i in range(0,len(opts),2): rows.append([InlineKeyboardButton(f"{k}{' ✓' if selected==k else ''}",callback_data=f"play:ans:{k}") for k in list(opts)[i:i+2]])
-    rows.append([InlineKeyboardButton("⏭ Not Attempted",callback_data="play:skip")])
-    if idx>0: rows.append([InlineKeyboardButton("⬅ Previous",callback_data="play:prev"),InlineKeyboardButton("Next ➡",callback_data="play:next")])
-    else: rows.append([InlineKeyboardButton("Next ➡",callback_data="play:next")])
-    rows.append([InlineKeyboardButton("Submit Quiz",callback_data="play:submit")])
-    await q.edit_message_text(text[:3900],reply_markup=InlineKeyboardMarkup(rows))
+async def send_next_private_poll(application,pool,user_id):
+    user_data=application.user_data.get(user_id,{})
+    attempt=user_data.get("qb_attempt")
+    if not attempt or attempt.get("mode")!="practice" or attempt.get("poll_id"):
+        return
+    idx=int(attempt.get("index",0))
+    questions=attempt["questions"]
+    if idx>=len(questions):
+        await finish_private_poll_attempt(application,pool,user_id)
+        return
+    r=questions[idx]
+    opts=r["options"] if isinstance(r["options"],dict) else json.loads(r["options"] or "{}")
+    letters=list(opts.keys())[:10]
+    if bool(attempt["quiz"].get("shuffle_options")):
+        random.shuffle(letters)
+    poll_options=[str(opts[k])[:100] for k in letters]
+    if len(poll_options)<2:
+        await application.bot.send_message(chat_id=user_id,text=f"Question {idx+1} skipped: fewer than two valid options.")
+        attempt["index"]+=1
+        await send_next_private_poll(application,pool,user_id)
+        return
+    correct_letter=r.get("correct_option")
+    if correct_letter not in letters:
+        await application.bot.send_message(chat_id=user_id,text=f"Question {idx+1} skipped: no valid answer key.")
+        attempt["index"]+=1
+        await send_next_private_poll(application,pool,user_id)
+        return
+    question_text=str(r.get("question_en") or "Question")
+    if r.get("question_hi"):
+        question_text+="\\n"+str(r["question_hi"])
+    question_text=f"{attempt['quiz']['title']} · {idx+1}/{len(questions)}\\n\\n{question_text}"[:300]
+    explanation="\\n".join(x for x in (r.get("explanation_en"),r.get("explanation_hi")) if x)
+    poll=await application.bot.send_poll(
+        chat_id=user_id,question=question_text,options=poll_options,type="quiz",
+        correct_option_id=letters.index(correct_letter),is_anonymous=False,
+        explanation=explanation[:200] if explanation else None,allows_multiple_answers=False
+    )
+    attempt["poll_id"]=str(poll.poll.id)
+    attempt["poll_message_id"]=int(poll.message_id)
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO bank_quiz_attempt_polls(poll_id,attempt_id,telegram_id,question_id,position,option_letters,message_id) VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(poll_id) DO NOTHING",
+            (str(poll.poll.id),attempt["attempt_id"],user_id,r["id"],idx,json.dumps(letters),int(poll.message_id))
+        )
+
+
+async def receive_private_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, pool):
+    pa=update.poll_answer
+    if not pa or not pa.user or pool is None:
+        return False
+    async with pool.connection() as conn:
+        cur=await conn.execute(
+            "SELECT attempt_id,telegram_id,question_id,position,option_letters,message_id FROM bank_quiz_attempt_polls WHERE poll_id=%s AND telegram_id=%s AND answered_at IS NULL",
+            (str(pa.poll_id),int(pa.user.id))
+        )
+        row=await cur.fetchone()
+        if not row:
+            return False
+        letters=row["option_letters"] if isinstance(row["option_letters"],list) else json.loads(row["option_letters"] or "[]")
+        selected=letters[pa.option_ids[0]] if pa.option_ids and 0<=pa.option_ids[0]<len(letters) else None
+        if selected is None:
+            return True
+        cur=await conn.execute("UPDATE bank_quiz_attempt_polls SET answered_at=NOW() WHERE poll_id=%s AND answered_at IS NULL RETURNING poll_id",(str(pa.poll_id),))
+        if not await cur.fetchone():
+            return True
+        cur=await conn.execute("SELECT correct_option FROM question_bank WHERE id=%s",(row["question_id"],))
+        question=await cur.fetchone()
+        is_correct=bool(question and selected==question["correct_option"])
+        await conn.execute(
+            "INSERT INTO bank_quiz_attempt_answers(attempt_id,question_id,selected_option,is_correct) VALUES(%s,%s,%s,%s) ON CONFLICT(attempt_id,question_id) DO UPDATE SET selected_option=EXCLUDED.selected_option,is_correct=EXCLUDED.is_correct",
+            (row["attempt_id"],row["question_id"],selected,is_correct)
+        )
+    try:
+        await context.bot.stop_poll(chat_id=pa.user.id,message_id=int(row["message_id"]))
+    except Exception:
+        log.warning("Could not close private practice poll %s",pa.poll_id,exc_info=True)
+    user_data=context.application.user_data.get(pa.user.id,{})
+    attempt=user_data.get("qb_attempt")
+    if not attempt or int(attempt.get("attempt_id",-1))!=int(row["attempt_id"]):
+        await context.bot.send_message(chat_id=pa.user.id,text="Your answer was recorded. The bot restarted during this attempt; please start a new attempt to continue.")
+        return True
+    attempt["answers"][str(row["question_id"])]=selected
+    attempt["poll_id"]=None
+    attempt["index"]=int(row["position"])+1
+    await send_next_private_poll(context.application,pool,pa.user.id)
+    return True
+
+
+async def finish_private_poll_attempt(application,pool,user_id):
+    user_data=application.user_data.get(user_id,{})
+    attempt=user_data.get("qb_attempt")
+    if not attempt:
+        return
+    attempt_id=attempt["attempt_id"]
+    async with pool.connection() as conn:
+        cur=await conn.execute("SELECT COUNT(*) FILTER (WHERE is_correct=TRUE) AS correct, COUNT(*) FILTER (WHERE is_correct=FALSE) AS incorrect FROM bank_quiz_attempt_answers WHERE attempt_id=%s",(attempt_id,))
+        counts=await cur.fetchone()
+        correct=int(counts["correct"] or 0); incorrect=int(counts["incorrect"] or 0)
+        total=len(attempt["questions"]); skipped=max(0,total-correct-incorrect)
+        pos=float(attempt["quiz"]["positive_marks"]); neg=float(attempt["quiz"]["negative_marks"])
+        score=correct*pos-incorrect*neg
+        cur=await conn.execute("UPDATE bank_quiz_attempts SET submitted_at=NOW(),correct_count=%s,incorrect_count=%s,skipped_count=%s,score=%s WHERE id=%s AND submitted_at IS NULL RETURNING id",(correct,incorrect,skipped,round(score,2),attempt_id))
+        if await cur.fetchone():
+            await lb.record_bank_attempt(conn,attempt_id,user_id,"Student")
+    accuracy=(correct/(correct+incorrect)*100) if correct+incorrect else 0
+    await application.bot.send_message(chat_id=user_id,text=f"🏁 Practice completed — {attempt['quiz']['title']}\\n\\nTotal: {total}\\nCorrect: {correct}\\nIncorrect: {incorrect}\\nNot attempted: {skipped}\\nAccuracy: {accuracy:.1f}%\\nScore: {score:.2f}\\n\\nExplanations were displayed with each Telegram quiz poll.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Take another quiz",callback_data="play:list")]]))
+    user_data.pop("qb_attempt",None)
 
 
 async def answer_question(q,context,pool,letter):
@@ -2215,14 +2538,35 @@ async def route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, poo
     if data == "qb:cancelimport":
         if not is_authorized: await q.answer("Not authorized.",show_alert=True); return True
         context.user_data.pop("qb_import_preview",None); context.user_data.pop("qb_flow",None); await q.answer(); await q.edit_message_text("Import cancelled. No questions were saved.",reply_markup=admin_keyboard()); return True
+    if data.startswith("qb:forwardsubject:"):
+        if not is_authorized:
+            await q.answer("Not authorized.",show_alert=True); return True
+        raw=context.user_data.get("qb_poll_import_raw")
+        try:
+            subject_index=int(data.rsplit(":",1)[1])
+            subject=SUBJECTS[subject_index]
+        except (ValueError,IndexError):
+            await q.answer("Subject selection expired. Send the poll again.",show_alert=True); return True
+        if not raw:
+            await q.answer("Poll import expired. Send the poll again.",show_alert=True); return True
+        record=_normalize_record({"question":raw["question"],"options":raw["options"],"correct_option":raw["correct_option"],"explanation":raw.get("explanation"),"subject":subject,"source":raw.get("source")},subject,raw.get("source","Telegram quiz poll"),update.effective_user.id)
+        if not record:
+            await q.answer("Could not normalize this poll.",show_alert=True); return True
+        context.user_data.pop("qb_poll_import_raw",None)
+        context.user_data["qb_forward_preview"]=record
+        warning="" if record["correct_option"] else "\\n\\n⚠️ No answer key was available. This question will be saved as pending verification."
+        await q.answer()
+        await q.edit_message_text("📥 Telegram poll import preview\\n\\nDestination: "+subject+"\\nThe question has not been saved yet.\\n\\n"+format_question(record)+warning,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Save question",callback_data="qb:saveforward")],[InlineKeyboardButton("Discard",callback_data="qb:cancelforward")]]))
+        return True
     if data == "qb:saveforward":
         if not is_authorized: await q.answer("Not authorized.",show_alert=True); return True
         record=context.user_data.pop("qb_forward_preview",None)
         if not record: await q.answer("Preview expired",show_alert=True); return True
-        result=await import_records(pool,[record],update.effective_user.id,"Forwarded Telegram message","forwarded",record["subject"],0)
-        await q.answer(); await q.edit_message_text(f"Question saved. Added: {result['imported']}; duplicates skipped: {result['duplicates']}; pending verification: {result['pending']}.",reply_markup=admin_keyboard()); return True
+        result=await import_records(pool,[record],update.effective_user.id,"Telegram poll import","telegram_poll",record["subject"],0)
+        await q.answer(); await q.edit_message_text(f"Telegram poll saved. Added: {result['imported']}; duplicates skipped: {result['duplicates']}; pending verification: {result['pending']}.",reply_markup=admin_keyboard()); return True
     if data == "qb:cancelforward":
-        context.user_data.pop("qb_forward_preview",None); await q.answer(); await q.edit_message_text("Forwarded question discarded.",reply_markup=admin_keyboard()); return True
+        context.user_data.pop("qb_forward_preview",None); context.user_data.pop("qb_poll_import_raw",None); await q.answer(); await q.edit_message_text("Forwarded question discarded.",reply_markup=admin_keyboard()); return True
     if data.startswith("play:prev") or data.startswith("play:next"):
         if not q: return True
         a=context.user_data.get("qb_attempt")
