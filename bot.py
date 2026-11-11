@@ -4,7 +4,7 @@ import os
 
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, MenuButtonCommands
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, MenuButtonCommands
 from telegram.ext import PollAnswerHandler
 import question_bank as qb
 import group_quiz as gq
@@ -243,18 +243,95 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await reply_with_uluk(
         message,
-        f"Welcome to BPSC Nexus, {user.first_name or 'Aspirant'}! 🦉\n\nPractise BPSC quizzes right here in Telegram. Tap a button below or use /quiz.",
+        f"Welcome to BPSC Nexus, {user.first_name or 'Aspirant'}! 🦉\n\nPractise BPSC quizzes right here in Telegram. Use the persistent menu below to open Question Bank, Tutorial, Updates, My Profile or Leaderboard.",
         reply_markup=main_user_keyboard(),
     )
 
 
 
 
-def main_user_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📚 Start a quiz", callback_data="play:list")],
-        [InlineKeyboardButton("📘 Tutorial", callback_data="user:tutorial")],
-    ])
+STUDENT_MENU = {
+    "📚 Question Bank", "📘 Tutorial", "📢 Updates", "👤 My Profile", "🏆 Leaderboard"
+}
+
+def main_user_keyboard() -> ReplyKeyboardMarkup:
+    """Persistent five-destination private-chat navigation."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📚 Question Bank"), KeyboardButton("📘 Tutorial")],
+         [KeyboardButton("📢 Updates"), KeyboardButton("👤 My Profile")],
+         [KeyboardButton("🏆 Leaderboard")]],
+        resize_keyboard=True, is_persistent=True, input_field_placeholder="Choose a BPSC Nexus section"
+    )
+
+async def student_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not is_private(update) or message.text not in STUDENT_MENU:
+        return
+    await save_user(update)
+    choice = message.text
+    if choice == "📚 Question Bank":
+        await quiz_command(update, context)
+        return
+    if choice == "📘 Tutorial":
+        await tutorial_command(update, context)
+        return
+    if choice == "👤 My Profile":
+        async with pool.connection() as conn:
+            cur = await conn.execute("""SELECT COUNT(*) FILTER (WHERE submitted_at IS NOT NULL) AS attempts,
+                COALESCE(SUM(correct_count),0) AS correct, COALESCE(SUM(incorrect_count),0) AS incorrect,
+                COALESCE(SUM(skipped_count),0) AS skipped, COALESCE(SUM(score),0) AS score
+                FROM bank_quiz_attempts WHERE telegram_id=%s""", (user.id,))
+            stats = await cur.fetchone()
+        total = int(stats["correct"] or 0) + int(stats["incorrect"] or 0)
+        accuracy = (100 * int(stats["correct"] or 0) / total) if total else 0
+        await message.reply_text(
+            f"👤 MY PROFILE\n\nName: {user.full_name}\nCompleted personal quizzes: {int(stats['attempts'] or 0)}\n"
+            f"Correct: {int(stats['correct'] or 0)} · Incorrect: {int(stats['incorrect'] or 0)} · Skipped: {int(stats['skipped'] or 0)}\n"
+            f"Accuracy: {accuracy:.1f}%\nPersonal quiz score total: {float(stats['score'] or 0):.2f}\n\n"
+            "For detailed group-quiz analysis, use /myanalysis.", reply_markup=main_user_keyboard())
+        return
+    if choice == "📢 Updates":
+        async with pool.connection() as conn:
+            cur = await conn.execute("""SELECT a.title, a.published_at, v.summary
+                FROM intel_publications p JOIN intel_articles a ON a.id=p.article_id
+                JOIN intel_content_versions v ON v.id=p.content_version_id
+                WHERE p.status='published' ORDER BY COALESCE(p.published_at,a.published_at) DESC LIMIT 5""")
+            rows = await cur.fetchall()
+        if not rows:
+            await message.reply_text("📢 No approved updates have been published yet.", reply_markup=main_user_keyboard())
+        else:
+            lines = ["📢 BPSC NEXUS UPDATES", ""]
+            for i, row in enumerate(rows, 1):
+                summary = (row["summary"] or "").strip()
+                lines.append(f"{i}. {row['title']}" + (f"\n{summary[:500]}" if summary else ""))
+            await message.reply_text("\n\n".join(lines), reply_markup=main_user_keyboard(), disable_web_page_preview=True)
+        return
+    if choice == "🏆 Leaderboard":
+        async with pool.connection() as conn:
+            cur = await conn.execute("""WITH scored AS (
+                SELECT telegram_id, display_name, normalized_points, correct_count, incorrect_count,
+                total_time_seconds, total_questions_count, first_submitted_at,
+                CASE WHEN correct_count+incorrect_count>0 THEN correct_count::numeric/(correct_count+incorrect_count)*100 ELSE 0 END accuracy
+                FROM bpsc_leaderboard_period_totals WHERE period_type='lifetime' AND period_key='all' AND subject='All subjects'
+            ), ranked AS (SELECT ROW_NUMBER() OVER (ORDER BY normalized_points DESC, accuracy DESC,
+                (total_time_seconds::numeric/NULLIF(total_questions_count,0)) ASC, first_submitted_at ASC, telegram_id ASC) AS rank, * FROM scored)
+                SELECT rank,telegram_id,display_name,normalized_points,accuracy FROM ranked WHERE rank<=10 OR telegram_id=%s ORDER BY rank""", (user.id,))
+            rows = await cur.fetchall()
+        lines = ["🏆 BPSC NEXUS · LIFETIME LEADERBOARD", "Verified completed assessments · normalized points", ""]
+        mine = None
+        for row in rows:
+            line = f"{int(row['rank'])}. {row['display_name']} — {float(row['normalized_points']):.2f} pts · {float(row['accuracy']):.1f}% accuracy"
+            if int(row["rank"]) <= 10:
+                lines.append(line)
+            if int(row["telegram_id"]) == user.id:
+                mine = line
+        if len(rows) == 0:
+            lines.append("No verified leaderboard submissions yet.")
+        if mine:
+            lines += ["", "Your rank: " + mine]
+        lines += ["", "Weekly, monthly, daily challenge and subject-wise rankings are available in the Ranks section of the Mini App. Group-specific rankings remain available inside each Telegram group via /leaderboard."]
+        await message.reply_text("\n".join(lines), reply_markup=main_user_keyboard())
 
 
 async def personal_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -490,6 +567,7 @@ def main() -> None:
     application.add_handler(PollAnswerHandler(gq.group_poll_answer))
     application.add_handler(MessageHandler(filters.Document.ALL, question_bank_file_handler))
     application.add_handler(MessageHandler(filters.POLL, question_bank_poll_handler))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^(📚 Question Bank|📘 Tutorial|📢 Updates|👤 My Profile|🏆 Leaderboard)$"), student_menu_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_input))
     application.add_error_handler(error_handler)
 
