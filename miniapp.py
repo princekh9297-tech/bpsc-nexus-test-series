@@ -2533,11 +2533,9 @@ async def _create_quiz_attempt(request, qid: int, mode: str):
     async with pool.connection() as conn:
         await qb.ensure_schema(pool)
         await ensure_access_schema(conn)
-        gate_ok,gate_reason=await _demo_gate(conn,int(user['id']),_is_series_admin(user))
-        if not gate_ok:
-            if gate_reason in ('register','no_trial'):
-                return json_response({'error':'Please register for the free demo first to attempt quizzes.','demo_gate':'register'},403)
-            return json_response({'error':'Your free demo has ended. Unlock a pass to keep attempting quizzes.','demo_gate':'expired'},403)
+        # Published FREE quizzes are open to all Telegram users. Demo registration is
+        # not a prerequisite for starting a free test; paid quizzes are still protected
+        # by the entitlement check below. Admins retain their existing bypass.
         cur = await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks,question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,is_published,access_type FROM bank_quizzes WHERE id=%s", (qid,))
         quiz = await cur.fetchone()
         if not quiz:

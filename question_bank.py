@@ -278,10 +278,18 @@ def detect_question_layout(question_en: str, question_hi: str = "", record: dict
     return qtype, structure, flags
 
 
+def _key_norm(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[\s\-./()\[\]:]+", "_", text)
+    text = re.sub(r"[^a-z0-9_\u0900-\u097f]", "", text)
+    return re.sub(r"_+", "_", text).strip("_")
+
+
 def _get(d: dict, *names: str, default=None):
-    lower = {str(k).strip().lower().replace(" ", "_"): v for k, v in d.items()}
+    if not isinstance(d, dict): return default
+    lower = {_key_norm(k): v for k, v in d.items()}
     for name in names:
-        key = name.lower().replace(" ", "_")
+        key = _key_norm(name)
         if key in lower and lower[key] not in (None, ""):
             return lower[key]
     return default
@@ -304,8 +312,12 @@ def _option_map(value: Any, row: dict) -> dict[str, str]:
                 key = LETTERS[i]
             if key in LETTERS and _norm(val): options[key] = _norm(val)
     for letter in LETTERS:
-        val = _get(row, letter, f"option_{letter}", f"option{letter}", f"choice_{letter}", f"choice{letter}")
+        val = _get(row, letter, f"option_{letter}", f"option{letter}", f"choice_{letter}", f"choice{letter}", f"option_{letter}_text", f"answer_{letter}", f"विकल्प_{letter}")
         if val is not None and _norm(val): options[letter] = _norm(val)
+    # Numeric option columns are common in coaching exports (Option 1 ... Option 5).
+    for i, letter in enumerate(LETTERS, 1):
+        val = _get(row, f"option_{i}", f"choice_{i}", f"answer_option_{i}")
+        if val is not None and _norm(val): options.setdefault(letter, _norm(val))
     return options
 
 
@@ -327,18 +339,18 @@ def _answer_letter(answer: Any, options: dict[str, str]) -> str | None:
 
 def _normalize_record(record: Any, default_subject: str, source_name: str, owner_id: int) -> dict | None:
     if not isinstance(record, dict): return None
-    q_en = _norm(_get(record, "question_en", "question", "question_text", "text", "q", "question_english", "english_question"))
-    q_hi = _norm(_get(record, "question_hi", "question_hindi", "hindi_question", "question_hin", "प्रश्न"))
-    options_raw = _get(record, "options", "choices", "answers", default={})
+    q_en = _norm(_get(record, "question_en", "question", "question_text", "text", "q", "question_english", "english_question", "question_statement", "question_content", "prompt", "stem", "प्रश्न"))
+    q_hi = _norm(_get(record, "question_hi", "question_hindi", "hindi_question", "question_hin", "प्रश्न_हिंदी", "हिंदी_प्रश्न"))
+    options_raw = _get(record, "options", "choices", "answers", "answer_options", "option_list", default={})
     options = _option_map(options_raw, record)
     if not q_en and q_hi:
         q_en = q_hi
     if not q_en: return None
     # At least two non-empty options are needed for a usable MCQ.
     options = {k: v for k, v in options.items() if _norm(v)}
-    ans = _get(record, "correct_option", "correct_answer", "answer", "answer_key", "correct", "key", "right_answer", "correctanswer")
+    ans = _get(record, "correct_option", "correct_answer", "answer", "answer_key", "correct", "key", "right_answer", "correctanswer", "correct_option_letter", "correct_answer_key", "सही_उत्तर", "उत्तर")
     correct = _answer_letter(ans, options)
-    explanation_en = _norm(_get(record, "explanation_en", "explanation", "solution", "reason", "explanation_english"))
+    explanation_en = _norm(_get(record, "explanation_en", "explanation", "solution", "reason", "explanation_english", "detailed_explanation", "व्याख्या"))
     explanation_hi = _norm(_get(record, "explanation_hi", "hindi_explanation", "explanation_hindi", "व्याख्या"))
     subject = _norm(_get(record, "subject", "category", "subject_name", default=default_subject)) or default_subject
     topic = _norm(_get(record, "topic", "chapter", "unit")) or None
@@ -386,7 +398,24 @@ def _extract_json_records(obj: Any) -> list:
         # One question object is also accepted.
         if any(k in {str(x).lower() for x in obj} for k in ("question", "question_en", "question_text", "q")):
             return [obj]
-    raise ValueError("JSON must contain a question array or a single question object.")
+    # Last-resort recursive discovery for common exports such as {data:{items:[...]}}.
+    def discover(value, depth=0):
+        if depth > 6: return []
+        if isinstance(value, list):
+            dicts=[x for x in value if isinstance(x,dict)]
+            if dicts and any(_get(x,"question","question_en","question_text","q","prompt","stem") for x in dicts): return dicts
+            for item in value:
+                found=discover(item,depth+1)
+                if found: return found
+        elif isinstance(value,dict):
+            if _get(value,"question","question_en","question_text","q","prompt","stem"): return [value]
+            for child in value.values():
+                found=discover(child,depth+1)
+                if found: return found
+        return []
+    found=discover(obj)
+    if found: return found
+    raise ValueError("JSON structure was read, but no question records were found. Expected question/question_en plus options or A–E fields.")
 
 
 class _TextExtractor(HTMLParser):
@@ -797,9 +826,29 @@ def _parse_member(filename: str, raw: bytes):
     ext=filename.rsplit('.',1)[-1].lower() if '.' in filename else ''
     if ext in ('json',): return _extract_json_records(json.loads(raw.decode('utf-8-sig')))
     if ext=='csv':
-        rows=list(csv.DictReader(io.StringIO(raw.decode('utf-8-sig',errors='replace'))))
-        if not rows: raise ValueError(f'{filename}: CSV has no data rows or header.')
-        return _tabular_records(rows)
+        content=raw.decode('utf-8-sig',errors='replace')
+        try: dialect=csv.Sniffer().sniff(content[:8192], delimiters=',;\t|')
+        except Exception: dialect=csv.excel
+        matrix=list(csv.reader(io.StringIO(content),dialect))
+        if not matrix: raise ValueError(f'{filename}: CSV contains no rows.')
+        headers=[_key_norm(x) for x in matrix[0]]
+        known_headers={'question','question_en','question_text','question_english','question_hindi','options','option_a','option_1','correct_answer','answer','answer_key','explanation'}
+        has_header=bool(set(headers)&known_headers)
+        if has_header:
+            rows=list(csv.DictReader(io.StringIO(content),dialect=dialect))
+            if not rows: raise ValueError(f'{filename}: CSV has a header but no data rows.')
+            return _tabular_records(rows)
+        # Headerless CSV: Question, A, B, C, D, [answer], [explanation].
+        rows=[]
+        for cells in matrix:
+            cells=[str(x or '').strip() for x in cells]
+            if len(cells)>=5 and cells[0]:
+                row={'question':cells[0],'options':{LETTERS[i]:cells[i+1] for i in range(min(5,len(cells)-1)) if cells[i+1]}}
+                if len(cells)>5: row['correct_answer']=cells[5]
+                if len(cells)>6: row['explanation']=cells[6]
+                rows.append(row)
+        if rows:return rows
+        raise ValueError(f'{filename}: CSV columns were not recognized. Include Question, Option A–D and Correct Answer headers, or use headerless rows in that order.')
     if ext in ('xlsx','xls'):
         try:
             import openpyxl
@@ -830,7 +879,19 @@ def _parse_member(filename: str, raw: bytes):
             except Exception as e:
                 raise ValueError(f'{filename}: scanned PDF needs pdf2image, Poppler and Tesseract installed on the server ({type(e).__name__}).')
         if not text.strip(): raise ValueError(f'{filename}: OCR found no readable question text.')
-        return _txt_to_records(text)
+        try:
+            return _txt_to_records(text)
+        except ValueError as text_error:
+            # Some PDFs contain a text layer that is technically non-empty but unusable;
+            # retry OCR rather than incorrectly reporting an empty import.
+            try:
+                from pdf2image import convert_from_bytes
+                import pytesseract
+                pages=convert_from_bytes(raw,first_page=1,last_page=80)
+                ocr='\n'.join(pytesseract.image_to_string(page,lang='eng+hin') for page in pages)
+                if ocr.strip(): return _txt_to_records(ocr)
+            except Exception: pass
+            raise ValueError(f'{filename}: text was extracted but no MCQ structure was recognized. Check numbered questions and A–E options. {str(text_error)}')
     if ext in ('png','jpg','jpeg','webp','tif','tiff','bmp'):
         text=_extract_image(raw)
         if not text.strip(): raise ValueError(f'{filename}: OCR found no readable text.')
