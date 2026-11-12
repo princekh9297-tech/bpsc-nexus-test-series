@@ -2752,10 +2752,7 @@ async function loadQuizzes(){
     if($('quiz-list'))$('quiz-list').innerHTML=quizzes.map(q=>{
       return `<article class="quiz-card"><div class="card-top"><span class="subject">${esc(q.subject)}</span><span class="count">FREE · ${q.total_questions} Q</span></div><h3>${esc(q.title)}</h3><p>${esc(q.description||'')}</p><div class="meta"><span>◷ ${q.duration_minutes} min</span><span>+${q.positive_marks} / −${q.negative_marks}</span></div><div class="mode-row"><button class="secondary" data-start="${q.id}" data-mode="practice">Practice</button><button class="primary" data-start="${q.id}" data-mode="exam">Exam</button></div></article>`;
     }).join('');
-    document.querySelectorAll('[data-start]').forEach(b=>b.onclick=()=>{
-      if(window.BPSC_PROFILE_READY===false){window.BPSC_OPEN_PROFILE_REGISTRATION?.();return;}
-      startQuiz(Number(b.dataset.start),b.dataset.mode);
-    });
+    document.querySelectorAll('[data-start]').forEach(b=>b.onclick=()=>startQuiz(Number(b.dataset.start),b.dataset.mode));
   }catch(e){if($('quiz-list'))$('quiz-list').innerHTML='<div class="empty">Could not load.</div>';}
 }
 
@@ -2811,7 +2808,6 @@ async function startSeriesBank(subject,mode){
  const buttons=[...document.querySelectorAll('[data-bank-start],[data-bank-subject]')];buttons.forEach(b=>b.disabled=true);
  const status=$('series-bank-status');if(status)status.textContent=`Preparing ${subject==='All subjects'?'Common Question Bank':subject+' bank'}…`;
  try{
-  if(!(await ensureDemoGate('attempt question banks')))return;
   const meta=seriesBankMetaCache||await api('/api/quiz-builder/meta');
   const count=subject==='All subjects'?Number(meta.total_ready||0):Number((meta.subjects||[]).find(s=>s.name===subject)?.count||0);
   if(!count)throw new Error('No ready questions are available in this bank yet.');
@@ -2882,7 +2878,6 @@ loadBuilderMeta();
 
 let quizOriginTab='home';let quizRouteActive=false;
 async function startQuiz(id,mode){
-  if(!(await ensureDemoGate('attempt quizzes')))return;
   if(maintenanceOn&&!hasAdminAccess()){showError('Under maintenance. New quizzes are temporarily disabled.');return;}
   try{clearError();if(!quizRouteActive){quizOriginTab=document.querySelector('.tab-btn.active')?.dataset.tab||'home';}const created=await api('/api/attempts','POST',{quiz_id:id,mode});attempt=await api('/api/attempts/'+created.attempt_id);try{sessionStorage.setItem('bpsc_nexus_active_attempt',String(attempt.attempt_id));}catch(e){}if(attempt.submitted){showResult(attempt);return;}index=0;answers={};review=new Set();feedback={};optionOrders={};attempt.questions.forEach(q=>{answers[q.id]=q.selected_option||null;if(q.marked_review)review.add(q.id);if(q.feedback)feedback[q.id]=q.feedback;});showView('exam');history.pushState({nexusQuiz:true,attemptId:attempt.attempt_id},'','#quiz');renderQuestion();startTimer();if($('quiz-route-mode'))$('quiz-route-mode').textContent=String(attempt.mode_label||attempt.mode).toUpperCase();}
   catch(e){showError(e.message);}
