@@ -11,8 +11,10 @@ import html
 import io
 import json
 import logging
+import os
 import random
 import re
+import urllib.request
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -86,6 +88,10 @@ DDL = [
     "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS question_type TEXT NOT NULL DEFAULT 'unknown'",
     "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS question_structure JSONB NOT NULL DEFAULT '{}'::jsonb",
     "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS question_flags JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS classification_confidence NUMERIC(5,4) NOT NULL DEFAULT 0.5",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS classification_source TEXT NOT NULL DEFAULT 'legacy'",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS classification_review_required BOOLEAN NOT NULL DEFAULT TRUE",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS original_question_type TEXT",
     """CREATE TABLE IF NOT EXISTS bank_quizzes (
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         title TEXT NOT NULL,
@@ -259,10 +265,10 @@ def detect_question_layout(question_en: str, question_hi: str = "", record: dict
         qtype = "pair_based"
     elif re.search(r"match\s+(?:the\s+)?following|match\s+list|correctly\s+matched|सुमेलित|मिलान\s+कीजिए|सूची\s*[i१२12].{0,80}सूची", text, re.I | re.S):
         qtype = "match_following"
-    elif events or re.search(r"chronological order|correct sequence|arrange.{0,30}order|कालानुक्रम|सही क्रम में व्यवस्थित|घटनाओं का क्रम", text, re.I):
-        qtype = "chronology"
     elif re.search(r"sequence of|arrange in (?:ascending|descending) order|increasing order|decreasing order|आरोही क्रम|अवरोही क्रम", text, re.I):
         qtype = "sequence"
+    elif events or re.search(r"chronological order|correct sequence|arrange.{0,30}order|कालानुक्रम|सही क्रम में व्यवस्थित|घटनाओं का क्रम", text, re.I):
+        qtype = "chronology"
     elif re.search(r"data interpretation|following table|following graph|following chart|निम्नलिखित तालिका|आंकड़ों के आधार पर", text, re.I):
         qtype = "data_interpretation"
     elif passage or re.search(r"read the following passage|passage given below|निम्नलिखित गद्यांश|निम्नलिखित अनुच्छेद", text, re.I):
@@ -276,6 +282,38 @@ def detect_question_layout(question_en: str, question_hi: str = "", record: dict
     else:
         qtype = "standard"
     return qtype, structure, flags
+
+
+def classify_question_for_import(question_en: str, question_hi: str = "", record: dict | None = None):
+    """Run the ingestion-time MCQ layout engine and return persisted classification metadata.
+
+    This is the deterministic classifier available in this deployment. Ambiguous records are
+    explicitly routed to the Question Intelligence review queue instead of being stamped as
+    high-confidence standard MCQs by the database trigger.
+    """
+    record = record if isinstance(record, dict) else {}
+    explicit = str(_get(record, "question_type", "layout_type", "question_layout", default="") or "").strip()
+    qtype, structure, flags = detect_question_layout(question_en, question_hi, record)
+    text = f"{question_en}\n{question_hi}".lower()
+    structural = bool(structure) or bool(re.search(
+        r"\b(match the following|assertion|reason|consider the following statements|how many statements|chronological order|odd one out|incorrect pair|passage|following table|following graph|data interpretation|select all that apply)\b|"
+        r"निम्नलिखित कथन|कथनों? में से|मिलान कीजिए|कालानुक्रम|गद्यांश|तालिका|आंकड़ों के आधार पर", text, re.I))
+    if explicit and qtype != "standard":
+        confidence, source = 0.99, "source_explicit"
+    elif qtype != "standard" and structural:
+        confidence, source = 0.91, "rule_based"
+    elif qtype != "standard":
+        confidence, source = 0.78, "rule_based"
+    elif re.search(r"\b(which|what|who|when|where|how|choose|select|identify)\b|कौन|क्या|कब|कहाँ", text, re.I) and len(_option_map(_get(record, "options", "choices", "opts", default={}), record)) >= 2:
+        confidence, source = 0.78, "rule_based"
+    else:
+        confidence, source = 0.48, "needs_review"
+    review = confidence < 0.65
+    flags["classification_review_reason"] = "Ambiguous layout; verify question type" if review else None
+    return {"question_type": qtype, "question_structure": structure, "question_flags": flags,
+            "classification_confidence": confidence, "classification_source": source,
+            "classification_review_required": review,
+            "original_question_type": explicit or qtype}
 
 
 def _get(d: dict, *names: str, default=None):
@@ -348,12 +386,73 @@ def _normalize_record(record: Any, default_subject: str, source_name: str, owner
     canonical = _norm(q_en).casefold() + "|" + "|".join(_norm(options.get(k, "")).casefold() for k in LETTERS)
     qhash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     status = "ready" if len(options) >= 2 and correct in options else "pending"
-    qtype, qstructure, qflags = detect_question_layout(q_en, q_hi, record)
+    classification = classify_question_for_import(q_en, q_hi, record)
+    qtype, qstructure, qflags = classification["question_type"], classification["question_structure"], classification["question_flags"]
     return {"question_en": q_en, "question_hi": q_hi or None, "options": options, "correct_option": correct,
             "explanation_en": explanation_en or None, "explanation_hi": explanation_hi or None,
             "subject": subject, "topic": topic, "source": source, "source_url": source_url,
             "attribution": attribution, "status": status, "question_hash": qhash, "created_by_telegram_id": owner_id,
-            "question_type": qtype, "question_structure": qstructure, "question_flags": qflags}
+            "question_type": qtype, "question_structure": qstructure, "question_flags": qflags,
+            "classification_confidence": classification["classification_confidence"],
+            "classification_source": classification["classification_source"],
+            "classification_review_required": classification["classification_review_required"],
+            "original_question_type": classification["original_question_type"]}
+
+
+async def enrich_import_classifications_with_ai(records: list[dict]) -> dict:
+    """Optional AI fallback for low-confidence layouts; only classification metadata may change.
+
+    Uses the same OpenAI-compatible INTEL_AI_* configuration as Nexus Intel. If unavailable,
+    uncertain questions remain in the admin review queue; question content and answer keys are
+    never sent back as model-authored replacements.
+    """
+    endpoint=os.getenv("INTEL_AI_BASE_URL", "").strip().rstrip("/")
+    key=os.getenv("INTEL_AI_API_KEY", "").strip()
+    model=os.getenv("INTEL_AI_MODEL", "").strip()
+    pending=[(i,r) for i,r in enumerate(records) if r.get("classification_review_required")]
+    if not pending or not (endpoint and key and model):
+        return {"attempted":0,"classified":0,"needs_review":len(pending),"provider_configured":bool(endpoint and key and model)}
+
+    classified=0
+    # Small batches keep requests predictable and model output constrained.
+    for offset in range(0,len(pending),25):
+        batch=pending[offset:offset+25]
+        payload_rows=[]
+        for idx,row in batch:
+            payload_rows.append({"id":idx,"question":row.get("question_en") or row.get("question_hi") or "",
+                "hindi":row.get("question_hi") or "", "options":row.get("options") or {},
+                "existing_type":row.get("question_type") or "standard"})
+        prompt=("Classify each MCQ layout. Return ONLY JSON: {\"items\":[{\"id\":integer,\"question_type\":string,\"confidence\":number}]}. "
+          "Allowed question_type values: "+", ".join(sorted(LAYOUT_TYPES))+". "
+          "Do not rewrite, translate, correct, infer, or return question text, options, answers, or explanations. "
+          "Use standard only when no special layout is present. Confidence must be 0..1.\nDATA: "+json.dumps(payload_rows,ensure_ascii=False))
+        body=json.dumps({"model":model,"temperature":0,"messages":[{"role":"system","content":"You are a strict MCQ layout classifier. Output JSON only."},{"role":"user","content":prompt}],"response_format":{"type":"json_object"}}).encode()
+        def _request():
+            req=urllib.request.Request(endpoint+"/chat/completions",data=body,headers={"Content-Type":"application/json","Authorization":"Bearer "+key})
+            with urllib.request.urlopen(req,timeout=35) as response: return json.loads(response.read().decode("utf-8"))
+        try:
+            response=await asyncio.to_thread(_request)
+            content=response["choices"][0]["message"]["content"]
+            result=json.loads(content) if isinstance(content,str) else content
+            items=result.get("items",[]) if isinstance(result,dict) else []
+        except Exception as exc:
+            log.warning("AI MCQ classification fallback failed safely: %s",type(exc).__name__)
+            continue
+        by_id={int(x["id"]):x for x in items if isinstance(x,dict) and str(x.get("id","")).isdigit()}
+        for idx,row in batch:
+            suggestion=by_id.get(idx)
+            if not suggestion: continue
+            qtype=str(suggestion.get("question_type","")).strip().lower().replace("-","_").replace(" ","_")
+            try: confidence=max(0.0,min(1.0,float(suggestion.get("confidence",0))))
+            except (TypeError,ValueError): confidence=0.0
+            if qtype not in LAYOUT_TYPES or confidence < 0.70: continue
+            row["question_type"]=qtype
+            row["classification_confidence"]=round(confidence,4)
+            row["classification_source"]="ai_fallback"
+            row["classification_review_required"]=False
+            row.setdefault("question_flags",{})["ai_classification_used"]=True
+            classified+=1
+    return {"attempted":len(pending),"classified":classified,"needs_review":len(pending)-classified,"provider_configured":True}
 
 
 def _extract_json_records(obj: Any) -> list:
@@ -1015,10 +1114,10 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
                 else:
                     mapped_subject = allowed.get(embedded_label.casefold(), selected)
                 item["subject"] = mapped_subject
-                cur=await conn.execute("""INSERT INTO question_bank(question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status,question_hash,import_batch_id,created_by_telegram_id)
-                    VALUES(%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                cur=await conn.execute("""INSERT INTO question_bank(question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status,question_hash,import_batch_id,created_by_telegram_id,classification_confidence,classification_source,classification_review_required,original_question_type)
+                    VALUES(%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(question_hash) DO NOTHING RETURNING id""",
-                    (item["question_en"],item["question_hi"],item.get("question_type","standard"),json.dumps(item.get("question_structure",{}),ensure_ascii=False),json.dumps(item.get("question_flags",{}),ensure_ascii=False),json.dumps(item["options"],ensure_ascii=False),item["correct_option"],item["explanation_en"],item["explanation_hi"],item["subject"],item["topic"],item["source"],item["source_url"],item["attribution"],item["status"],item["question_hash"],batch_id,owner_id))
+                    (item["question_en"],item["question_hi"],item.get("question_type","standard"),json.dumps(item.get("question_structure",{}),ensure_ascii=False),json.dumps(item.get("question_flags",{}),ensure_ascii=False),json.dumps(item["options"],ensure_ascii=False),item["correct_option"],item["explanation_en"],item["explanation_hi"],item["subject"],item["topic"],item["source"],item["source_url"],item["attribution"],item["status"],item["question_hash"],batch_id,owner_id,item.get("classification_confidence",0.48),item.get("classification_source","needs_review"),item.get("classification_review_required",True),item.get("original_question_type",item.get("question_type","standard"))))
                 if await cur.fetchone(): imported+=1
                 else: duplicates+=1
             await conn.execute("UPDATE question_import_batches SET imported_count=%s,duplicate_count=%s WHERE id=%s",(imported,duplicates,batch_id))

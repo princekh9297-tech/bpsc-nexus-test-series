@@ -1970,15 +1970,16 @@ async def admin_bulk_import(request):
         subject=str(fields.get('subject','')).strip()
         if not subject: return json_response({'error':'Choose the destination subject/collection.'},400)
         records,diag=qb.parse_file(filename,raw,subject,int(admin['id']))
+        classification_diag=await qb.enrich_import_classifications_with_ai(records)
         match=re.search(r'invalid=(\d+)',diag); invalid=int(match.group(1)) if match else 0
         preview=str(fields.get('preview','')).lower() in ('1','true','yes')
         if preview:
-            return json_response({'preview':True,'filename':filename,'diagnostics':diag,'detected':len(records)+invalid,'valid':len(records),'invalid':invalid,'sample':[{k:v for k,v in r.items() if k not in ('owner_id',)} for r in records[:12]],'ready_to_import':bool(records)})
+            return json_response({'preview':True,'filename':filename,'diagnostics':diag,'detected':len(records)+invalid,'valid':len(records),'invalid':invalid,'sample':[{k:v for k,v in r.items() if k not in ('owner_id',)} for r in records[:12]],'classification':classification_diag,'ready_to_import':bool(records)})
         file_type=filename.rsplit('.',1)[-1].lower() if '.' in filename else 'unknown'
         result=await qb.import_records(request.app['pool'],records,int(admin['id']),filename,file_type,subject,invalid)
         async with request.app['pool'].connection() as conn:
             await _write_admin_audit(conn,admin['id'],'bulk_question_import',filename,result)
-        return json_response({'result':result,'filename':filename},201)
+        return json_response({'result':result,'filename':filename,'classification':classification_diag},201)
     except ValueError as e: return json_response({'error':str(e)},400)
     except Exception as e:
         log.exception('Mini App bulk question import failed')
