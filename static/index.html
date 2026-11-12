@@ -2752,7 +2752,10 @@ async function loadQuizzes(){
     if($('quiz-list'))$('quiz-list').innerHTML=quizzes.map(q=>{
       return `<article class="quiz-card"><div class="card-top"><span class="subject">${esc(q.subject)}</span><span class="count">FREE · ${q.total_questions} Q</span></div><h3>${esc(q.title)}</h3><p>${esc(q.description||'')}</p><div class="meta"><span>◷ ${q.duration_minutes} min</span><span>+${q.positive_marks} / −${q.negative_marks}</span></div><div class="mode-row"><button class="secondary" data-start="${q.id}" data-mode="practice">Practice</button><button class="primary" data-start="${q.id}" data-mode="exam">Exam</button></div></article>`;
     }).join('');
-    document.querySelectorAll('[data-start]').forEach(b=>b.onclick=()=>startQuiz(Number(b.dataset.start),b.dataset.mode));
+    document.querySelectorAll('[data-start]').forEach(b=>b.onclick=()=>{
+      if(window.BPSC_PROFILE_READY===false){window.BPSC_OPEN_PROFILE_REGISTRATION?.();return;}
+      startQuiz(Number(b.dataset.start),b.dataset.mode);
+    });
   }catch(e){if($('quiz-list'))$('quiz-list').innerHTML='<div class="empty">Could not load.</div>';}
 }
 
@@ -2866,7 +2869,6 @@ async function loadBuilderMeta(){
   try{const data=await api('/api/quiz-builder/meta');if($('bank-total'))($('bank-total')||{set textContent(value){}}).textContent=Number(data.total_ready||0).toLocaleString()+' verified';if($('builder-subject'))$('builder-subject').innerHTML='<option value="All subjects">All subjects · '+data.total_ready+'</option>'+(data.subjects||[]).map(s=>`<option value="${esc(s.name)}">${esc(s.name)} · ${s.count}</option>`).join('');if($('builder-topic'))$('builder-topic').innerHTML='<option value="">All topics</option>'+(data.topics||[]).map(t=>`<option value="${esc(t)}">${esc(t)}</option>`).join('');}catch(e){if($('bank-total'))($('bank-total')||{set textContent(value){}}).textContent='Unavailable';}
 }
 async function createCustomQuiz(){
-  if(!(await ensureDemoGate('build custom quizzes')))return;
   const btn=$('build-quiz-btn'),status=$('builder-status');btn.disabled=true;status.textContent='Building…';
   try{
     const payload={subject:$('builder-subject').value,topic:$('builder-topic').value,count:Number($('builder-count').value),selection:$('builder-selection').value,duration_minutes:360,question_time_seconds:Number($('builder-qtime').value),use_all_questions:$('builder-all-questions').checked,positive_marks:Number($('builder-positive').value),negative_marks:Number($('builder-negative').value),mode:document.querySelector('input[name="builder-mode"]:checked').value,title:$('builder-title').value||'My Custom Quiz',shuffle_options:$('builder-shuffle-options').checked};
