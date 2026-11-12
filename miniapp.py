@@ -2533,9 +2533,8 @@ async def _create_quiz_attempt(request, qid: int, mode: str):
     async with pool.connection() as conn:
         await qb.ensure_schema(pool)
         await ensure_access_schema(conn)
-        # Published FREE quizzes are open to all Telegram users. Demo registration is
-        # not a prerequisite for starting a free test; paid quizzes are still protected
-        # by the entitlement check below. Admins retain their existing bypass.
+        # Published free quizzes are available without demo registration. Paid quizzes are
+        # protected below by subject/pass entitlement checks; admins retain their normal bypass.
         cur = await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks,question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,is_published,access_type FROM bank_quizzes WHERE id=%s", (qid,))
         quiz = await cur.fetchone()
         if not quiz:
@@ -2552,8 +2551,7 @@ async def _create_quiz_attempt(request, qid: int, mode: str):
         cur = await conn.execute("SELECT access_type FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) AND archived_at IS NULL LIMIT 1", (quiz['subject'],))
         bank_row = await cur.fetchone()
         effective_access = quiz['access_type'] if quiz['access_type'] in ('free', 'paid') else (bank_row['access_type'] if bank_row else 'free')
-        access = await _access_state(conn, user['id'], _is_series_admin(user), True)
-        if effective_access == 'paid' and not access['has_paid_access']:
+        if effective_access == 'paid' and not _is_series_admin(user) and not await _has_subject_entitlement(conn, int(user['id']), str(quiz['subject'] or '')):
             return json_response({'error': 'This quiz requires paid access. Open membership options to continue.'}, 403)
         settings = {'mode_label': 'Practice' if mode == 'practice' else 'Exam', 'negative_marks': float(quiz['negative_marks'])}
         cur = await conn.execute("""INSERT INTO bank_quiz_attempts(telegram_id,quiz_id,mode,quiz_settings,total_questions,started_at,question_time_seconds)
@@ -2957,10 +2955,6 @@ async def quiz_builder_meta(request):
 
 async def quiz_builder_create(request):
     user = request['telegram_user']
-    async with request.app['pool'].connection() as _gate_conn:
-        gate_ok,gate_reason=await _demo_gate(_gate_conn,int(user['id']),_is_series_admin(user))
-    if not gate_ok:
-        return json_response({'error':('Register for the free demo first to build custom quizzes.' if gate_reason in ('register','no_trial') else 'Your demo has ended. Unlock a pass to keep building.'),'demo_gate':'register' if gate_reason in ('register','no_trial') else 'expired'},403)
     try:
         body = await request.json()
         subject = str(body.get('subject') or 'All subjects').strip()
@@ -2981,6 +2975,11 @@ async def quiz_builder_create(request):
     await qb.ensure_schema(request.app['pool'])
     async with request.app['pool'].connection() as conn:
         await ensure_access_schema(conn)
+        if subject and subject != 'All subjects' and not _is_series_admin(user):
+            cur = await conn.execute("SELECT access_type FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) AND archived_at IS NULL LIMIT 1", (subject,))
+            subject_access = await cur.fetchone()
+            if subject_access and subject_access['access_type'] == 'paid' and not await _has_subject_entitlement(conn, int(user['id']), subject):
+                return json_response({'error':'This question bank requires paid access. Open membership options to continue.'},403)
         clauses = ["status='ready'"]
         params = []
         if subject and subject != 'All subjects':
@@ -2993,12 +2992,17 @@ async def quiz_builder_create(request):
         ids = [int(r['id']) for r in await cur.fetchall()]
         if not ids:
             return json_response({'error': 'No matching questions found.'}, 404)
+        custom_access = 'free'
+        if subject and subject != 'All subjects':
+            cur = await conn.execute("SELECT access_type FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) AND archived_at IS NULL LIMIT 1", (subject,))
+            sr = await cur.fetchone()
+            if sr and sr['access_type'] == 'paid': custom_access = 'paid'
         cur = await conn.execute("""INSERT INTO bank_quizzes
             (title,description,subject,created_by_telegram_id,duration_minutes,positive_marks,negative_marks,
              question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,is_published,access_type)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,TRUE,'free') RETURNING id""",
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,TRUE,%s) RETURNING id""",
             (title, f'Custom quiz with {len(ids)} questions', subject if subject != 'All subjects' else 'Custom',
-             user['id'], duration_minutes, positive, negative, qtime, shuffle, user['id']))
+             user['id'], duration_minutes, positive, negative, qtime, shuffle, user['id'], custom_access))
         qid = int((await cur.fetchone())['id'])
         for pos, question_id in enumerate(ids, 1):
             await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,question_id,position) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING", (qid, question_id, pos))

@@ -278,18 +278,10 @@ def detect_question_layout(question_en: str, question_hi: str = "", record: dict
     return qtype, structure, flags
 
 
-def _key_norm(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    text = re.sub(r"[\s\-./()\[\]:]+", "_", text)
-    text = re.sub(r"[^a-z0-9_\u0900-\u097f]", "", text)
-    return re.sub(r"_+", "_", text).strip("_")
-
-
 def _get(d: dict, *names: str, default=None):
-    if not isinstance(d, dict): return default
-    lower = {_key_norm(k): v for k, v in d.items()}
+    lower = {str(k).strip().lower().replace(" ", "_"): v for k, v in d.items()}
     for name in names:
-        key = _key_norm(name)
+        key = name.lower().replace(" ", "_")
         if key in lower and lower[key] not in (None, ""):
             return lower[key]
     return default
@@ -312,12 +304,8 @@ def _option_map(value: Any, row: dict) -> dict[str, str]:
                 key = LETTERS[i]
             if key in LETTERS and _norm(val): options[key] = _norm(val)
     for letter in LETTERS:
-        val = _get(row, letter, f"option_{letter}", f"option{letter}", f"choice_{letter}", f"choice{letter}", f"option_{letter}_text", f"answer_{letter}", f"विकल्प_{letter}")
+        val = _get(row, letter, f"option_{letter}", f"option{letter}", f"choice_{letter}", f"choice{letter}")
         if val is not None and _norm(val): options[letter] = _norm(val)
-    # Numeric option columns are common in coaching exports (Option 1 ... Option 5).
-    for i, letter in enumerate(LETTERS, 1):
-        val = _get(row, f"option_{i}", f"choice_{i}", f"answer_option_{i}")
-        if val is not None and _norm(val): options.setdefault(letter, _norm(val))
     return options
 
 
@@ -339,18 +327,18 @@ def _answer_letter(answer: Any, options: dict[str, str]) -> str | None:
 
 def _normalize_record(record: Any, default_subject: str, source_name: str, owner_id: int) -> dict | None:
     if not isinstance(record, dict): return None
-    q_en = _norm(_get(record, "question_en", "question", "question_text", "text", "q", "question_english", "english_question", "question_statement", "question_content", "prompt", "stem", "प्रश्न"))
-    q_hi = _norm(_get(record, "question_hi", "question_hindi", "hindi_question", "question_hin", "प्रश्न_हिंदी", "हिंदी_प्रश्न"))
-    options_raw = _get(record, "options", "choices", "answers", "answer_options", "option_list", default={})
+    q_en = _norm(_get(record, "question_en", "question", "question_text", "questiontext", "questionenglish", "prompt", "stem", "ques", "text", "q", "question_english", "english_question"))
+    q_hi = _norm(_get(record, "question_hi", "question_hindi", "questionhindi", "hindi_question", "question_hin", "hiquestion", "प्रश्न"))
+    options_raw = _get(record, "options", "opts", "choices", "alternatives", "option_list", "answer_options", "answers", default={})
     options = _option_map(options_raw, record)
     if not q_en and q_hi:
         q_en = q_hi
     if not q_en: return None
     # At least two non-empty options are needed for a usable MCQ.
     options = {k: v for k, v in options.items() if _norm(v)}
-    ans = _get(record, "correct_option", "correct_answer", "answer", "answer_key", "correct", "key", "right_answer", "correctanswer", "correct_option_letter", "correct_answer_key", "सही_उत्तर", "उत्तर")
+    ans = _get(record, "correct_option", "correct_answer", "correctanswer", "answer", "answer_key", "answerkey", "correct", "key", "right_answer", "rightanswer", "ans")
     correct = _answer_letter(ans, options)
-    explanation_en = _norm(_get(record, "explanation_en", "explanation", "solution", "reason", "explanation_english", "detailed_explanation", "व्याख्या"))
+    explanation_en = _norm(_get(record, "explanation_en", "explanation", "solution", "reason", "explanation_english"))
     explanation_hi = _norm(_get(record, "explanation_hi", "hindi_explanation", "explanation_hindi", "व्याख्या"))
     subject = _norm(_get(record, "subject", "category", "subject_name", default=default_subject)) or default_subject
     topic = _norm(_get(record, "topic", "chapter", "unit")) or None
@@ -398,24 +386,7 @@ def _extract_json_records(obj: Any) -> list:
         # One question object is also accepted.
         if any(k in {str(x).lower() for x in obj} for k in ("question", "question_en", "question_text", "q")):
             return [obj]
-    # Last-resort recursive discovery for common exports such as {data:{items:[...]}}.
-    def discover(value, depth=0):
-        if depth > 6: return []
-        if isinstance(value, list):
-            dicts=[x for x in value if isinstance(x,dict)]
-            if dicts and any(_get(x,"question","question_en","question_text","q","prompt","stem") for x in dicts): return dicts
-            for item in value:
-                found=discover(item,depth+1)
-                if found: return found
-        elif isinstance(value,dict):
-            if _get(value,"question","question_en","question_text","q","prompt","stem"): return [value]
-            for child in value.values():
-                found=discover(child,depth+1)
-                if found: return found
-        return []
-    found=discover(obj)
-    if found: return found
-    raise ValueError("JSON structure was read, but no question records were found. Expected question/question_en plus options or A–E fields.")
+    raise ValueError("JSON must contain a question array or a single question object.")
 
 
 class _TextExtractor(HTMLParser):
@@ -706,8 +677,8 @@ def _txt_to_records(text: str) -> list[dict]:
     current = None
     section = "question"
     active_option = None
-    q_start = re.compile(r"^\s*(?:(?:Q(?:uestion)?\s*)?\d{1,5}\s*[.)\-:]\s*|Q(?:uestion)?\s*\d{1,5}\s*[:.)\-]\s*)(.*)$", re.I)
-    option_line = re.compile(r"^\s*([A-E])\s*[).:\-]\s*(.*?)\s*$", re.I)
+    q_start = re.compile(r"^\s*(?:(?:Q(?:uestion)?|प्रश्न)\s*\d{1,5}\s*[:.)\-]?\s*|\d{1,5}\s*[.)\-:]\s*)(.*)$", re.I)
+    option_line = re.compile(r"^\s*(?:\(?([A-E])\)?|([कखगघङचछजझ]) )\s*[).:\-]\s*(.*?)\s*$", re.I)
     standalone_option = re.compile(r"^\s*([A-E])\s*$", re.I)
     answer_line = re.compile(r"^\s*(?:correct\s*)?(?:answer|ans|key)\s*[:：\-]\s*(.+?)\s*$", re.I)
     explanation_line = re.compile(r"^\s*(?:explanation|solution|reason|व्याख्या)\s*[:：\-]?\s*(.*)$", re.I)
@@ -752,11 +723,16 @@ def _txt_to_records(text: str) -> list[dict]:
         if am:
             m = re.search(r"(?i)\b(?:option\s*)?([A-E])\b", am.group(1))
             if m: current["answer"] = m.group(1).upper()
+            else:
+                n=re.search(r"\b([1-5])\b",am.group(1))
+                if n: current["answer"] = LETTERS[int(n.group(1))-1]
             section, active_option = "answer", None
             continue
         om = option_line.match(raw_line)
         if om:
-            letter, value = om.group(1).upper(), om.group(2).strip()
+            hindi_map={'क':'A','ख':'B','ग':'C','घ':'D','ङ':'E','च':'A','छ':'B','ज':'C','झ':'D'}
+            letter = (om.group(1) or hindi_map.get(om.group(2), 'A')).upper()
+            value = om.group(3).strip()
             correct = bool(re.search(r"[✓✔☑✅]", value))
             value = re.sub(r"\s*[✓✔☑✅]+\s*$", "", value).strip()
             current["options"][letter] = [value] if value else []
@@ -819,47 +795,66 @@ def _extract_image(raw: bytes) -> str:
         import pytesseract
     except Exception as e:
         raise ValueError("Image OCR requires Pillow, pytesseract and the Tesseract OCR binary on the server.") from e
-    try: return pytesseract.image_to_string(Image.open(io.BytesIO(raw)), lang='eng+hin')
+    try: return pytesseract.image_to_string(Image.open(io.BytesIO(raw)), lang='eng+hin', config='--psm 4')
     except Exception as e: raise ValueError(f"OCR could not read this image: {e}")
 
 def _parse_member(filename: str, raw: bytes):
     ext=filename.rsplit('.',1)[-1].lower() if '.' in filename else ''
-    if ext in ('json',): return _extract_json_records(json.loads(raw.decode('utf-8-sig')))
-    if ext=='csv':
-        content=raw.decode('utf-8-sig',errors='replace')
-        try: dialect=csv.Sniffer().sniff(content[:8192], delimiters=',;\t|')
-        except Exception: dialect=csv.excel
-        matrix=list(csv.reader(io.StringIO(content),dialect))
-        if not matrix: raise ValueError(f'{filename}: CSV contains no rows.')
-        headers=[_key_norm(x) for x in matrix[0]]
-        known_headers={'question','question_en','question_text','question_english','question_hindi','options','option_a','option_1','correct_answer','answer','answer_key','explanation'}
-        has_header=bool(set(headers)&known_headers)
+    if ext in ('json',):
+        obj=json.loads(raw.decode('utf-8-sig'))
+        try: return _extract_json_records(obj)
+        except ValueError:
+            rows=_generic_question_rows(obj)
+            if rows: return [_adapt_generic_row(r, 'Other / Unclassified', filename) for r in rows]
+            raise
+    if ext in ('csv','tsv'):
+        text=raw.decode('utf-8-sig',errors='replace')
+        sample='\n'.join(text.splitlines()[:12])
+        try: dialect=csv.Sniffer().sniff(sample, delimiters=',;\t|')
+        except Exception: dialect=type('Dialect',(),{'delimiter':'\t' if ext=='tsv' else ','})
+        matrix=list(csv.reader(io.StringIO(text), dialect=dialect))
+        matrix=[row for row in matrix if any(str(v or '').strip() for v in row)]
+        if not matrix: raise ValueError(f'{filename}: file has no data rows.')
+        aliases={'question','question_en','question_hi','question_text','questiontext','q','prompt','stem','प्रश्न','options','option_a','a','answer','correct_answer','correct_option','subject','topic','explanation'}
+        first=[str(x or '').strip().lower().replace(' ','_') for x in matrix[0]]
+        has_header=bool(set(first)&aliases)
         if has_header:
-            rows=list(csv.DictReader(io.StringIO(content),dialect=dialect))
-            if not rows: raise ValueError(f'{filename}: CSV has a header but no data rows.')
-            return _tabular_records(rows)
-        # Headerless CSV: Question, A, B, C, D, [answer], [explanation].
-        rows=[]
-        for cells in matrix:
-            cells=[str(x or '').strip() for x in cells]
-            if len(cells)>=5 and cells[0]:
-                row={'question':cells[0],'options':{LETTERS[i]:cells[i+1] for i in range(min(5,len(cells)-1)) if cells[i+1]}}
-                if len(cells)>5: row['correct_answer']=cells[5]
-                if len(cells)>6: row['explanation']=cells[6]
-                rows.append(row)
-        if rows:return rows
-        raise ValueError(f'{filename}: CSV columns were not recognized. Include Question, Option A–D and Correct Answer headers, or use headerless rows in that order.')
+            headers=[x or f'column_{i+1}' for i,x in enumerate(first)]
+            rows=[dict(zip(headers,row)) for row in matrix[1:] if any(str(v or '').strip() for v in row)]
+        else:
+            # Headerless tabular MCQ convention: question, A, B, C, D, [E], answer, [explanation].
+            rows=[]
+            for row in matrix:
+                vals=list(row)
+                if len(vals) < 6:
+                    raise ValueError(f'{filename}: headerless CSV rows need a question, at least four options and an answer.')
+                last=str(vals[-1] or '').strip().upper().replace('OPTION ','')
+                penultimate=str(vals[-2] or '').strip().upper().replace('OPTION ','') if len(vals)>6 else ''
+                last_is_answer=bool(re.fullmatch(r'[A-E]|[1-5]',last))
+                previous_is_answer=bool(re.fullmatch(r'[A-E]|[1-5]',penultimate))
+                if len(vals)>=7 and previous_is_answer and not last_is_answer:
+                    option_values=vals[1:-2]; answer_value=vals[-2]; explanation_value=vals[-1]
+                elif last_is_answer:
+                    option_values=vals[1:-1]; answer_value=vals[-1]; explanation_value=''
+                else:
+                    option_values=vals[1:-1]; answer_value=vals[-1]; explanation_value=''
+                option_values=(option_values+['']*5)[:5]
+                row_obj={'question':vals[0], 'A':option_values[0], 'B':option_values[1], 'C':option_values[2], 'D':option_values[3],
+                         'E':option_values[4], 'answer':answer_value, 'explanation':explanation_value}
+                rows.append(row_obj)
+        if not rows: raise ValueError(f'{filename}: no question rows found.')
+        return _tabular_records(rows)
     if ext in ('xlsx','xls'):
         try:
-            import openpyxl
-        except Exception as e: raise ValueError('Excel support requires openpyxl on the server.') from e
-        try:
             if ext=='xls':
-                import xlrd
+                try: import xlrd
+                except Exception as e: raise ValueError('Legacy XLS support requires xlrd on the server.') from e
                 book=xlrd.open_workbook(file_contents=raw); sheet=book.sheet_by_index(0)
                 if sheet.nrows<2: raise ValueError(f'{filename}: workbook needs a header row and data.')
                 keys=[str(x or '').strip() for x in sheet.row_values(0)]
                 return _tabular_records([dict(zip(keys,sheet.row_values(i))) for i in range(1,sheet.nrows)])
+            try: import openpyxl
+            except Exception as e: raise ValueError('XLSX support requires openpyxl on the server.') from e
             wb=openpyxl.load_workbook(io.BytesIO(raw),read_only=True,data_only=True)
             ws=wb.active; values=ws.iter_rows(values_only=True); headers=next(values,None)
             if not headers: raise ValueError(f'{filename}: workbook is empty.')
@@ -875,23 +870,11 @@ def _parse_member(filename: str, raw: bytes):
                 from pdf2image import convert_from_bytes
                 import pytesseract
                 pages=convert_from_bytes(raw,first_page=1,last_page=80)
-                text='\n'.join(pytesseract.image_to_string(page,lang='eng+hin') for page in pages)
+                text='\n'.join(pytesseract.image_to_string(page,lang='eng+hin',config='--psm 4') for page in pages)
             except Exception as e:
                 raise ValueError(f'{filename}: scanned PDF needs pdf2image, Poppler and Tesseract installed on the server ({type(e).__name__}).')
         if not text.strip(): raise ValueError(f'{filename}: OCR found no readable question text.')
-        try:
-            return _txt_to_records(text)
-        except ValueError as text_error:
-            # Some PDFs contain a text layer that is technically non-empty but unusable;
-            # retry OCR rather than incorrectly reporting an empty import.
-            try:
-                from pdf2image import convert_from_bytes
-                import pytesseract
-                pages=convert_from_bytes(raw,first_page=1,last_page=80)
-                ocr='\n'.join(pytesseract.image_to_string(page,lang='eng+hin') for page in pages)
-                if ocr.strip(): return _txt_to_records(ocr)
-            except Exception: pass
-            raise ValueError(f'{filename}: text was extracted but no MCQ structure was recognized. Check numbered questions and A–E options. {str(text_error)}')
+        return _txt_to_records(text)
     if ext in ('png','jpg','jpeg','webp','tif','tiff','bmp'):
         text=_extract_image(raw)
         if not text.strip(): raise ValueError(f'{filename}: OCR found no readable text.')
@@ -925,6 +908,11 @@ def parse_file(filename: str, raw: bytes, subject: str, owner_id: int) -> tuple[
         try:
             parsed=_parse_member(member_name,member_raw); detected+=len(parsed)
             for record in parsed:
+                if isinstance(record, dict):
+                    adapted=_adapt_generic_row(record, subject, member_name)
+                    merged=dict(record)
+                    merged.update({k:v for k,v in adapted.items() if v not in (None, '', {}, [])})
+                    record=merged
                 item=_normalize_record(record,subject,member_name,owner_id)
                 if item is None: invalid+=1
                 else: records.append(item)
