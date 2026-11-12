@@ -1994,7 +1994,7 @@ button:focus-visible{outline:3px solid var(--red)!important;outline-offset:3px!i
     </div>
 
     <div class="admin-view" id="admin-view-import">
-      <div class="admin-view-head"><h2>📤 Bulk Import</h2><p>HTML, JSON, CSV. Max 20 MB / 20,000 questions.</p></div>
+      <div class="admin-view-head"><h2>📤 Question Import Studio</h2><p>TXT, JSON, CSV, XLSX, DOCX, PDF, HTML, ZIP and image OCR. Max 20 MB / 20,000 questions.</p></div>
       <div class="panel admin-panel-card">
         <h3 class="admin-section-title">Create destination</h3>
         <form id="admin-import-subject-form" class="admin-form">
@@ -2007,10 +2007,12 @@ button:focus-visible{outline:3px solid var(--red)!important;outline-offset:3px!i
         <h3 class="admin-section-title">Upload questions</h3>
         <form id="admin-import-form" class="admin-form">
           <label>Destination<select id="admin-import-subject" required><option value="">Loading…</option></select></label>
-          <label>File<input id="admin-import-file" type="file" accept=".html,.htm,.json,.csv" required></label>
-          <button class="primary full" type="submit">Import</button>
+          <label>File<input id="admin-import-file" type="file" accept=".txt,.json,.csv,.xlsx,.xls,.docx,.pdf,.html,.htm,.zip,.png,.jpg,.jpeg,.webp,.tif,.tiff,.bmp" required></label>
+          <div style="font-size:11px;color:var(--muted);grid-column:1/-1">Quick Import detects the format automatically. ZIP supports multiple files. Review the extraction preview before confirming import. Scanned PDFs require OCR-ready processing; image OCR needs Tesseract installed on the server.</div>
+          <button class="secondary full" type="submit">1. Preview extraction</button>
+          <button class="primary full" id="admin-import-confirm" type="button" disabled>2. Confirm & Import</button>
         </form>
-        <div id="admin-import-status" class="admin-status"></div>
+        <div id="admin-import-status" class="admin-status"></div><div id="admin-import-preview" class="admin-status" style="white-space:pre-wrap"></div>
       </div>
     </div>
 
@@ -2667,12 +2669,25 @@ async function loadAdminImportSubjects(){
   }catch(e){}
 }
 $('admin-import-subject-form')?.addEventListener('submit',async e=>{e.preventDefault();const s=$('admin-import-subject-status');s.textContent='Creating…';try{await api('/api/admin/import/subjects','POST',{name:$('admin-import-new-subject').value,subject_type:$('admin-import-new-kind').value});$('admin-import-new-subject').value='';s.textContent='Created.';await loadAdminImportSubjects();}catch(err){s.textContent=err.message;}});
+let adminImportPreviewReady=false;
+$('admin-import-file')?.addEventListener('change',()=>{adminImportPreviewReady=false;$('admin-import-confirm').disabled=true;$('admin-import-preview').textContent='';});
 $('admin-import-form')?.addEventListener('submit',async e=>{
   e.preventDefault();const s=$('admin-import-status'),file=$('admin-import-file').files[0],subject=$('admin-import-subject').value;
-  if(!file){s.textContent='Choose a file.';return;}
-  if(file.size>20*1024*1024){s.textContent='File too large.';return;}
-  const form=new FormData();form.append('subject',subject);form.append('file',file,file.name);s.textContent='Uploading…';
-  try{const res=await fetch('/api/admin/import/questions',{method:'POST',headers:{'X-Telegram-Init-Data':tg.initData},body:form});const d=await res.json();if(!res.ok)throw new Error(d.error||'Import failed');const r=d.result;s.textContent=`Imported ${r.imported} · Dup ${r.duplicates} · Invalid ${r.invalid}`;$('admin-import-file').value='';}catch(err){s.textContent=err.message;}
+  if(!file){s.textContent='Choose a file.';return;} if(!subject){s.textContent='Choose a destination.';return;}
+  if(file.size>20*1024*1024){s.textContent='File too large (20 MB maximum).';return;}
+  const form=new FormData();form.append('subject',subject);form.append('file',file,file.name);form.append('preview','1');s.textContent='Detecting format and extracting questions…';
+  try{const res=await fetch('/api/admin/import/questions',{method:'POST',headers:{'X-Telegram-Init-Data':tg.initData},body:form});const d=await res.json();if(!res.ok)throw new Error(d.error||'Preview failed');
+    adminImportPreviewReady=true;$('admin-import-confirm').disabled=false;
+    const samples=(d.sample||[]).slice(0,5).map((q,i)=>`${i+1}. ${q.question_en||q.question_hi||'(question text unavailable)'}\n   Options: ${Object.entries(q.options||{}).map(([k,v])=>`${k}) ${Array.isArray(v)?v.join(' / '):v}`).join(' | ')}\n   Answer: ${q.correct_option||'Not detected'}`).join('\n\n');
+    $('admin-import-preview').textContent=`PREVIEW · ${d.filename}\nDetected: ${d.detected} · Valid: ${d.valid} · Invalid: ${d.invalid}\n${d.diagnostics}\n\nSample questions:\n${samples}\n\nConfirm only after checking the extraction.`;
+    s.textContent='Preview ready. No questions have been imported yet.';
+  }catch(err){adminImportPreviewReady=false;$('admin-import-confirm').disabled=true;s.textContent=err.message;}
+});
+$('admin-import-confirm')?.addEventListener('click',async()=>{
+  if(!adminImportPreviewReady)return;const s=$('admin-import-status'),file=$('admin-import-file').files[0],subject=$('admin-import-subject').value;
+  const form=new FormData();form.append('subject',subject);form.append('file',file,file.name);s.textContent='Importing reviewed file…';$('admin-import-confirm').disabled=true;
+  try{const res=await fetch('/api/admin/import/questions',{method:'POST',headers:{'X-Telegram-Init-Data':tg.initData},body:form});const d=await res.json();if(!res.ok)throw new Error(d.error||'Import failed');const r=d.result;s.textContent=`Import complete · Imported ${r.imported} · Duplicates ${r.duplicates} · Invalid ${r.invalid}`;$('admin-import-file').value='';$('admin-import-preview').textContent='';adminImportPreviewReady=false;
+  }catch(err){s.textContent=err.message;$('admin-import-confirm').disabled=false;}
 });
 
 async function loadAdminPassOptions(){
