@@ -1953,13 +1953,18 @@ async def admin_bulk_import(request):
     admin=request['telegram_user']
     if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
     try:
-        form=await request.multipart(); fields={}; upload=None
+        # Multipart parts are sequential streams. Read the uploaded file immediately
+        # when encountered; advancing the reader to a later form field drains the
+        # previous part. Retaining BodyPartReader and reading it after the loop
+        # therefore returned b'' for otherwise valid uploads (all file types).
+        form=await request.multipart(); fields={}; filename='questions.csv'; raw=None
         async for part in form:
-            if part.name=='file': upload=part
-            else: fields[part.name]=(await part.text())
-        if upload is None: return json_response({'error':'Choose an HTML, JSON or CSV question file.'},400)
-        filename=str(upload.filename or 'questions.csv').replace('\\','/').split('/')[-1][:180]
-        raw=await upload.read(decode=False)
+            if part.name=='file':
+                filename=str(part.filename or 'questions.csv').replace('\\','/').split('/')[-1][:180]
+                raw=await part.read(decode=False)
+            else:
+                fields[part.name]=(await part.text())
+        if raw is None: return json_response({'error':'Choose a question file to upload.'},400)
         if not raw: return json_response({'error':'The selected file is empty.'},400)
         if len(raw)>20*1024*1024: return json_response({'error':'Import files are limited to 20 MB.'},413)
         subject=str(fields.get('subject','')).strip()
