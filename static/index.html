@@ -1746,6 +1746,7 @@ button:focus-visible{outline:3px solid var(--red)!important;outline-offset:3px!i
         <button class="admin-nav-btn" data-admin-view="activity">📡 Activity</button>
         <button class="admin-nav-btn" data-admin-view="notifications">🔔 Notifications</button>
         <button class="admin-nav-btn" data-admin-view="members">👥 Members</button>
+        <button class="admin-nav-btn" data-admin-view="students">🧠 Student Intelligence</button>
         <button class="admin-nav-btn" data-admin-view="banks">🗃️ Banks</button>
         <button class="admin-nav-btn" data-admin-view="tests">🗑️ Delete Tests</button>
         <button class="admin-nav-btn" data-admin-view="series">📚 Series</button>
@@ -1792,6 +1793,18 @@ button:focus-visible{outline:3px solid var(--red)!important;outline-offset:3px!i
         </div>
         <div class="activity-feed" id="admin-activity-feed"><div class="loader">Loading…</div></div>
       </div>
+    </div>
+
+    <div class="admin-view" id="admin-view-students">
+      <div class="admin-view-head"><h2>🧠 Student Intelligence</h2><p>Verified Telegram identities, engagement, login history and academic performance.</p></div>
+      <div class="admin-stats" id="student-intel-stats"><div class="admin-stat"><strong>—</strong><span>Students</span></div><div class="admin-stat"><strong>—</strong><span>Active today</span></div><div class="admin-stat"><strong>—</strong><span>Test attempts</span></div><div class="admin-stat"><strong>—</strong><span>Responses</span></div></div>
+      <div class="panel admin-panel-card">
+        <div class="section-head" style="margin-top:0"><h3 class="admin-section-title">👥 Student directory</h3><button class="secondary" id="student-intel-refresh" type="button">↻ Refresh</button></div>
+        <input id="student-intel-search" type="search" placeholder="Search name, username or Telegram ID…" style="width:100%;margin:8px 0 12px">
+        <div id="student-intel-list"><div class="loader">Loading student records…</div></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"><button class="secondary" id="student-export-users" type="button">⬇ Export students CSV</button><button class="secondary" id="student-export-attempts" type="button">⬇ Export attempts CSV</button></div>
+      </div>
+      <div class="panel admin-panel-card" id="student-intel-detail" style="display:none;margin-top:12px"></div>
     </div>
 
     <div class="admin-view" id="admin-view-notifications">
@@ -2307,6 +2320,7 @@ window.activateAdminView=function(name){
   if(name==='notifications')loadAdminNotifications().catch(()=>{});
   if(name==='tests')loadAdminTests().catch(()=>{});
   if(name==='activity')loadActivity().catch(()=>{});
+  if(name==='students')loadStudentIntelligence().catch(()=>{});
   if(name==='revenue')loadRevenue().catch(()=>{});
   if(name==='banner')loadBanner().catch(()=>{});
   if(name==='maintenance')loadMaintenance().catch(()=>{});
@@ -2318,6 +2332,30 @@ document.addEventListener('click',e=>{
   const b=e.target.closest('[data-admin-view]');if(b){window.activateAdminView(b.dataset.adminView);return;}
   const j=e.target.closest('[data-admin-jump]');if(j){window.activateAdminView(j.dataset.adminJump);return;}
 });
+
+// ---------- Student Intelligence ----------
+let studentIntelCache=[];
+async function loadStudentIntelligence(){
+  const list=$('student-intel-list');if(list)list.innerHTML='<div class="loader">Loading student records…</div>';
+  try{
+    const d=await api('/api/admin/students');studentIntelCache=d.students||[];
+    const st=d.stats||{};const stats=$('student-intel-stats');
+    if(stats)stats.innerHTML=[[st.total_students,'Registered'],[st.active_today,'Active today'],[st.total_attempts,'Test attempts'],[st.responses,'Responses']].map(x=>`<div class="admin-stat"><strong>${Number(x[0]||0).toLocaleString()}</strong><span>${esc(x[1])}</span></div>`).join('');
+    renderStudentIntelList();
+  }catch(e){if(list)list.innerHTML=`<div class="empty">${esc(e.message)}</div>`;}
+}
+function renderStudentIntelList(){
+  const list=$('student-intel-list');if(!list)return;const q=String($('student-intel-search')?.value||'').toLowerCase();
+  const rows=studentIntelCache.filter(s=>[s.first_name,s.last_name,s.username,s.telegram_id].join(' ').toLowerCase().includes(q));
+  if(!rows.length){list.innerHTML='<div class="empty">No matching student records.</div>';return;}
+  list.innerHTML=rows.map(s=>`<button type="button" class="panel" data-student-id="${s.telegram_id}" style="width:100%;text-align:left;display:flex;justify-content:space-between;gap:10px;margin:6px 0;padding:12px;cursor:pointer"><span><b>${esc([s.first_name,s.last_name].filter(Boolean).join(' ')||'Student')}</b><small style="display:block;color:var(--muted)">${esc(s.username?'@'+s.username:'No username')} · ${s.telegram_id}</small><small style="display:block;color:var(--muted)">Last active: ${esc(s.last_seen_at?new Date(s.last_seen_at).toLocaleString():'—')}</small></span><span style="text-align:right"><b>${s.attempts} tests</b><small style="display:block;color:var(--muted)">${s.accuracy??'—'}% accuracy</small></span></button>`).join('');
+}
+async function loadStudentIntelDetail(tid){const box=$('student-intel-detail');if(!box)return;box.style.display='block';box.innerHTML='<div class="loader">Loading student analytics…</div>';try{const d=await api('/api/admin/students/'+encodeURIComponent(tid));const u=d.user||{};box.innerHTML=`<div class="section-head"><h3 class="admin-section-title">Student · ${esc([u.first_name,u.last_name].filter(Boolean).join(' ')||tid)}</h3><button class="secondary" id="student-detail-close" type="button">Close</button></div><p style="color:var(--muted);font-size:12px">Telegram ID: ${u.telegram_id} · @${esc(u.username||'—')}<br>Registered: ${esc(u.created_at||'—')} · Last seen: ${esc(u.last_seen_at||'—')}</p><h4>Subject performance</h4>${(d.subjects||[]).map(x=>`<div style="display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line)"><span>${esc(x.subject)}</span><b>${x.correct}/${x.attempted} correct · ${x.questions} Q</b></div>`).join('')||'<p>No subject data yet.</p>'}<h4 style="margin-top:14px">Test history</h4>${(d.attempts||[]).map(a=>`<div style="padding:9px 0;border-bottom:1px solid var(--line)"><b>${esc(a.title||'Quiz #'+a.quiz_id)}</b><small style="display:block;color:var(--muted)">${esc(a.subject||'—')} · ${esc(a.mode)} · ${a.correct_count}/${a.total_questions} correct · ${a.accuracy??'—'}% · ${esc(a.started_at||'')}</small></div>`).join('')||'<p>No attempts yet.</p>'}<h4 style="margin-top:14px">Login history</h4>${(d.logins||[]).map(x=>`<div style="padding:6px 0;border-bottom:1px solid var(--line);font-size:12px">${esc(x.login_at||'')} <span style="color:var(--muted)">· Last seen ${esc(x.last_seen_at||'')}</span></div>`).join('')||'<p>No login history yet.</p>'}`;box.querySelector('#student-detail-close')?.addEventListener('click',()=>box.style.display='none');}catch(e){box.innerHTML=`<div class="empty">${esc(e.message)}</div>`;}}
+$('student-intel-refresh')?.addEventListener('click',loadStudentIntelligence);
+$('student-intel-search')?.addEventListener('input',renderStudentIntelList);
+$('student-intel-list')?.addEventListener('click',e=>{const b=e.target.closest('[data-student-id]');if(b)loadStudentIntelDetail(b.dataset.studentId);});
+$('student-export-users')?.addEventListener('click',()=>window.open('/api/admin/student-export/students','_blank'));
+$('student-export-attempts')?.addEventListener('click',()=>window.open('/api/admin/student-export/attempts','_blank'));
 
 // ---------- Notifications ----------
 async function loadNotifications(ring=false){
@@ -3084,7 +3122,7 @@ loadAdminSession().finally(()=>{loadAccess().catch(()=>{}).finally(()=>{loadQuiz
 </script>
 
 
-<div id="profile-registration-overlay" class="profile-registration-overlay" role="dialog" aria-modal="true" aria-labelledby="profile-registration-title">
+<div id="profile-registration-overlay" class="profile-registration-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="profile-registration-title">
   <form id="profile-registration-form" class="profile-registration-card">
     <div class="profile-registration-mark">N</div>
     <div class="profile-registration-kicker">ONE-TIME SETUP</div>
@@ -3110,7 +3148,16 @@ loadAdminSession().finally(()=>{loadAccess().catch(()=>{}).finally(()=>{loadQuiz
   let profile=null, photoData='';
   try{profile=JSON.parse(localStorage.getItem(KEY)||'null')}catch(e){}
   const defaultPhoto=tgUser.photo_url||'';
-  window.BPSC_PROFILE_READY=!!(profile&&String(profile.userId||'').trim()&&String(profile.name||'').trim());
+  const telegramName=[tgUser.first_name,tgUser.last_name].filter(Boolean).join(' ').trim();
+  if(tgUser.id){
+    profile={...(profile||{}),name:telegramName||profile?.name||'Student',userId:String(tgUser.id),username:tgUser.username?'@'+tgUser.username:(profile?.username||''),photo:defaultPhoto||profile?.photo||''};
+    try{localStorage.setItem(KEY,JSON.stringify(profile));}catch(e){}
+    window.BPSC_PROFILE_READY=true;
+    const sessionKey='bpsc_nexus_session_'+String(tgUser.id);
+    let sessionValue='';try{sessionValue=sessionStorage.getItem(sessionKey)||'';if(!sessionValue){sessionValue=(crypto.randomUUID?crypto.randomUUID():String(Date.now())+'_'+Math.random().toString(36).slice(2));sessionStorage.setItem(sessionKey,sessionValue);}}catch(e){sessionValue=String(Date.now());}
+    if(tg?.initData){fetch('/api/register',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Telegram-Init-Data':tg.initData},body:JSON.stringify({session_key:sessionValue})}).then(r=>{if(!r.ok)throw new Error('Telegram verification failed');return r.json();}).then(()=>{window.BPSC_PROFILE_VERIFIED=true;}).catch(err=>{window.BPSC_PROFILE_VERIFIED=false;console.warn('Student verification:',err.message);});}
+  }
+  window.BPSC_PROFILE_READY=!!(tgUser.id||(profile&&String(profile.userId||'').trim()&&String(profile.name||'').trim()));
   function setAvatar(src){
     const img=$('profile-avatar-preview');
     if(!img)return;
