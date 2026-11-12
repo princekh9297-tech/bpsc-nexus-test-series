@@ -183,7 +183,8 @@ def _norm(value: Any) -> str:
 
 LAYOUT_TYPES = {
     "standard", "match_following", "statement_based", "assertion_reason", "chronology",
-    "pair_based", "passage_based", "table_based", "image_based", "numerical"
+    "pair_based", "passage_based", "table_based", "image_based", "numerical",
+    "multiple_correct", "incorrect_pair", "odd_one_out", "sequence", "data_interpretation"
 }
 
 
@@ -247,12 +248,22 @@ def detect_question_layout(question_en: str, question_hi: str = "", record: dict
         qtype = "assertion_reason"
     elif statements or re.search(r"following\s+(?:three\s+|four\s+)?statements?|statements?\s+(?:given|listed|are\s+given)|consider the following statements|which of the (?:(?:above|following) )?statements|which one of the following statements|how many of the statements|निम्नलिखित कथन|कथनों?\s+में से|कौन से कथन|उपर्युक्त कथन|उपर्युक्त में से कौन|कथन\s*(?:1|१|दो|तीन|चार)", text, re.I) or (re.search(r"statement|कथन", text, re.I) and len(re.findall(r"(?:\(\s*(?:1|2|3|4|i|ii|iii|iv|१|२|३|४)\s*\)|(?:^|\s)(?:1|2|3|4|i|ii|iii|iv)[.)])", text, re.I)) >= 2):
         qtype = "statement_based"
+    elif re.search(r"odd one out|which one is different|असंगत चुन|विषम चुन", text, re.I):
+        qtype = "odd_one_out"
+    elif re.search(r"incorrectly?\s+(?:matched|paired)|incorrect pair|not correctly matched|असुमेलित|गलत युग्म", text, re.I):
+        qtype = "incorrect_pair"
+    elif re.search(r"select all that apply|all that apply|more than one correct|multiple correct|one or more correct|एक से अधिक सही|सभी सही विकल्प", text, re.I):
+        qtype = "multiple_correct"
     elif pairs or re.search(r"which of the following pairs|correctly matched pair|following pairs|सही सुमेलित युग्म|निम्नलिखित युग्म", text, re.I):
         qtype = "pair_based"
     elif re.search(r"match\s+(?:the\s+)?following|match\s+list|correctly\s+matched|सुमेलित|मिलान\s+कीजिए|सूची\s*[i१२12].{0,80}सूची", text, re.I | re.S):
         qtype = "match_following"
     elif events or re.search(r"chronological order|correct sequence|arrange.{0,30}order|कालानुक्रम|सही क्रम में व्यवस्थित|घटनाओं का क्रम", text, re.I):
         qtype = "chronology"
+    elif re.search(r"sequence of|arrange in (?:ascending|descending) order|increasing order|decreasing order|आरोही क्रम|अवरोही क्रम", text, re.I):
+        qtype = "sequence"
+    elif re.search(r"data interpretation|following table|following graph|following chart|निम्नलिखित तालिका|आंकड़ों के आधार पर", text, re.I):
+        qtype = "data_interpretation"
     elif passage or re.search(r"read the following passage|passage given below|निम्नलिखित गद्यांश|निम्नलिखित अनुच्छेद", text, re.I):
         qtype = "passage_based"
     elif _get(record, "image", "image_url", "diagram", "figure", "map_url", default=None):
