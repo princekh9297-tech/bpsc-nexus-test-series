@@ -15,6 +15,7 @@ import random
 import re
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any
 
 import leaderboard as lb
@@ -754,26 +755,126 @@ def _txt_to_records(text: str) -> list[dict]:
         raise ValueError("Could not identify MCQs in this TXT file. Use numbered questions followed by A)–E) options. Mark the correct option with ✓/✅ or add an 'Answer: D' line. Optional explanations can start with 'Explanation:'.")
     return records
 
+def _tabular_records(rows):
+    out=[]
+    for row in rows:
+        if not row: continue
+        clean={str(k or '').strip().lower().replace(' ','_'):v for k,v in row.items() if k is not None}
+        out.append(clean)
+    return out
+
+def _extract_docx(raw: bytes) -> str:
+    try:
+        from docx import Document
+    except Exception as e:
+        raise ValueError("DOCX support requires python-docx on the server.") from e
+    doc=Document(io.BytesIO(raw)); chunks=[]
+    for para in doc.paragraphs:
+        if para.text.strip(): chunks.append(para.text)
+    for table in doc.tables:
+        for row in table.rows:
+            chunks.append(' | '.join(cell.text.replace('\n',' ').strip() for cell in row.cells))
+    return '\n'.join(chunks)
+
+def _extract_pdf(raw: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+    except Exception as e:
+        raise ValueError("PDF support requires pypdf on the server.") from e
+    try: return '\n'.join((page.extract_text() or '') for page in PdfReader(io.BytesIO(raw)).pages)
+    except Exception as e: raise ValueError(f"Could not read PDF: {e}")
+
+def _extract_image(raw: bytes) -> str:
+    try:
+        from PIL import Image
+        import pytesseract
+    except Exception as e:
+        raise ValueError("Image OCR requires Pillow, pytesseract and the Tesseract OCR binary on the server.") from e
+    try: return pytesseract.image_to_string(Image.open(io.BytesIO(raw)), lang='eng+hin')
+    except Exception as e: raise ValueError(f"OCR could not read this image: {e}")
+
+def _parse_member(filename: str, raw: bytes):
+    ext=filename.rsplit('.',1)[-1].lower() if '.' in filename else ''
+    if ext in ('json',): return _extract_json_records(json.loads(raw.decode('utf-8-sig')))
+    if ext=='csv':
+        rows=list(csv.DictReader(io.StringIO(raw.decode('utf-8-sig',errors='replace'))))
+        if not rows: raise ValueError(f'{filename}: CSV has no data rows or header.')
+        return _tabular_records(rows)
+    if ext in ('xlsx','xls'):
+        try:
+            import openpyxl
+        except Exception as e: raise ValueError('Excel support requires openpyxl on the server.') from e
+        try:
+            if ext=='xls':
+                import xlrd
+                book=xlrd.open_workbook(file_contents=raw); sheet=book.sheet_by_index(0)
+                if sheet.nrows<2: raise ValueError(f'{filename}: workbook needs a header row and data.')
+                keys=[str(x or '').strip() for x in sheet.row_values(0)]
+                return _tabular_records([dict(zip(keys,sheet.row_values(i))) for i in range(1,sheet.nrows)])
+            wb=openpyxl.load_workbook(io.BytesIO(raw),read_only=True,data_only=True)
+            ws=wb.active; values=ws.iter_rows(values_only=True); headers=next(values,None)
+            if not headers: raise ValueError(f'{filename}: workbook is empty.')
+            keys=[str(x or '').strip() for x in headers]
+            return _tabular_records([dict(zip(keys,row)) for row in values if any(v is not None for v in row)])
+        except ValueError: raise
+        except Exception as e: raise ValueError(f'{filename}: could not read workbook: {e}')
+    if ext in ('docx',): return _txt_to_records(_extract_docx(raw))
+    if ext=='pdf':
+        text=_extract_pdf(raw)
+        if not text.strip():
+            try:
+                from pdf2image import convert_from_bytes
+                import pytesseract
+                pages=convert_from_bytes(raw,first_page=1,last_page=80)
+                text='\n'.join(pytesseract.image_to_string(page,lang='eng+hin') for page in pages)
+            except Exception as e:
+                raise ValueError(f'{filename}: scanned PDF needs pdf2image, Poppler and Tesseract installed on the server ({type(e).__name__}).')
+        if not text.strip(): raise ValueError(f'{filename}: OCR found no readable question text.')
+        return _txt_to_records(text)
+    if ext in ('png','jpg','jpeg','webp','tif','tiff','bmp'):
+        text=_extract_image(raw)
+        if not text.strip(): raise ValueError(f'{filename}: OCR found no readable text.')
+        return _txt_to_records(text)
+    if ext in ('html','htm'):
+        try: return _html_to_records(raw.decode('utf-8-sig',errors='replace'))
+        except Exception as e: raise ValueError(f'{filename}: HTML extraction failed: {e}')
+    if ext=='txt': return _txt_to_records(raw.decode('utf-8-sig',errors='replace'))
+    raise ValueError(f'{filename}: unsupported file type.')
+
 def parse_file(filename: str, raw: bytes, subject: str, owner_id: int) -> tuple[list[dict], str]:
     if len(raw) > MAX_FILE_BYTES: raise ValueError("File exceeds the 20 MB import limit.")
-    ext=filename.rsplit(".",1)[-1].lower() if "." in filename else ""
-    try: text=raw.decode("utf-8-sig")
-    except UnicodeDecodeError: text=raw.decode("utf-8", errors="replace")
-    if ext == "json": records=_extract_json_records(json.loads(text))
-    elif ext == "csv":
-        try: records=list(csv.DictReader(io.StringIO(text)))
-        except Exception as e: raise ValueError(f"Could not read CSV: {e}")
-        if not records: raise ValueError("CSV is empty or has no header row.")
-    elif ext in ("html", "htm"): records=_html_to_records(text)
-    elif ext == "txt": records=_txt_to_records(text)
-    else: raise ValueError("Supported file formats are .html, .htm, .json, .csv and .txt.")
-    if len(records) > MAX_QUESTIONS_PER_IMPORT: raise ValueError(f"Import is limited to {MAX_QUESTIONS_PER_IMPORT:,} questions per file.")
-    normalized=[]; invalid=0
-    for record in records:
-        item=_normalize_record(record, subject, filename, owner_id)
-        if item is None: invalid+=1
-        else: normalized.append(item)
-    return normalized, f"detected={len(records)}; invalid={invalid}"
+    ext=filename.rsplit('.',1)[-1].lower() if '.' in filename else ''
+    source_files=[]
+    if ext=='zip':
+        try:
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                members=[i for i in zf.infolist() if not i.is_dir() and not i.filename.startswith('__MACOSX/') and not Path(i.filename).name.startswith('.')]
+                if not members: raise ValueError('ZIP contains no supported files.')
+                expanded_total=0
+                for info in members:
+                    expanded_total += info.file_size
+                    if info.file_size>MAX_FILE_BYTES or expanded_total>40*1024*1024:
+                        raise ValueError('ZIP expanded content exceeds the safe extraction limit (40 MB total).')
+                    source_files.append((info.filename,zf.read(info)))
+        except zipfile.BadZipFile as e: raise ValueError('The ZIP archive is damaged or invalid.') from e
+    else: source_files=[(filename,raw)]
+    records=[]; invalid=0; detected=0; errors=[]
+    for member_name,member_raw in source_files:
+        try:
+            parsed=_parse_member(member_name,member_raw); detected+=len(parsed)
+            for record in parsed:
+                item=_normalize_record(record,subject,member_name,owner_id)
+                if item is None: invalid+=1
+                else: records.append(item)
+        except ValueError as e: errors.append(str(e))
+        except Exception as e: errors.append(f'{member_name}: could not parse ({type(e).__name__}).')
+    if len(records)>MAX_QUESTIONS_PER_IMPORT: raise ValueError(f'Import is limited to {MAX_QUESTIONS_PER_IMPORT:,} questions per file.')
+    if not records:
+        detail='; '.join(errors[:4])
+        raise ValueError(detail or 'No valid questions were detected. Check the file structure and required question/option/answer fields.')
+    suffix=f'; skipped_files={len(errors)}'
+    return records, f'detected={detected}; invalid={invalid}; files={len(source_files)}{suffix}'
 
 
 async def ensure_schema(pool):

@@ -1966,6 +1966,9 @@ async def admin_bulk_import(request):
         if not subject: return json_response({'error':'Choose the destination subject/collection.'},400)
         records,diag=qb.parse_file(filename,raw,subject,int(admin['id']))
         match=re.search(r'invalid=(\d+)',diag); invalid=int(match.group(1)) if match else 0
+        preview=str(fields.get('preview','')).lower() in ('1','true','yes')
+        if preview:
+            return json_response({'preview':True,'filename':filename,'diagnostics':diag,'detected':len(records)+invalid,'valid':len(records),'invalid':invalid,'sample':[{k:v for k,v in r.items() if k not in ('owner_id',)} for r in records[:12]],'ready_to_import':bool(records)})
         file_type=filename.rsplit('.',1)[-1].lower() if '.' in filename else 'unknown'
         result=await qb.import_records(request.app['pool'],records,int(admin['id']),filename,file_type,subject,invalid)
         async with request.app['pool'].connection() as conn:
