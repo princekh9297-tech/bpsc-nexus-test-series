@@ -1,23 +1,24 @@
-import asyncio
+"""BPSC Nexus Telegram navigation bot.
+
+Quiz delivery, attempts, scoring, leaderboards and student analytics are handled
+exclusively by the Telegram Mini App. This bot only exposes /start, /tutorial
+and /miniapp as navigation/help commands.
+"""
+
 import logging
 import os
 
-from psycopg.rows import dict_row
-from psycopg_pool import AsyncConnectionPool
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, MenuButtonCommands
-from telegram.ext import PollAnswerHandler
-import question_bank as qb
-import group_quiz as gq
-import intel
-
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonCommands,
+    Update,
+    WebAppInfo,
 )
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -25,503 +26,111 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bpsc_nexus_bot")
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024
-ADMIN_TELEGRAM_IDS = {
-    item.strip()
-    for item in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",")
-    if item.strip().isdigit()
-}
-pool: AsyncConnectionPool | None = None
-
-def is_admin(update: Update) -> bool:
-    user = update.effective_user
-    return user is not None and str(user.id) in ADMIN_TELEGRAM_IDS
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+MINI_APP_URL = os.environ.get("MINI_APP_URL", "").strip()
 
 
-def is_private(update: Update) -> bool:
+async def miniapp_keyboard() -> InlineKeyboardMarkup | None:
+    if not MINI_APP_URL.startswith("https://"):
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🚀 Open BPSC Nexus Mini App", web_app=WebAppInfo(url=MINI_APP_URL))]]
+    )
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
     chat = update.effective_chat
-    return chat is not None and chat.type == "private"
-
-
-async def ensure_schema() -> None:
-    """Idempotent migration: only the user table is needed by the bot itself.
-
-    Older tables from previous versions (premium_passes, pass_catalogue,
-    bpsc_payment_requests, tests ...) are intentionally left untouched in the
-    database; the bot simply no longer reads or writes them.
-    """
-    if pool is None:
-        raise RuntimeError("Database pool is not available")
-    statements = [
-        """CREATE TABLE IF NOT EXISTS app_users (
-            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            telegram_id BIGINT UNIQUE NOT NULL,
-            first_name TEXT,
-            username TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS first_name TEXT",
-        "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS username TEXT",
-    ]
-    async with pool.connection() as conn:
-        for statement in statements:
-            await conn.execute(statement)
-    logger.info("Database migration verified: app_users table.")
-
-
-async def post_init(application: Application) -> None:
-    global pool
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is missing.")
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL environment variable is missing.")
-    if not RENDER_EXTERNAL_URL.startswith("https://"):
-        raise RuntimeError("RENDER_EXTERNAL_URL must be the HTTPS URL assigned by Render.")
-    if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 16:
-        raise RuntimeError("Set WEBHOOK_SECRET to a random string of at least 16 characters.")
-    if not ADMIN_TELEGRAM_IDS:
-        logger.warning("ADMIN_TELEGRAM_IDS is empty; all admin panel access will be denied.")
-
-    pool = AsyncConnectionPool(
-        conninfo=DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        open=False,
-        kwargs={"row_factory": dict_row, "connect_timeout": 10},
-    )
-    await pool.open()
-    await pool.wait()
-    async with pool.connection() as conn:
-        await conn.execute("SELECT 1")
-
-    # Serialize every startup migration across Render processes/instances.
-    # This is a session-level lock: it remains held while the individual
-    # migration functions use their own pooled connections and is released
-    # automatically by PostgreSQL if this process/connection disappears.
-    migration_lock_key = 0x425053434D4947  # Stable BPSC Nexus schema-migration lock.
-    async with pool.connection() as migration_lock_conn:
-        logger.info("Waiting for the shared database migration lock...")
-        await migration_lock_conn.execute(
-            "SELECT pg_advisory_lock(%s)", (migration_lock_key,)
-        )
-        await migration_lock_conn.commit()
-        try:
-            logger.info("Database migration lock acquired; applying startup migrations.")
-            await ensure_schema()
-            await qb.ensure_schema(pool)
-            await gq.ensure_schema(pool)
-            await intel.ensure_schema(pool)
-            logger.info("All startup migrations completed successfully.")
-        finally:
-            # Commit the unlock query as well; the session-level lock survives
-            # transaction boundaries until pg_advisory_unlock is called.
-            await migration_lock_conn.execute(
-                "SELECT pg_advisory_unlock(%s)", (migration_lock_key,)
-            )
-            await migration_lock_conn.commit()
-            logger.info("Database migration lock released.")
-    me = await application.bot.get_me()
-    application.bot_data["bot_username"] = me.username
-    application.bot_data["db_pool"] = pool
-    # Start the persistent group-poll scheduler once the shared database is ready.
-    if application.bot_data.get("group_quiz_scheduler_task") is None:
-        application.bot_data["group_quiz_scheduler_task"] = asyncio.create_task(gq.scheduler(application, pool))
-    try:
-        # Replace any previously configured Telegram Web App menu button with the native Commands menu.
-        # Reset both the bot-wide default and any per-admin private-chat overrides.
-        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-        for admin_id in ADMIN_TELEGRAM_IDS:
-            await application.bot.set_chat_menu_button(chat_id=int(admin_id), menu_button=MenuButtonCommands())
-        await application.bot.set_my_commands([
-            BotCommand("start", "Start BPSC Nexus"),
-            BotCommand("quiz", "Take a quiz in this chat"),
-            BotCommand("myanalysis", "Get your private group quiz analysis"),
-            BotCommand("tutorial", "How to use BPSC Nexus"),
-            BotCommand("help", "Show commands and help"),
-        ], scope=BotCommandScopeAllPrivateChats())
-        await application.bot.set_my_commands([
-            BotCommand("start", "Show group quiz commands"),
-            BotCommand("startquiz", "Create/start a group quiz (admins)"),
-            BotCommand("pausequiz", "Pause the current group quiz (admins)"),
-            BotCommand("resumequiz", "Resume a paused group quiz (admins)"),
-            BotCommand("stopquiz", "Stop and finalize quiz with results (admins)"),
-            BotCommand("schedulequiz", "Schedule a group quiz (admins)"),
-            BotCommand("leaderboard", "Show group leaderboard"),
-            BotCommand("quizstatus", "Show current group quiz status"),
-            BotCommand("quizbrand", "Set this group’s quiz branding (admins)"),
-            BotCommand("help", "Show group commands"),
-        ], scope=BotCommandScopeAllGroupChats())
-    except Exception:
-        logger.exception("Could not register Telegram command menus")
-    logger.info("Database connection verified; Question Bank and Group Quiz migrations applied automatically.")
-
-
-async def post_shutdown(application: Application) -> None:
-    global pool
-    task = application.bot_data.get("group_quiz_scheduler_task")
-    if task is not None:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    if pool is not None:
-        await pool.close()
-        pool = None
-
-
-async def save_user(update: Update) -> None:
-    user = update.effective_user
-    if user is None or pool is None:
+    if message is None or chat is None:
         return
-    async with pool.connection() as conn:
-        await conn.execute(
-            """
-            INSERT INTO app_users (telegram_id, first_name, username)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (telegram_id) DO UPDATE
-            SET first_name = EXCLUDED.first_name,
-                username = EXCLUDED.username
-            """,
-            (user.id, user.first_name, user.username),
-        )
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-async def reply_with_uluk(message, caption: str, reply_markup=None) -> None:
-    """Send clean text until individually art-directed transparent sticker assets are approved."""
-    await message.reply_text(caption, reply_markup=reply_markup)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_private(update):
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "🧩 BPSC Nexus Group Quiz\n\n"
-                "Group admins/owners: /startquiz to create a quiz, /pausequiz to pause, "
-                "/resumequiz to continue, /stopquiz to complete early and publish results, "
-                "/schedulequiz to schedule, /leaderboard for rankings, /quizstatus for status, and /quizbrand to customise this group’s branding.\n\n"
-                "Use /help to see all group commands. Personal quizzes open in private chat."
-            )
-        return
-    user = update.effective_user
-    message = update.effective_message
-    if user is None or message is None:
-        return
-    await save_user(update)
-    if context.args and context.args[0].startswith("gqa_"):
-        try:
-            session_id = int(context.args[0][4:])
-        except ValueError:
-            await message.reply_text("That personal analysis link is invalid. Use /myanalysis to get your latest report.")
-            return
-        await gq.send_personal_analysis(update, context, pool, session_id)
-        return
-    if context.args and context.args[0].startswith("quiz_"):
-        try:
-            quiz_id = int(context.args[0][5:])
-        except ValueError:
-            await message.reply_text("That quiz link is invalid. Use /quiz to see available quizzes.")
-            return
-        await message.reply_text("Choose how you want to attempt this quiz:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Start quiz", callback_data=f"play:start:{quiz_id}")]]))
-        return
-    await reply_with_uluk(
-        message,
-        f"Welcome to BPSC Nexus, {user.first_name or 'Aspirant'}! 🦉\n\nPractise BPSC quizzes right here in Telegram. Use the persistent menu below to open Question Bank, Tutorial, Updates, My Profile or Leaderboard.",
-        reply_markup=main_user_keyboard(),
-    )
-
-
-
-
-STUDENT_MENU = {
-    "📚 Question Bank", "📘 Tutorial", "📢 Updates", "👤 My Profile", "🏆 Leaderboard"
-}
-
-def main_user_keyboard() -> ReplyKeyboardMarkup:
-    """Persistent five-destination private-chat navigation."""
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("📚 Question Bank"), KeyboardButton("📘 Tutorial")],
-         [KeyboardButton("📢 Updates"), KeyboardButton("👤 My Profile")],
-         [KeyboardButton("🏆 Leaderboard")]],
-        resize_keyboard=True, is_persistent=True, input_field_placeholder="Choose a BPSC Nexus section"
-    )
-
-async def student_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    user = update.effective_user
-    if not message or not user or not is_private(update) or message.text not in STUDENT_MENU:
-        return
-    await save_user(update)
-    choice = message.text
-    if choice == "📚 Question Bank":
-        await quiz_command(update, context)
-        return
-    if choice == "📘 Tutorial":
-        await tutorial_command(update, context)
-        return
-    if choice == "👤 My Profile":
-        async with pool.connection() as conn:
-            cur = await conn.execute("""SELECT COUNT(*) FILTER (WHERE submitted_at IS NOT NULL) AS attempts,
-                COALESCE(SUM(correct_count),0) AS correct, COALESCE(SUM(incorrect_count),0) AS incorrect,
-                COALESCE(SUM(skipped_count),0) AS skipped, COALESCE(SUM(score),0) AS score
-                FROM bank_quiz_attempts WHERE telegram_id=%s""", (user.id,))
-            stats = await cur.fetchone()
-        total = int(stats["correct"] or 0) + int(stats["incorrect"] or 0)
-        accuracy = (100 * int(stats["correct"] or 0) / total) if total else 0
+    if chat.type != "private":
         await message.reply_text(
-            f"👤 MY PROFILE\n\nName: {user.full_name}\nCompleted personal quizzes: {int(stats['attempts'] or 0)}\n"
-            f"Correct: {int(stats['correct'] or 0)} · Incorrect: {int(stats['incorrect'] or 0)} · Skipped: {int(stats['skipped'] or 0)}\n"
-            f"Accuracy: {accuracy:.1f}%\nPersonal quiz score total: {float(stats['score'] or 0):.2f}\n\n"
-            "For detailed group-quiz analysis, use /myanalysis.", reply_markup=main_user_keyboard())
+            "BPSC Nexus quizzes are available exclusively through the Mini App.\n"
+            "Open a private chat with me and use /miniapp."
+        )
         return
-    if choice == "📢 Updates":
-        async with pool.connection() as conn:
-            cur = await conn.execute("""SELECT a.title, a.published_at, v.summary
-                FROM intel_publications p JOIN intel_articles a ON a.id=p.article_id
-                JOIN intel_content_versions v ON v.id=p.content_version_id
-                WHERE p.status='published' ORDER BY COALESCE(p.published_at,a.published_at) DESC LIMIT 5""")
-            rows = await cur.fetchall()
-        if not rows:
-            await message.reply_text("📢 No approved updates have been published yet.", reply_markup=main_user_keyboard())
-        else:
-            lines = ["📢 BPSC NEXUS UPDATES", ""]
-            for i, row in enumerate(rows, 1):
-                summary = (row["summary"] or "").strip()
-                lines.append(f"{i}. {row['title']}" + (f"\n{summary[:500]}" if summary else ""))
-            await message.reply_text("\n\n".join(lines), reply_markup=main_user_keyboard(), disable_web_page_preview=True)
-        return
-    if choice == "🏆 Leaderboard":
-        async with pool.connection() as conn:
-            cur = await conn.execute("""WITH scored AS (
-                SELECT telegram_id, display_name, normalized_points, correct_count, incorrect_count,
-                total_time_seconds, total_questions_count, first_submitted_at,
-                CASE WHEN correct_count+incorrect_count>0 THEN correct_count::numeric/(correct_count+incorrect_count)*100 ELSE 0 END accuracy
-                FROM bpsc_leaderboard_period_totals WHERE period_type='lifetime' AND period_key='all' AND subject='All subjects'
-            ), ranked AS (SELECT ROW_NUMBER() OVER (ORDER BY normalized_points DESC, accuracy DESC,
-                (total_time_seconds::numeric/NULLIF(total_questions_count,0)) ASC, first_submitted_at ASC, telegram_id ASC) AS rank, * FROM scored)
-                SELECT rank,telegram_id,display_name,normalized_points,accuracy FROM ranked WHERE rank<=10 OR telegram_id=%s ORDER BY rank""", (user.id,))
-            rows = await cur.fetchall()
-        lines = ["🏆 BPSC NEXUS · LIFETIME LEADERBOARD", "Verified completed assessments · normalized points", ""]
-        mine = None
-        for row in rows:
-            line = f"{int(row['rank'])}. {row['display_name']} — {float(row['normalized_points']):.2f} pts · {float(row['accuracy']):.1f}% accuracy"
-            if int(row["rank"]) <= 10:
-                lines.append(line)
-            if int(row["telegram_id"]) == user.id:
-                mine = line
-        if len(rows) == 0:
-            lines.append("No verified leaderboard submissions yet.")
-        if mine:
-            lines += ["", "Your rank: " + mine]
-        lines += ["", "Weekly, monthly, daily challenge and subject-wise rankings are available in the Ranks section of the Mini App. Group-specific rankings remain available inside each Telegram group via /leaderboard."]
-        await message.reply_text("\n".join(lines), reply_markup=main_user_keyboard())
+
+    await message.reply_text(
+        "📚 *BPSC NEXUS*\n\n"
+        "Your preparation workspace for practice, mock tests, progress and rankings.\n\n"
+        "Use the button below to continue in the Mini App.\n\n"
+        "Commands: /miniapp · /tutorial",
+        parse_mode="Markdown",
+        reply_markup=await miniapp_keyboard(),
+        disable_web_page_preview=True,
+    )
 
 
-async def personal_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await gq.personal_analysis_command(update, context, pool)
+async def miniapp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+
+    if chat.type != "private":
+        await message.reply_text(
+            "Please open a private chat with BPSC Nexus and use /miniapp to launch the workspace."
+        )
+        return
+
+    keyboard = await miniapp_keyboard()
+    if keyboard is None:
+        await message.reply_text(
+            "The Mini App URL is not configured yet. Please contact the administrator."
+        )
+        return
+
+    await message.reply_text(
+        "🚀 *BPSC Nexus Mini App*\nTap below to open your workspace.",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
 
 
 async def tutorial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
         return
-    if not is_private(update):
-        await message.reply_text("Please open a private chat with BPSC Nexus to take personal quizzes.")
-        return
-    await reply_with_uluk(
-        message,
-        "📘 BPSC Nexus — Quick Tutorial\n\n"
-        "1. Send /quiz to see the published quizzes.\n"
-        "2. Tap a quiz and choose Practice or Exam mode.\n"
-        "3. Answer each question with the option buttons, then Submit to see your score.\n"
-        "4. Join a group quiz in your study group and use /myanalysis for your private report.",
-        reply_markup=main_user_keyboard(),
+
+    await message.reply_text(
+        "📘 *BPSC NEXUS — QUICK TUTORIAL*\n\n"
+        "1. Open the Mini App using /miniapp.\n"
+        "2. Sign in automatically through your Telegram account.\n"
+        "3. Open the Question Bank and choose a subject or test.\n"
+        "4. Select Practice Mode or Exam Mode where available.\n"
+        "5. Submit your answers to view your result and performance.\n"
+        "6. Visit your profile and leaderboard to review your progress.\n\n"
+        "All quiz attempts and results are handled inside the Mini App. "
+        "The Telegram bot is only for launching the app and providing help.",
+        parse_mode="Markdown",
+        reply_markup=await miniapp_keyboard() if update.effective_chat and update.effective_chat.type == "private" else None,
+        disable_web_page_preview=True,
     )
 
-async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_private(update):
-        if update.effective_message:
-            await update.effective_message.reply_text("Please open me in a private chat to take quizzes.")
-        return
-    if pool is None or update.effective_message is None:
-        return
-    async with pool.connection() as conn:
-        cur = await conn.execute("SELECT id,title,subject,(SELECT COUNT(*) FROM bank_quiz_questions bqq WHERE bqq.quiz_id=bq.id) AS n FROM bank_quizzes bq WHERE is_published=TRUE AND (is_custom=FALSE OR custom_owner_telegram_id=%s) ORDER BY id DESC LIMIT 20", (update.effective_user.id,))
-        rows = await cur.fetchall()
-    if not rows:
-        await update.effective_message.reply_text("No quizzes are published yet. Please check again later.")
-        return
-    lines = ["📚 Available quizzes", ""]
-    buttons = []
-    for item in rows:
-        lines.append(f"#{item['id']} · {item['title']}\n{item['subject']} · {item['n']} questions")
-        buttons.append([InlineKeyboardButton(f"Start #{item['id']} · {item['title'][:35]}", callback_data=f"play:start:{item['id']}")])
-    await update.effective_message.reply_text("\n\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
+async def post_init(application: Application) -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is missing.")
+    if not RENDER_EXTERNAL_URL.startswith("https://"):
+        raise RuntimeError("RENDER_EXTERNAL_URL must be the HTTPS URL assigned by Render.")
+    if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 16:
+        raise RuntimeError("Set WEBHOOK_SECRET to a random string of at least 16 characters.")
+    if not MINI_APP_URL.startswith("https://"):
+        logger.warning("MINI_APP_URL is missing or invalid; /miniapp will show a configuration message.")
 
-async def question_bank_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_private(update) or not is_admin(update):
-        if update.effective_message and update.effective_message.document:
-            await update.effective_message.reply_text("Question imports are available only to authorized admins in a private chat.")
-        return
-    handled = await qb.receive_file(update, context, pool, True)
-    if not handled and update.effective_message and update.effective_message.document:
-        doc = update.effective_message.document
-        ext = (doc.file_name or "").rsplit(".", 1)[-1].lower()
-        if ext in {"html", "htm", "json", "csv"}:
-            await update.effective_message.reply_text("Open Admin Panel → Question Bank → Import, choose a default subject, then send the file.")
-
-
-async def question_bank_poll_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_private(update) or not is_admin(update):
-        return
-    await qb.receive_poll(update, context, True)
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_private(update):
-        message = update.effective_message
-        if message:
-            await message.reply_text(
-                "🧩 BPSC Nexus — Group Commands\n\n"
-                "/startquiz — create a quiz and choose its fixed question range (admins/owner)\n"
-                "/pausequiz — pause the active quiz (current poll closes; resume continues at next question)\n"
-                "/resumequiz — resume a paused quiz\n"
-                "/stopquiz — stop early, mark completed, and publish analysis + leaderboard\n"
-                "/schedulequiz <quiz_id> <YYYY-MM-DDTHH:MMZ> [15|30|60|120|300] [learning|exam] — schedule in UTC\n"
-                "/leaderboard — cumulative leaderboard for this group\n"
-                "/quizstatus — active/paused/scheduled quiz status\n"
-                "/quizbrand <name> — customise branding on this group’s quiz polls; /quizbrand reset restores the group title\n"
-                "Legacy aliases still work: /groupquiz, /groupquiz_schedule, /grouprank, /groupstatus, /groupstop\n"
-                "/start — show this group guide\n\n"
-                "Make the bot an administrator with permission to send messages and create polls."
-            )
-        return
-    await tutorial_command(update, context)
-
-
-
-
-# ---------- Admin panel UI ----------
-def admin_home_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗃 Question Bank & Quiz Studio", callback_data="qb:home")],
-        [InlineKeyboardButton("📡 Nexus Intel", callback_data="intel:home")],
-    ])
-
-
-def admin_only(update: Update) -> bool:
-    return is_private(update) and is_admin(update)
-
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_private(update):
-        if update.effective_message:
-            await update.effective_message.reply_text("For security, the admin panel is available only in a private chat with the bot.")
-        return
-    if not is_admin(update):
-        if update.effective_message:
-            await update.effective_message.reply_text("⛔ This panel is available only to authorized administrators.")
-        return
-    context.user_data.pop("admin_flow", None)
-    await update.effective_message.reply_text("🛡️ BPSC Nexus Admin Panel\nChoose an action:", reply_markup=admin_home_keyboard())
-
-
-async def show_admin_home(query) -> None:
-    await query.edit_message_text("🛡️ BPSC Nexus Admin Panel\nChoose an action:", reply_markup=admin_home_keyboard())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if query is None:
-        return
-    data = query.data or ""
-    if data.startswith("intel:"):
-        if not admin_only(update):
-            await query.answer("Not authorized.", show_alert=True)
-            return
-        await intel.route_callback(update, context, pool, admin_only)
-        return
-    if await gq.route_callback(update, context, pool):
-        return
-    # Personal quiz buttons (play:*) and admin question-bank buttons (qb:*).
-    handled = await qb.route_callback(update, context, pool, admin_only(update))
-    if handled:
-        return
-    # Admin callback data is always re-authorized; hiding the buttons is not the security boundary.
-    if data.startswith("adm:"):
-        if not admin_only(update):
-            await query.answer("Not authorized.", show_alert=True)
-            return
-        await query.answer()
-        if data == "adm:home":
-            context.user_data.pop("admin_flow", None)
-            await show_admin_home(query)
-        elif data == "adm:cancel":
-            context.user_data.pop("admin_flow", None)
-            await query.edit_message_text("Cancelled.", reply_markup=admin_home_keyboard())
-        else:
-            await query.edit_message_text("Unknown action. Return to the Admin Panel.", reply_markup=admin_home_keyboard())
-        return
-
-    if data == "user:tutorial":
-        await query.answer()
-        await tutorial_command(update, context)
-    else:
-        await query.answer("This action is no longer available.", show_alert=True)
-
-
-async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    user = update.effective_user
-    if message is None or not message.text or user is None:
-        return
-    # Group-quiz range/timer/scoring prompts are handled before the owner-only admin text flow.
-    # The handler returns True only when this message belongs to an active group-quiz setup.
-    if await gq.group_quiz_text_input(update, context):
-        return
-    # Ignore ordinary user text completely; admin text prompts work only in private chat.
-    if not admin_only(update):
-        return
-    await qb.admin_text_callback(update, context, pool, True)
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    commands = [
+        BotCommand("start", "Start BPSC Nexus"),
+        BotCommand("tutorial", "How to use BPSC Nexus"),
+        BotCommand("miniapp", "Open BPSC Nexus Mini App"),
+    ]
+    await application.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+    await application.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+    logger.info("BPSC Nexus navigation bot initialized; quiz handlers are disabled.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -531,8 +140,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Set BOT_TOKEN in the hosting environment.")
-    if not DATABASE_URL:
-        raise SystemExit("Set DATABASE_URL in the hosting environment.")
+    if not RENDER_EXTERNAL_URL.startswith("https://"):
+        raise SystemExit("Set RENDER_EXTERNAL_URL to the HTTPS URL assigned by Render.")
     if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 16:
         raise SystemExit("Set WEBHOOK_SECRET to a random string of at least 16 characters.")
 
@@ -540,38 +149,14 @@ def main() -> None:
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        .post_shutdown(post_shutdown)
         .build()
     )
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("quiz", quiz_command))
-    application.add_handler(CommandHandler("myanalysis", personal_analysis_command))
+    application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("tutorial", tutorial_command))
-    application.add_handler(CommandHandler("admin", admin_command))
-    # New one-word group command names; old aliases remain registered for backwards compatibility.
-    application.add_handler(CommandHandler("startquiz", gq.group_quiz_command))
-    application.add_handler(CommandHandler("pausequiz", gq.group_pause_command))
-    application.add_handler(CommandHandler("resumequiz", gq.group_resume_command))
-    application.add_handler(CommandHandler("stopquiz", gq.group_stop_command))
-    application.add_handler(CommandHandler("schedulequiz", gq.group_quiz_schedule_command))
-    application.add_handler(CommandHandler("leaderboard", gq.group_leaderboard_command))
-    application.add_handler(CommandHandler("quizstatus", gq.group_status_command))
-    application.add_handler(CommandHandler("quizbrand", gq.group_brand_command))
-    application.add_handler(CommandHandler("groupquiz", gq.group_quiz_command))
-    application.add_handler(CommandHandler("groupquiz_schedule", gq.group_quiz_schedule_command))
-    application.add_handler(CommandHandler("grouprank", gq.group_leaderboard_command))
-    application.add_handler(CommandHandler("groupstatus", gq.group_status_command))
-    application.add_handler(CommandHandler("groupstop", gq.group_stop_command))
-    application.add_handler(CallbackQueryHandler(admin_callback))
-    application.add_handler(PollAnswerHandler(gq.group_poll_answer))
-    application.add_handler(MessageHandler(filters.Document.ALL, question_bank_file_handler))
-    application.add_handler(MessageHandler(filters.POLL, question_bank_poll_handler))
-    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^(📚 Question Bank|📘 Tutorial|📢 Updates|👤 My Profile|🏆 Leaderboard)$"), student_menu_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_input))
+    application.add_handler(CommandHandler("miniapp", miniapp_command))
     application.add_error_handler(error_handler)
 
-    logger.info("Starting BPSC Nexus Telegram bot in webhook mode.")
+    logger.info("Starting BPSC Nexus navigation bot in webhook mode.")
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
@@ -579,7 +164,7 @@ def main() -> None:
         webhook_url=f"{RENDER_EXTERNAL_URL}/telegram",
         secret_token=WEBHOOK_SECRET,
         drop_pending_updates=False,
-        allowed_updates=Update.ALL_TYPES,
+        allowed_updates=["message"],
     )
 
 

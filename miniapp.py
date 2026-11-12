@@ -60,7 +60,9 @@ def validate_init_data(init_data: str) -> dict:
         telegram_id = int(user["id"])
     except Exception:
         raise ValueError("Telegram user data is missing.")
-    return {"id": telegram_id, "first_name": str(user.get("first_name", "Student")), "username": user.get("username")}
+    return {"id": telegram_id, "first_name": str(user.get("first_name", "Student")),
+            "last_name": str(user.get("last_name", "")), "username": user.get("username"),
+            "photo_url": user.get("photo_url"), "language_code": user.get("language_code")}
 
 
 ADMIN_LOGIN_ID = os.environ.get("ADMIN_LOGIN_ID", "").strip()
@@ -2748,6 +2750,115 @@ async def my_attempts(request):
     return json_response({'attempts':rows})
 
 
+async def ensure_student_intelligence_schema(conn):
+    """Additive schema for verified student identity, login history and activity."""
+    await conn.execute("""CREATE TABLE IF NOT EXISTS app_users (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        telegram_id BIGINT UNIQUE NOT NULL,
+        first_name TEXT, username TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+    await conn.execute("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS last_name TEXT")
+    await conn.execute("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS photo_url TEXT")
+    await conn.execute("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS language_code TEXT")
+    await conn.execute("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
+    await conn.execute("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_student_login_history (
+        id BIGSERIAL PRIMARY KEY, telegram_id BIGINT NOT NULL,
+        session_key TEXT NOT NULL, first_name TEXT, username TEXT,
+        login_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        user_agent TEXT, UNIQUE(telegram_id, session_key))""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_student_login_tid_idx ON bpsc_student_login_history(telegram_id, login_at DESC)")
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_student_activity (
+        id BIGSERIAL PRIMARY KEY, telegram_id BIGINT NOT NULL,
+        event_type TEXT NOT NULL, event_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_student_activity_tid_idx ON bpsc_student_activity(telegram_id, created_at DESC)")
+
+
+async def admin_student_overview(request):
+    if not _is_series_admin(request['telegram_user']):
+        return json_response({'error':'Admin access required.'},403)
+    async with request.app['pool'].connection() as conn:
+        await ensure_student_intelligence_schema(conn)
+        cur=await conn.execute("""SELECT
+          (SELECT COUNT(*) FROM app_users) AS total_students,
+          (SELECT COUNT(*) FROM app_users WHERE last_seen_at >= NOW()-INTERVAL '1 day') AS active_today,
+          (SELECT COUNT(*) FROM app_users WHERE last_seen_at >= NOW()-INTERVAL '7 days') AS active_week,
+          (SELECT COUNT(*) FROM app_users WHERE created_at >= date_trunc('day',NOW())) AS new_today,
+          (SELECT COUNT(*) FROM bank_quiz_attempts) AS total_attempts,
+          (SELECT COUNT(*) FROM bank_quiz_attempts WHERE started_at >= date_trunc('day',NOW())) AS attempts_today,
+          (SELECT COALESCE(SUM(total_questions),0) FROM bank_quiz_attempts) AS questions_in_tests,
+          (SELECT COUNT(*) FROM bank_quiz_attempt_answers) AS responses""")
+        row=dict(await cur.fetchone())
+        cur=await conn.execute("""SELECT u.telegram_id,u.first_name,u.last_name,u.username,u.created_at,u.last_seen_at,
+          COUNT(a.id) AS attempts, COALESCE(SUM(a.total_questions),0) AS questions,
+          COALESCE(SUM(a.correct_count),0) AS correct,
+          ROUND(100.0*COALESCE(SUM(a.correct_count),0)/NULLIF(SUM(a.correct_count+a.incorrect_count),0),1) AS accuracy
+          FROM app_users u LEFT JOIN bank_quiz_attempts a ON a.telegram_id=u.telegram_id
+          GROUP BY u.telegram_id,u.first_name,u.last_name,u.username,u.created_at,u.last_seen_at
+          ORDER BY COALESCE(u.last_seen_at,u.created_at) DESC NULLS LAST LIMIT 100""")
+        students=[]
+        for r in await cur.fetchall():
+            d=dict(r); d['telegram_id']=int(d['telegram_id']); d['attempts']=int(d['attempts'] or 0); d['questions']=int(d['questions'] or 0); d['correct']=int(d['correct'] or 0); students.append(d)
+    return json_response({'stats':row,'students':students})
+
+
+async def admin_student_detail(request):
+    if not _is_series_admin(request['telegram_user']): return json_response({'error':'Admin access required.'},403)
+    try: tid=int(request.match_info['telegram_id'])
+    except ValueError: return json_response({'error':'Invalid Telegram ID.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_student_intelligence_schema(conn)
+        cur=await conn.execute("SELECT telegram_id,first_name,last_name,username,photo_url,language_code,created_at,last_seen_at FROM app_users WHERE telegram_id=%s",(tid,)); user=await cur.fetchone()
+        if not user: return json_response({'error':'Student not found.'},404)
+        cur=await conn.execute("""SELECT a.id,a.quiz_id,q.title,q.subject,a.mode,a.total_questions,a.correct_count,a.incorrect_count,a.skipped_count,a.score,a.started_at,a.submitted_at,
+          ROUND(100.0*a.correct_count/NULLIF(a.correct_count+a.incorrect_count,0),1) AS accuracy
+          FROM bank_quiz_attempts a LEFT JOIN bank_quizzes q ON q.id=a.quiz_id
+          WHERE a.telegram_id=%s ORDER BY a.started_at DESC LIMIT 300""",(tid,)); attempts=[dict(x) for x in await cur.fetchall()]
+        cur=await conn.execute("""SELECT COALESCE(s.subject,'Other / Unclassified') AS subject,
+          COUNT(*) AS questions,COUNT(*) FILTER(WHERE aa.selected_option IS NOT NULL) AS attempted,
+          COUNT(*) FILTER(WHERE aa.is_correct=TRUE) AS correct
+          FROM bank_quiz_attempts a JOIN bank_quiz_attempt_question_snapshots s ON s.attempt_id=a.id
+          LEFT JOIN bank_quiz_attempt_answers aa ON aa.attempt_id=s.attempt_id AND aa.question_id=s.question_id
+          WHERE a.telegram_id=%s GROUP BY 1 ORDER BY questions DESC""",(tid,)); subjects=[dict(x) for x in await cur.fetchall()]
+        cur=await conn.execute("SELECT login_at,last_seen_at,user_agent FROM bpsc_student_login_history WHERE telegram_id=%s ORDER BY login_at DESC LIMIT 100",(tid,)); logins=[dict(x) for x in await cur.fetchall()]
+    return json_response({'user':dict(user),'attempts':attempts,'subjects':subjects,'logins':logins})
+
+
+async def admin_student_export(request):
+    if not _is_series_admin(request['telegram_user']): return json_response({'error':'Admin access required.'},403)
+    kind=request.match_info.get('kind','students')
+    buf=io.StringIO(); writer=csv.writer(buf)
+    async with request.app['pool'].connection() as conn:
+        await ensure_student_intelligence_schema(conn)
+        if kind=='attempts':
+            writer.writerow(['telegram_id','student_name','quiz_id','quiz_title','subject','mode','total_questions','correct','incorrect','skipped','score','started_at','submitted_at'])
+            cur=await conn.execute("""SELECT a.telegram_id,u.first_name,a.quiz_id,q.title,q.subject,a.mode,a.total_questions,a.correct_count,a.incorrect_count,a.skipped_count,a.score,a.started_at,a.submitted_at FROM bank_quiz_attempts a LEFT JOIN app_users u ON u.telegram_id=a.telegram_id LEFT JOIN bank_quizzes q ON q.id=a.quiz_id ORDER BY a.started_at DESC""")
+        else:
+            writer.writerow(['telegram_id','first_name','last_name','username','created_at','last_seen_at','attempts','questions','correct','incorrect','skipped'])
+            cur=await conn.execute("""SELECT u.telegram_id,u.first_name,u.last_name,u.username,u.created_at,u.last_seen_at,COUNT(a.id) attempts,COALESCE(SUM(a.total_questions),0) questions,COALESCE(SUM(a.correct_count),0) correct,COALESCE(SUM(a.incorrect_count),0) incorrect,COALESCE(SUM(a.skipped_count),0) skipped FROM app_users u LEFT JOIN bank_quiz_attempts a ON a.telegram_id=u.telegram_id GROUP BY u.telegram_id ORDER BY u.created_at DESC""")
+        for r in await cur.fetchall(): writer.writerow(list(dict(r).values()))
+    return web.Response(body=buf.getvalue().encode('utf-8-sig'),content_type='text/csv',headers={'Content-Disposition':f'attachment; filename="bpsc_nexus_{kind}.csv"'})
+
+
+async def student_login_event(request):
+    user=request['telegram_user']
+    try: body=await request.json()
+    except Exception: body={}
+    key=re.sub(r'[^A-Za-z0-9_-]','',str(body.get('session_key') or ''))[:80]
+    if not key: return json_response({'error':'Session key is required.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_student_intelligence_schema(conn)
+        await conn.execute("""INSERT INTO app_users(telegram_id,first_name,last_name,username,photo_url,language_code,last_seen_at)
+          VALUES(%s,%s,%s,%s,%s,%s,NOW()) ON CONFLICT(telegram_id) DO UPDATE SET first_name=EXCLUDED.first_name,last_name=EXCLUDED.last_name,username=EXCLUDED.username,photo_url=COALESCE(EXCLUDED.photo_url,app_users.photo_url),language_code=EXCLUDED.language_code,last_seen_at=NOW(),updated_at=NOW()""",
+          (user['id'],user.get('first_name'),user.get('last_name'),user.get('username'),user.get('photo_url'),user.get('language_code')))
+        await conn.execute("""INSERT INTO bpsc_student_login_history(telegram_id,session_key,first_name,username,user_agent)
+          VALUES(%s,%s,%s,%s,%s) ON CONFLICT(telegram_id,session_key) DO UPDATE SET last_seen_at=NOW()""",
+          (user['id'],key,user.get('first_name'),user.get('username'),request.headers.get('User-Agent','')[:500]))
+        await conn.execute("INSERT INTO bpsc_student_activity(telegram_id,event_type,event_data) VALUES(%s,'miniapp_opened',%s::jsonb)",(user['id'],json.dumps({'session_key':key})))
+    return json_response({'registered':True,'verified':True,'user':user})
+
+
 async def app_me(request):
     user=request['telegram_user']
     async with request.app['pool'].connection() as conn:
@@ -2758,12 +2869,23 @@ async def app_me(request):
 
 async def register_user(request):
     user=request['telegram_user']
+    try: body=await request.json()
+    except Exception: body={}
+    key=re.sub(r'[^A-Za-z0-9_-]','',str(body.get('session_key') or ''))[:80]
+    if not key: key=hashlib.sha256((str(user['id'])+str(request.headers.get('User-Agent',''))+str(int(time.time()//1800))).encode()).hexdigest()[:32]
     async with request.app['pool'].connection() as conn:
-        await conn.execute("""INSERT INTO app_users(telegram_id,first_name,username,last_seen_at)
-            VALUES(%s,%s,%s,NOW())
-            ON CONFLICT(telegram_id) DO UPDATE SET first_name=EXCLUDED.first_name,username=EXCLUDED.username,last_seen_at=NOW()""",
-            (user['id'],user.get('first_name','Student'),user.get('username')))
-    return json_response({'registered':True})
+        await ensure_student_intelligence_schema(conn)
+        await conn.execute("""INSERT INTO app_users(telegram_id,first_name,last_name,username,photo_url,language_code,last_seen_at)
+            VALUES(%s,%s,%s,%s,%s,%s,NOW()) ON CONFLICT(telegram_id) DO UPDATE SET
+            first_name=EXCLUDED.first_name,last_name=EXCLUDED.last_name,username=EXCLUDED.username,
+            photo_url=COALESCE(EXCLUDED.photo_url,app_users.photo_url),language_code=EXCLUDED.language_code,
+            last_seen_at=NOW(),updated_at=NOW()""",
+            (user['id'],user.get('first_name','Student'),user.get('last_name',''),user.get('username'),user.get('photo_url'),user.get('language_code')))
+        await conn.execute("""INSERT INTO bpsc_student_login_history(telegram_id,session_key,first_name,username,user_agent)
+            VALUES(%s,%s,%s,%s,%s) ON CONFLICT(telegram_id,session_key) DO UPDATE SET last_seen_at=NOW()""",
+            (user['id'],key,user.get('first_name'),user.get('username'),request.headers.get('User-Agent','')[:500]))
+        await conn.execute("INSERT INTO bpsc_student_activity(telegram_id,event_type,event_data) VALUES(%s,'miniapp_opened',%s::jsonb)",(user['id'],json.dumps({'session_key':key})))
+    return json_response({'registered':True,'verified':True,'user':user})
 
 
 
@@ -3278,6 +3400,10 @@ def build_app() -> web.Application:
 
         web.get('/api/me', app_me),
         web.post('/api/register', register_user),
+        web.post('/api/student/login-event', student_login_event),
+        web.get('/api/admin/students', admin_student_overview),
+        web.get('/api/admin/students/{telegram_id}', admin_student_detail),
+        web.get('/api/admin/student-export/{kind}', admin_student_export),
         web.get('/api/access/status', access_status),
         web.get('/api/demo/status', demo_status),
         web.get('/api/access', access_alias),
@@ -3445,6 +3571,7 @@ async def on_startup(app):
             await ensure_test_series_schema(conn)
             await ensure_notifications_schema(conn)
             await payment_schema(conn)
+            await ensure_student_intelligence_schema(conn)
         except Exception:
             log.exception('Schema bootstrap reported errors; continuing startup.')
     log.info('BPSC Nexus Mini App ready on port %s', PORT)
