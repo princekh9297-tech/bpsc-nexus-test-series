@@ -1,0 +1,31 @@
+BPSC NEXUS MINI APP — IMPORT FOUNDATION UPDATE
+
+Included:
+- question_bank.py (updated backend module)
+- 001_import_classification_schema.sql (idempotent PostgreSQL migration)
+
+WHAT THIS UPDATE DOES
+- Adds the six-level taxonomy storage foundation: exam, subject, category, chapter, topic, subtopic.
+- Adds separate storage for original classification labels and source provenance.
+- Preserves embedded exam/category/chapter/topic/subtopic values instead of folding category/exam into legacy subject/source fields.
+- Adds classification review records for imported questions that carry original classification labels.
+- Keeps existing question-bank columns, IDs, quiz tables, and legacy subject/topic fields.
+- Existing import API endpoints and frontend remain compatible.
+
+DEPLOY
+1. Back up the current application files and PostgreSQL database.
+2. Replace the deployed question_bank.py with this version.
+3. Deploy/restart the application. question_bank.ensure_schema() runs the additive DDL at startup.
+4. Alternatively, execute 001_import_classification_schema.sql against the same PostgreSQL database before restarting. It is idempotent.
+5. Check application startup logs and perform a small test import before bulk importing.
+
+IMPORTANT LIMITATION
+This is the first deployable backend foundation, not the complete Import Studio redesign described in the architecture. The existing preview/confirm frontend flow is unchanged. Taxonomy CRUD APIs, admin mapping approval screens, persistent staged previews, and the full review workspace are not yet implemented. Do not describe this bundle as the completed end-to-end architecture.
+
+ROLLBACK
+Restore the backed-up question_bank.py. The added database tables/columns are additive and can remain safely in place. Do not drop them as a rollback step because imported records may already reference the new data.
+
+VALIDATION PERFORMED
+- Python syntax compilation passed.
+- SQL placeholder count in the modified question insert matches its parameter tuple.
+- Live PostgreSQL migration and end-to-end import tests were not possible in this environment.

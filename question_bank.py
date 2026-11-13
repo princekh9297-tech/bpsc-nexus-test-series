@@ -92,6 +92,84 @@ DDL = [
     "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS classification_source TEXT NOT NULL DEFAULT 'legacy'",
     "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS classification_review_required BOOLEAN NOT NULL DEFAULT TRUE",
     "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS original_question_type TEXT",
+    """CREATE TABLE IF NOT EXISTS exam_catalog (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        normalized_name TEXT NOT NULL UNIQUE,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_by_telegram_id BIGINT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    """CREATE TABLE IF NOT EXISTS taxonomy_nodes (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        parent_id BIGINT REFERENCES taxonomy_nodes(id) ON DELETE RESTRICT,
+        exam_id BIGINT REFERENCES exam_catalog(id) ON DELETE RESTRICT,
+        node_type TEXT NOT NULL CHECK (node_type IN ('exam','subject','category','chapter','topic','subtopic')),
+        name TEXT NOT NULL,
+        normalized_name TEXT NOT NULL,
+        aliases JSONB NOT NULL DEFAULT '[]'::jsonb,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_by_telegram_id BIGINT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_taxonomy_parent_type ON taxonomy_nodes(parent_id,node_type,is_active)",
+    "CREATE INDEX IF NOT EXISTS idx_taxonomy_normalized ON taxonomy_nodes(normalized_name)",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS classification_original JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS classification_status TEXT NOT NULL DEFAULT 'unresolved'",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS classification_node_id BIGINT REFERENCES taxonomy_nodes(id) ON DELETE SET NULL",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS source_metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS source_page TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_question_bank_classification_status ON question_bank(classification_status,status)",
+    """CREATE TABLE IF NOT EXISTS question_classifications (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        question_id BIGINT NOT NULL REFERENCES question_bank(id) ON DELETE CASCADE,
+        taxonomy_node_id BIGINT NOT NULL REFERENCES taxonomy_nodes(id) ON DELETE RESTRICT,
+        is_primary BOOLEAN NOT NULL DEFAULT TRUE,
+        approval_status TEXT NOT NULL DEFAULT 'approved' CHECK (approval_status IN ('suggested','approved','unresolved')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(question_id,taxonomy_node_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS question_sources (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        question_id BIGINT NOT NULL REFERENCES question_bank(id) ON DELETE CASCADE,
+        import_batch_id BIGINT REFERENCES question_import_batches(id) ON DELETE SET NULL,
+        source_file TEXT,
+        source_page TEXT,
+        source_name TEXT,
+        source_url TEXT,
+        attribution TEXT,
+        original_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_question_sources_question ON question_sources(question_id)",
+    """CREATE TABLE IF NOT EXISTS question_import_mappings (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        batch_id BIGINT NOT NULL REFERENCES question_import_batches(id) ON DELETE CASCADE,
+        original_path TEXT NOT NULL,
+        original_label TEXT NOT NULL,
+        suggested_node_id BIGINT REFERENCES taxonomy_nodes(id) ON DELETE SET NULL,
+        match_method TEXT,
+        confidence NUMERIC(5,4),
+        approval_status TEXT NOT NULL DEFAULT 'unresolved' CHECK (approval_status IN ('suggested','approved','unresolved','rejected')),
+        approved_by_telegram_id BIGINT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_import_mappings_batch ON question_import_mappings(batch_id,approval_status)",
+    """CREATE TABLE IF NOT EXISTS question_classification_reviews (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        question_id BIGINT REFERENCES question_bank(id) ON DELETE CASCADE,
+        batch_id BIGINT REFERENCES question_import_batches(id) ON DELETE CASCADE,
+        original_classification JSONB NOT NULL DEFAULT '{}'::jsonb,
+        reason TEXT NOT NULL DEFAULT 'unresolved_classification',
+        status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved','dismissed')),
+        resolved_by_telegram_id BIGINT,
+        resolved_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
     """CREATE TABLE IF NOT EXISTS bank_quizzes (
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         title TEXT NOT NULL,
@@ -378,11 +456,28 @@ def _normalize_record(record: Any, default_subject: str, source_name: str, owner
     correct = _answer_letter(ans, options)
     explanation_en = _norm(_get(record, "explanation_en", "explanation", "solution", "reason", "explanation_english"))
     explanation_hi = _norm(_get(record, "explanation_hi", "hindi_explanation", "explanation_hindi", "व्याख्या"))
-    subject = _norm(_get(record, "subject", "category", "subject_name", default=default_subject)) or default_subject
-    topic = _norm(_get(record, "topic", "chapter", "unit")) or None
-    source = _norm(_get(record, "source", "book", "exam", "source_name", default=source_name)) or source_name
+    # Keep the six academic classification levels distinct. Never collapse category,
+    # chapter or exam labels into the legacy subject/source fields.
+    original_classification = {
+        "exam": _norm(_get(record, "exam", "exam_name", "examination")) or None,
+        "subject": _norm(_get(record, "subject", "subject_name", "paper_subject")) or None,
+        "category": _norm(_get(record, "category", "category_name", "section", "section_name")) or None,
+        "chapter": _norm(_get(record, "chapter", "chapter_name", "chapterNameEn", "unit")) or None,
+        "topic": _norm(_get(record, "topic", "topic_name", "lesson")) or None,
+        "subtopic": _norm(_get(record, "subtopic", "sub_topic", "subtopic_name")) or None,
+    }
+    subject = original_classification["subject"] or default_subject
+    topic = original_classification["topic"] or original_classification["chapter"] or None
+    source = _norm(_get(record, "source", "book", "source_name", "publisher" , default=source_name)) or source_name
     source_url = _norm(_get(record, "source_url", "url", "link")) or None
-    attribution = _norm(_get(record, "attribution", "author", "credit", "publisher")) or None
+    attribution = _norm(_get(record, "attribution", "author", "credit", "copyright")) or None
+    source_page = _norm(_get(record, "source_page", "page_number", "page_no", "page")) or None
+    source_metadata_raw = _get(record, "source_metadata", "metadata", default={})
+    source_metadata = dict(source_metadata_raw) if isinstance(source_metadata_raw, dict) else {}
+    for key in ("source_file", "file_name", "source_page", "page_number", "edition", "publication_year", "publisher", "source_id"):
+        value = _get(record, key)
+        if value not in (None, ""):
+            source_metadata.setdefault(key, value)
     canonical = _norm(q_en).casefold() + "|" + "|".join(_norm(options.get(k, "")).casefold() for k in LETTERS)
     qhash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     status = "ready" if len(options) >= 2 and correct in options else "pending"
@@ -391,7 +486,9 @@ def _normalize_record(record: Any, default_subject: str, source_name: str, owner
     return {"question_en": q_en, "question_hi": q_hi or None, "options": options, "correct_option": correct,
             "explanation_en": explanation_en or None, "explanation_hi": explanation_hi or None,
             "subject": subject, "topic": topic, "source": source, "source_url": source_url,
-            "attribution": attribution, "status": status, "question_hash": qhash, "created_by_telegram_id": owner_id,
+            "attribution": attribution, "source_page": source_page,
+            "classification_original": original_classification, "source_metadata": source_metadata,
+            "classification_status": "unresolved", "status": status, "question_hash": qhash, "created_by_telegram_id": owner_id,
             "question_type": qtype, "question_structure": qstructure, "question_flags": qflags,
             "classification_confidence": classification["classification_confidence"],
             "classification_source": classification["classification_source"],
@@ -670,12 +767,17 @@ def _adapt_generic_row(row: dict, default_subject: str, source: str) -> dict:
     if isinstance(exp,dict):
         exp_hi=exp_hi or exp.get("hi") or exp.get("hindi")
         exp=exp.get("en") or exp.get("english") or exp.get("text") or ""
-    subject=first("subject","subjectName","category","categoryName","section","paper","exam","group") or default_subject or "Other / Unclassified"
-    topic=first("topic","subtopic","chapter","chapterNameEn","unit","lesson","sectionName","page","tag")
+    subject=first("subject","subjectName","subject_name","paper_subject") or default_subject or "Other / Unclassified"
+    category=first("category","categoryName","section","section_name")
+    exam=first("exam","exam_name","examination")
+    chapter=first("chapter","chapterNameEn","chapter_name","unit")
+    topic=first("topic","topic_name","lesson")
+    subtopic=first("subtopic","sub_topic","subtopic_name")
     if isinstance(q,list): q="\n".join(map(str,q))
     if isinstance(qhi,list): qhi="\n".join(map(str,qhi))
     return {"question":str(q or ""),"question_hi":str(qhi or ""),"options":opts,"correct_answer":ans,
-            "explanation":str(exp or ""),"explanation_hi":str(exp_hi or ""),"subject":str(subject),"topic":str(topic or ""),"source":source}
+            "explanation":str(exp or ""),"explanation_hi":str(exp_hi or ""),"subject":str(subject),"category":str(category or ""),
+            "exam":str(exam or ""),"chapter":str(chapter or ""),"topic":str(topic or ""),"subtopic":str(subtopic or ""),"source":source}
 
 
 def _html_to_records(raw: str) -> list[dict]:
@@ -1114,11 +1216,22 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
                 else:
                     mapped_subject = allowed.get(embedded_label.casefold(), selected)
                 item["subject"] = mapped_subject
-                cur=await conn.execute("""INSERT INTO question_bank(question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status,question_hash,import_batch_id,created_by_telegram_id,classification_confidence,classification_source,classification_review_required,original_question_type)
-                    VALUES(%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                cur=await conn.execute("""INSERT INTO question_bank(question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status,question_hash,import_batch_id,created_by_telegram_id,classification_confidence,classification_source,classification_review_required,original_question_type,classification_original,classification_status,source_metadata,source_page)
+                    VALUES(%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s)
                     ON CONFLICT(question_hash) DO NOTHING RETURNING id""",
-                    (item["question_en"],item["question_hi"],item.get("question_type","standard"),json.dumps(item.get("question_structure",{}),ensure_ascii=False),json.dumps(item.get("question_flags",{}),ensure_ascii=False),json.dumps(item["options"],ensure_ascii=False),item["correct_option"],item["explanation_en"],item["explanation_hi"],item["subject"],item["topic"],item["source"],item["source_url"],item["attribution"],item["status"],item["question_hash"],batch_id,owner_id,item.get("classification_confidence",0.48),item.get("classification_source","needs_review"),item.get("classification_review_required",True),item.get("original_question_type",item.get("question_type","standard"))))
-                if await cur.fetchone(): imported+=1
+                    (item["question_en"],item["question_hi"],item.get("question_type","standard"),json.dumps(item.get("question_structure",{}),ensure_ascii=False),json.dumps(item.get("question_flags",{}),ensure_ascii=False),json.dumps(item["options"],ensure_ascii=False),item["correct_option"],item["explanation_en"],item["explanation_hi"],item["subject"],item["topic"],item["source"],item["source_url"],item["attribution"],item["status"],item["question_hash"],batch_id,owner_id,item.get("classification_confidence",0.48),item.get("classification_source","needs_review"),item.get("classification_review_required",True),item.get("original_question_type",item.get("question_type","standard")),json.dumps(item.get("classification_original",{}),ensure_ascii=False),item.get("classification_status","unresolved"),json.dumps(item.get("source_metadata",{}),ensure_ascii=False),item.get("source_page")))
+                inserted = await cur.fetchone()
+                if inserted:
+                    imported+=1
+                    await conn.execute("""INSERT INTO question_sources(question_id,import_batch_id,source_file,source_page,source_name,source_url,attribution,original_metadata)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+                        (inserted["id"],batch_id,filename,item.get("source_page"),item.get("source"),item.get("source_url"),item.get("attribution"),json.dumps(item.get("source_metadata",{}),ensure_ascii=False)))
+                    original = item.get("classification_original") or {}
+                    unresolved = {k:v for k,v in original.items() if v}
+                    if unresolved:
+                        await conn.execute("""INSERT INTO question_classification_reviews(question_id,batch_id,original_classification,reason)
+                            VALUES(%s,%s,%s::jsonb,'classification_mapping_pending')""",
+                            (inserted["id"],batch_id,json.dumps(original,ensure_ascii=False)))
                 else: duplicates+=1
             await conn.execute("UPDATE question_import_batches SET imported_count=%s,duplicate_count=%s WHERE id=%s",(imported,duplicates,batch_id))
     return {"batch_id":batch_id,"detected":len(records)+invalid_count,"imported":imported,"duplicates":duplicates,"invalid":invalid_count,"pending":sum(1 for r in records if r["status"]=="pending")}
@@ -1925,7 +2038,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
     if data.startswith("qb:togglepublish:"):
         quiz_id=int(data.rsplit(":",1)[1])
         async with pool.connection() as conn:
-            cur=await conn.execute("UPDATE bank_quizzes SET is_published=NOT is_published,published_at=CASE WHEN is_published THEN NULL ELSE NOW() END WHERE id=%s RETURNING is_published,title",(quiz_id,)); r=await cur.fetchone()
+            cur=await conn.execute("UPDATE bank_quizzes SET is_published=NOT is_published,published_at=CASE WHEN is_published THEN NULL ELSE NOW() END WHERE id=%s AND (is_published=TRUE OR NULLIF(BTRIM(subject_theme),'') IS NOT NULL) RETURNING is_published,title",(quiz_id,)); r=await cur.fetchone()
         await q.edit_message_text(f"Quiz {'published' if r and r['is_published'] else 'unpublished' if r else 'not found'}.\n\n{r['title'] if r else ''}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Manage this quiz",callback_data=f"qb:manageview:{quiz_id}")],[InlineKeyboardButton("Quiz list",callback_data="qb:manage")]])); return
     if data == "qb:import":
         if not SUBJECTS:
@@ -2540,9 +2653,11 @@ def format_question(r):
 
 async def publish_quiz(q,context,pool,quiz_id):
     async with pool.connection() as conn:
-        cur=await conn.execute("SELECT id,title,subject,created_by_telegram_id,is_published FROM bank_quizzes WHERE id=%s",(quiz_id,)); quiz=await cur.fetchone()
+        cur=await conn.execute("SELECT id,title,subject,created_by_telegram_id,is_published,subject_theme FROM bank_quizzes WHERE id=%s",(quiz_id,)); quiz=await cur.fetchone()
         if not quiz or quiz["created_by_telegram_id"]!=q.from_user.id or quiz["is_published"]:
             await q.edit_message_text("Draft not found, not owned by you, or already published.",reply_markup=admin_keyboard()); return
+        if not str(quiz.get("subject_theme") or "").strip():
+            await q.edit_message_text("Select a subject-specific theme in the BPSC Nexus Admin Console before publishing this quiz. Published quiz themes cannot be changed.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open quiz management",callback_data=f"qb:manageview:{quiz_id}")],[InlineKeyboardButton("Back",callback_data="qb:manage")]])); return
         cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_questions WHERE quiz_id=%s",(quiz_id,)); n=(await cur.fetchone())["n"]
         await conn.execute("UPDATE bank_quizzes SET is_published=TRUE,published_at=NOW() WHERE id=%s",(quiz_id,))
     username=getattr(context.bot,"username",None)
