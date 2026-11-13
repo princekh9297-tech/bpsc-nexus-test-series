@@ -2263,7 +2263,7 @@ const api=async(path,method='GET',body=null)=>{
   if((!tg||!tg.initData)&&!adminRoute)throw new Error('Open from the BPSC Nexus bot in Telegram.');
   const headers={'Content-Type':'application/json'};
   if(tg&&tg.initData)headers['X-Telegram-Init-Data']=tg.initData;
-  const res=await fetch(path,{method,headers,credentials:'same-origin',body:body?JSON.stringify(body):undefined});
+  const res=await fetch(path,{method,headers,credentials:'same-origin',cache:'no-store',body:body?JSON.stringify(body):undefined});
   const data=await res.json().catch(()=>({error:'Unexpected response.'}));
   if(!res.ok){if(data.result&&data.result.submitted){showResult(data.result);throw new Error(data.error||'Time up.');}throw new Error(data.error||'Request failed.');}
   return data;
