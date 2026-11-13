@@ -1833,19 +1833,11 @@ button:focus-visible{outline:3px solid var(--red)!important;outline-offset:3px!i
 
 
 <section id="admin-panel" class="hidden-tab">
-  <div id="admin-login-panel" class="panel admin-login-panel">
-    <div class="admin-login-mark">🔐</div>
-    <div class="eyebrow">RESTRICTED AREA</div>
-    <h1 style="margin:6px 0 8px">Admin Sign In</h1>
-    <p class="admin-section-sub">Restricted area. Only accounts verified as administrators can open the Admin Console. Sign in with your admin ID and password.</p>
-    <form id="admin-login-form" class="admin-form" autocomplete="on">
-      <label>Admin ID<input id="admin-login-id" name="username" autocomplete="username" autocapitalize="none" required maxlength="120" placeholder="Enter admin ID"></label>
-      <label>Password<input id="admin-login-password" name="password" type="password" autocomplete="current-password" required maxlength="300" placeholder="Enter password"></label>
-      <button id="admin-login-submit" class="primary full" type="submit">Sign in →</button>
-    </form>
-    <div id="admin-login-status" class="admin-status"></div>
+  <div id="admin-login-panel" class="panel admin-login-panel" role="status">
+    <div class="admin-login-mark">🔒</div>
+    <h3>Admin access restricted</h3>
+    <p class="admin-section-sub">The Admin Console is available only to authorised Telegram accounts. Open this Mini App from your registered Telegram account.</p>
   </div>
-
   <div id="admin-secure-content" hidden>
     <div class="admin-hero">
       <div class="eyebrow">PRIVATE CONTROL ROOM</div>
@@ -1853,7 +1845,6 @@ button:focus-visible{outline:3px solid var(--red)!important;outline-offset:3px!i
       <p>Every tool the bot offers, in one place.</p>
       <div class="demo-actions">
         <button class="secondary" id="admin-refresh" type="button">↻ Refresh</button>
-        <button class="secondary" id="admin-logout" type="button">Sign out</button>
         <button class="secondary" id="admin-back-home" type="button">← Workspace</button>
       </div>
     </div>
@@ -2250,7 +2241,7 @@ const $=id=>document.getElementById(id);
 let quizzes=[],attempt=null,index=0,answers={},review=new Set(),busy=false;
 let timerHandle=null,questionTimerHandle=null,questionDeadline=0,questionTimerKey=null;
 let feedback={},result=null,optionOrders={};
-let accessInfo=null,adminSessionActive=false;
+let accessInfo=null;
 let allAdminTests=[],selectedTests=new Set();
 let notifList=[];
 let lastUnreadCount=-1;
@@ -2295,8 +2286,8 @@ function switchTab(tab,scroll=true){
   if(tab==='leaderboard')loadLeaderboard();
   if(tab==='admin'){
     updateAdminPanelAuthView();
-    if(hasAdminAccess()){loadAdminPanel();loadQuestionIntelligence();loadQuixAdmin();}
-    else loadAdminSession().then(ok=>{if(ok){updateAdminPanelAuthView();loadAdminPanel();loadQuestionIntelligence();loadQuixAdmin();}});
+    const openAdmin=()=>{updateAdminPanelAuthView();if(hasAdminAccess()){loadAdminPanel();loadQuestionIntelligence();loadQuixAdmin();}};
+    if(accessInfo)openAdmin();else loadAccess().then(openAdmin).catch(()=>updateAdminPanelAuthView());
   }
   if(scroll)window.scrollTo({top:0,behavior:'auto'});
 }
@@ -2335,33 +2326,25 @@ function loadThemePreference(){
   apply(saved,false);
 })();
 
-const hasAdminAccess=()=>!!(adminSessionActive||(accessInfo&&accessInfo.is_admin));
+// Admin identity is derived only from the Telegram-verified access response.
+// No separate username/password session is used by the Mini App.
+const hasAdminAccess=()=>!!(accessInfo&&accessInfo.is_admin);
 function updateAdminPanelAuthView(){
-  const login=$('admin-login-panel'),secure=$('admin-secure-content');
+  const restricted=$('admin-login-panel'),secure=$('admin-secure-content');
   const ok=hasAdminAccess();
-  if(login)login.hidden=ok;
+  if(restricted)restricted.hidden=ok;
   if(secure)secure.hidden=!ok;
   const launch=$('admin-launch-card');if(launch)launch.style.display=ok?'flex':'none';
   const topBtn=$('admin-top-btn');if(topBtn)topBtn.style.display='none';
   const navBtn=$('admin-nav-btn');if(navBtn)navBtn.style.display=ok?'flex':'none';
   if(ok&&typeof window.activateAdminView==='function')window.activateAdminView('overview');
 }
-async function loadAdminSession(){try{const d=await api('/api/admin/session');adminSessionActive=!!d.authenticated;if(adminSessionActive&&$('admin-login-status'))($('admin-login-status')||{set textContent(value){}}).textContent='Signed in as '+(d.login_id||'admin')+'.';}catch(e){adminSessionActive=false;}updateAdminPanelAuthView();return adminSessionActive;}
-async function loadAdminLogin(e){
-  e.preventDefault();const status=$('admin-login-status'),btn=$('admin-login-submit');btn.disabled=true;status.textContent='Verifying…';
-  try{await api('/api/admin/login','POST',{id:$('admin-login-id').value.trim(),password:$('admin-login-password').value});adminSessionActive=true;$('admin-login-password').value='';status.textContent='Signed in.';updateAdminPanelAuthView();await loadAdminPanel();}
-  catch(err){status.textContent=err.message||'Sign-in failed.';}finally{btn.disabled=false;}
-}
-async function logoutAdmin(){try{await api('/api/admin/logout','POST',{})}catch(e){}adminSessionActive=false;updateAdminPanelAuthView();if($('admin-login-status'))($('admin-login-status')||{set textContent(value){}}).textContent='Signed out.';switchTab('admin');}
-$('admin-login-form')?.addEventListener('submit',loadAdminLogin);
-$('admin-logout')?.addEventListener('click',logoutAdmin);
 
 async function loadAccess(){
   if(!tg||!tg.initData){updateAdminPanelAuthView();return null;}
   try {
     const d=await api('/api/access/status');
     accessInfo=d;
-    if(d.is_admin)adminSessionActive=true;
     updateAdminPanelAuthView();
     if(d.promo_banner&&d.promo_banner.enabled){
       const slot=$('promo-banner-slot');
@@ -3256,7 +3239,7 @@ loadThemePreference();
 const greeting=$('greeting-title');
 if(greeting&&tg?.initDataUnsafe?.user?.first_name)greeting.textContent='Welcome back, '+tg.initDataUnsafe.user.first_name+'.';const homeGreeting=$('nexus-home-greeting');if(homeGreeting&&tg?.initDataUnsafe?.user?.first_name)homeGreeting.textContent='Welcome back, '+tg.initDataUnsafe.user.first_name;
 $('global-theme-toggle')?.addEventListener('click',()=>applyTheme(document.body.classList.contains('theme-amoled')?'arghya':'amoled'));
-loadAdminSession().finally(()=>{loadAccess().catch(()=>{}).finally(()=>{loadQuizzes();loadTasks();loadHomeIntelligence();resumeStoredQuiz();loadNotifications(false).catch(()=>{});setInterval(()=>loadNotifications(false).catch(()=>{}),30000);});});
+loadAccess().finally(()=>{loadQuizzes();loadTasks();loadHomeIntelligence();resumeStoredQuiz();loadNotifications(false).catch(()=>{});setInterval(()=>loadNotifications(false).catch(()=>{}),30000);});
 
 })();
 </script>
