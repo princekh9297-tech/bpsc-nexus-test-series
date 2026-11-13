@@ -1,31 +1,37 @@
-BPSC NEXUS MINI APP — IMPORT FOUNDATION UPDATE
+BPSC NEXUS — SUBJECT VISIBILITY + CLASSIFIED FILE IMPORT FIX
 
-Included:
-- question_bank.py (updated backend module)
-- 001_import_classification_schema.sql (idempotent PostgreSQL migration)
+Files:
+- miniapp.py
+- question_bank.py
 
-WHAT THIS UPDATE DOES
-- Adds the six-level taxonomy storage foundation: exam, subject, category, chapter, topic, subtopic.
-- Adds separate storage for original classification labels and source provenance.
-- Preserves embedded exam/category/chapter/topic/subtopic values instead of folding category/exam into legacy subject/source fields.
-- Adds classification review records for imported questions that carry original classification labels.
-- Keeps existing question-bank columns, IDs, quiz tables, and legacy subject/topic fields.
-- Existing import API endpoints and frontend remain compatible.
+Fixes:
+1. Student subject catalogue now includes active registered subjects even when they have zero ready questions. Legacy subjects with ready questions remain visible.
+2. JSON parsing now recursively discovers question records and preserves parent exam/subject/category/section/chapter/topic/subtopic labels.
+3. Statement-based records with intro/items/tail are assembled into a question stem.
+4. Explanations stored as structured objects are converted into readable text.
+5. Labelled option strings such as A) ... | B) ... are parsed.
+6. Answer labels such as "Correct Answer: A (1929)" are recognized.
+7. Legacy topic field falls back to chapter/category so existing topic-based browsing retains the source grouping.
+8. Existing question content, options, answers and question hashes are otherwise preserved.
 
-DEPLOY
-1. Back up the current application files and PostgreSQL database.
-2. Replace the deployed question_bank.py with this version.
-3. Deploy/restart the application. question_bank.ensure_schema() runs the additive DDL at startup.
-4. Alternatively, execute 001_import_classification_schema.sql against the same PostgreSQL database before restarting. It is idempotent.
-5. Check application startup logs and perform a small test import before bulk importing.
+Deploy:
+1. Back up the currently deployed miniapp.py and question_bank.py.
+2. Replace BOTH files with the files in this bundle.
+3. Restart/redeploy the Render service.
+4. No new SQL migration is required for these code changes. Keep the earlier additive import-classification schema migration already applied.
+5. Open Admin → Import. Newly created active subjects should appear in the destination selector.
+6. Preview a chapter/classification JSON before confirming import.
 
-IMPORTANT LIMITATION
-This is the first deployable backend foundation, not the complete Import Studio redesign described in the architecture. The existing preview/confirm frontend flow is unchanged. Taxonomy CRUD APIs, admin mapping approval screens, persistent staged previews, and the full review workspace are not yet implemented. Do not describe this bundle as the completed end-to-end architecture.
+Validation performed:
+- Python syntax compilation passed for both files.
+- Local parser tests against the available sample datasets:
+  * Current Affairs: 3,106 / 3,106 detected as valid
+  * Biology: 1,601 / 1,601
+  * Chemistry: 716 / 716
+  * Physics: 1,773 / 1,773
+  * Bihar Special: 443 / 443
+- Bihar Special answer strings and fifth option were checked; answer key now resolves for the sample.
+- No live PostgreSQL or Render deployment test was possible here. Perform a small live preview/import after deployment before bulk importing.
 
-ROLLBACK
-Restore the backed-up question_bank.py. The added database tables/columns are additive and can remain safely in place. Do not drop them as a rollback step because imported records may already reference the new data.
-
-VALIDATION PERFORMED
-- Python syntax compilation passed.
-- SQL placeholder count in the modified question insert matches its parameter tuple.
-- Live PostgreSQL migration and end-to-end import tests were not possible in this environment.
+Important:
+The code preserves original classification labels in classification_original and legacy topic. This patch does not create a complete admin taxonomy-mapping/review interface; it fixes extraction and visibility.
