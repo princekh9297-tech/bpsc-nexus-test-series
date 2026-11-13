@@ -1,0 +1,192 @@
+--- a/static/index.html
++++ b/static/index.html
+@@ -1590,7 +1590,7 @@
+     </div>
+   </div>
+   <div class="topbar-actions">
+-    <button class="notif-bell" id="global-theme-toggle" type="button" aria-label="Switch appearance" title="Switch appearance">◐</button>
++    <button class="secondary" id="global-theme-toggle" type="button" aria-label="Switch appearance" title="Switch appearance" style="padding:8px 11px;font-size:12px;font-weight:800;white-space:nowrap">◐ Dark mode</button>
+     <button class="notif-bell" id="notif-bell-btn" type="button" aria-label="Notifications">
+       <span class="bell-icon">🔔</span>
+       <span class="bell-badge hidden" id="notif-badge">0</span>
+@@ -2225,10 +2225,9 @@
+   if(scroll)window.scrollTo({top:0,behavior:'auto'});
+ }
+ 
+-const THEME_KEY='bpsc_nexus_theme_v5';
++const THEME_KEY='bpsc_nexus_appearance_v1';
+ const THEME_CLASSES={arghya:'theme-arghya',amoled:'theme-amoled'};
+ const THEME_COLORS={arghya:'#fdf2dd',amoled:'#000000'};
+-let themeSyncHandle=null;
+ function applyTheme(name,save=true){
+   if(!THEME_CLASSES[name])name='arghya';
+   document.body.classList.remove('theme-arcade','theme-arghya','theme-nuclear-core','theme-alchemy-x','theme-rajwada','theme-kashi','theme-bodhi','theme-amoled');
+@@ -2236,22 +2235,14 @@
+   document.documentElement.dataset.theme=name;
+   const meta=$('meta-theme-color');if(meta)meta.setAttribute('content',THEME_COLORS[name]);
+   try{if(tg)tg.setHeaderColor(THEME_COLORS[name]);}catch(e){}
+-  document.querySelectorAll('[data-theme-choice]').forEach(el=>{
+-    const active=el.dataset.themeChoice===name;
+-    el.classList.toggle('active',active);
+-    el.setAttribute('aria-pressed',active?'true':'false');
+-  });
+-  if(save){try{localStorage.setItem(THEME_KEY,name)}catch(e){}
+-    if(tg&&tg.initData){if(themeSyncHandle)clearTimeout(themeSyncHandle);themeSyncHandle=setTimeout(()=>api('/api/preferences/theme','PUT',{theme:name}).catch(()=>{}),300);}
+-  }
+-}
+-async function loadThemePreference(){
++  const toggle=$('global-theme-toggle');
++  if(toggle){const dark=name==='amoled';toggle.textContent=dark?'☀ Light mode':'◐ Dark mode';toggle.setAttribute('aria-label',dark?'Switch to light appearance':'Switch to dark AMOLED appearance');toggle.title=dark?'Switch to light appearance':'Switch to dark AMOLED appearance';}
++  if(save){try{localStorage.setItem(THEME_KEY,name)}catch(e){}}
++}
++function loadThemePreference(){
+   let local='arghya';try{local=localStorage.getItem(THEME_KEY)||'arghya'}catch(e){}
+-  const aliases={'obsidian':'amoled','graphite':'amoled','classic':'arghya','emerald':'arghya','ivory':'arghya','cobalt':'arghya','amethyst':'arghya','midnight':'arghya','frost':'arghya','arcade':'arghya','nuclear-core':'arghya','alchemy-x':'arghya','royal':'rajwada','banaras':'kashi','saffron':'bodhi'};
+-  local=aliases[local]||local;
+-  if(!THEME_CLASSES[local])local='arghya';
++  if(local!=='amoled')local='arghya';
+   applyTheme(local,false);
+-  if(tg&&tg.initData){try{const d=await api('/api/preferences/theme');if(d.theme){const remote=aliases[d.theme]||d.theme;if(THEME_CLASSES[remote])applyTheme(remote,false);}}catch(e){}}
+ }
+ 
+ (function(){
+@@ -2655,45 +2646,12 @@
+ function renderAdminCleanup(data){
+   const subjects=data.subjects||[],quizzes=data.quizzes||[],series=data.series||[];
+   if($('admin-cleanup-summary'))$('admin-cleanup-summary').innerHTML=[['Subjects',subjects.length],['Tests',quizzes.length],['Series',series.length]].map(([l,v])=>`<div class="admin-stat"><strong>${v}</strong><span>${esc(l)}</span></div>`).join('');
+-  if ($('admin-cleanup-subjects')) {
+-  $('admin-cleanup-subjects').innerHTML = subjects.slice(0, 60).map(x => {
+-    const hasData = Number(x.total_questions||0) > 0
+-                 || Number(x.quiz_count||0) > 0
+-                 || Number(x.snapshot_count||0) > 0
+-                 || Number(x.series_count||0) > 0;
+-    const archived = !!x.archived;
+-    const badge = archived
+-      ? '<span class="subject-badge-archived">IN TRASH</span>'
+-      : '';
+-    return `<div class="admin-row" style="grid-template-columns:minmax(0,1fr) auto">
+-      <div>
+-        <strong>${badge}${esc(x.name)}</strong>
+-        <small>${Number(x.ready_questions||0)} ready · ${Number(x.total_questions||0)} total
+-          · ${Number(x.quiz_count||0)} tests · ${Number(x.snapshot_count||0)} history records</small>
+-      </div>
+-      <div style="display:flex;gap:6px;flex-wrap:wrap">
+-        ${archived
+-          ? `<button class="secondary" data-subject-action="restore" data-subject-name="${esc(x.name)}" style="padding:7px 10px;font-size:11px">↺ Restore all</button><button class="danger" data-subject-action="purge" data-subject-name="${esc(x.name)}" style="padding:7px 10px;font-size:11px">Delete permanently</button>`
+-          : `<button class="secondary" data-subject-action="archive" data-subject-name="${esc(x.name)}" style="padding:7px 10px;font-size:11px">🗑 Move to Trash</button>`}
+-      </div>
+-    </div>`;
+-  }).join('') || '<div class="empty">No subjects yet.</div>';
+-}
+-  if($('admin-cleanup-quizzes'))$('admin-cleanup-quizzes').innerHTML=quizzes.slice(0,30).map(x=>{
+-    const key=String(x.subject||'').toLowerCase();
+-    const themes=key.includes('history')?['heritage','civilisation','colonial','freedom','chronicle']:key.includes('science')?['molecular','anatomy','chemistry','quantum','cosmos']:key.includes('geo')?['terrain','atlas','earth','climate','expedition']:key.includes('polity')?['constitution','parliament','governance','republic','judiciary']:key.includes('econom')?['finance','markets','development','trade','growth']:key.includes('bihar')?['mithila','magadh','nalanda','ganga','bihar-heritage']:['heritage','chronicle','atlas','governance','development'];
+-    const selector=`<label style="display:flex;gap:6px;align-items:center;font-size:11px">Quiz theme <select data-quiz-theme="${x.id}" ${x.is_published?'disabled':''} style="max-width:150px;padding:6px">${x.subject_theme?'':'<option value="" selected disabled>Select a theme…</option>'}${themes.map(t=>`<option value="${t}" ${x.subject_theme===t?'selected':''}>${t.replaceAll('-',' ')}</option>`).join('')}</select></label>`;
+-    return `<div class="admin-row"><div><strong>#${x.id} · ${esc(x.title)}</strong><small>${Number(x.ready_questions||0)} ready · ${Number(x.attempt_count||0)} attempts · ${x.is_published?'Published — theme locked':'Draft — choose theme'}</small>${selector}</div></div>`;
+-  }).join('')||'<div class="empty">None.</div>';
++  if($('admin-cleanup-subjects'))$('admin-cleanup-subjects').innerHTML=subjects.slice(0,60).map(x=>`<div class="admin-row" style="grid-template-columns:minmax(0,1fr) auto"><div><strong>${esc(x.name)}</strong><small>${Number(x.ready_questions||0)} ready · ${Number(x.total_questions||0)} total · ${Number(x.quiz_count||0)} tests · ${Number(x.snapshot_count||0)} history records</small></div><button class="danger" data-subject-action="permanent-delete" data-subject-name="${esc(x.name)}" data-subject-archived="${!!x.archived}" style="padding:7px 10px;font-size:11px">Delete permanently</button></div>`).join('')||'<div class="empty">No subjects yet.</div>';
++  if($('admin-cleanup-quizzes'))$('admin-cleanup-quizzes').innerHTML=quizzes.slice(0,30).map(x=>`<div class="admin-row"><div><strong>#${x.id} · ${esc(x.title)}</strong><small>${Number(x.ready_questions||0)} ready · ${Number(x.attempt_count||0)} attempts · ${x.is_published?'Published':'Draft'}</small></div></div>`).join('')||'<div class="empty">None.</div>';
+   if($('admin-cleanup-series'))$('admin-cleanup-series').innerHTML=series.slice(0,30).map(x=>`<div class="admin-row"><div><strong>#${x.id} · ${esc(x.title)}</strong><small>${Number(x.ready_tests||0)} ready tests</small></div></div>`).join('')||'<div class="empty">None.</div>';
+ }
+ $('admin-cleanup-refresh')?.addEventListener('click',()=>loadAdminCleanup());
+-$('admin-cleanup-quizzes')?.addEventListener('change',async e=>{
+-  const sel=e.target.closest('[data-quiz-theme]');if(!sel)return;sel.disabled=true;
+-  try{await api(`/api/admin/quizzes/${Number(sel.dataset.quizTheme)}/theme`,'POST',{theme:sel.value});showError('Draft quiz theme saved.');}
+-  catch(err){showError(err.message);await loadAdminCleanup();}
+-  finally{sel.disabled=false;}
+-});
++
+ 
+ 
+ async function loadAdminImportSubjects(){
+@@ -2944,17 +2902,11 @@
+   update();questionTimerHandle=setInterval(update,1000);
+ }
+ function renderQuestionStructure(q){const st=q.question_structure||{};const type=q.question_type||'standard';const list=(v)=>Array.isArray(v)?v.map(x=>typeof x==='object'?(x.text||x.statement||x.value||JSON.stringify(x)):x):[];let html='';if(type==='assertion_reason'){if(st.assertion)html+=`<div class="question-structure-block"><b>Assertion (A)</b><p>${esc(st.assertion)}</p></div>`;if(st.reason)html+=`<div class="question-structure-block"><b>Reason (R)</b><p>${esc(st.reason)}</p></div>`;}if(type==='statement_based'){const a=list(st.statements);if(a.length)html+=`<div class="question-structure-block"><b>Statements</b><ol>${a.map(x=>`<li>${esc(x)}</li>`).join('')}</ol></div>`;}if(type==='match_following'){const a=list(st.list_i),b=list(st.list_ii);if(a.length||b.length)html+=`<div class="question-structure-block"><b>Match the following</b><div class="question-match-grid"><div>${a.map((x,i)=>`<p>${i+1}. ${esc(x)}</p>`).join('')}</div><div>${b.map((x,i)=>`<p>${String.fromCharCode(65+i)}. ${esc(x)}</p>`).join('')}</div></div></div>`;}if(type==='pair_based'||type==='incorrect_pair'){const a=list(st.pairs);if(a.length)html+=`<div class="question-structure-block"><b>Pairs</b><ol>${a.map(x=>`<li>${esc(x)}</li>`).join('')}</ol></div>`;}if(type==='chronology'||type==='sequence'){const a=list(st.events);if(a.length)html+=`<div class="question-structure-block"><b>Items to arrange</b><ol>${a.map(x=>`<li>${esc(x)}</li>`).join('')}</ol></div>`;}if(type==='passage_based'&&st.passage)html+=`<div class="question-structure-block"><b>Passage</b><p>${esc(st.passage)}</p></div>`;return html;}
+-function applyPublishedQuizTheme(theme){
+-  const allowed=new Set(['heritage','civilisation','colonial','freedom','chronicle','molecular','anatomy','chemistry','quantum','cosmos','terrain','atlas','earth','climate','expedition','constitution','parliament','governance','republic','judiciary','finance','markets','development','trade','growth','mithila','magadh','nalanda','ganga','bihar-heritage']);
+-  const t=allowed.has(String(theme||''))?String(theme):'';
+-  document.body.classList.toggle('quiz-theme-active',!!t);
+-  const family=t==='cosmos'||t==='quantum'||t==='molecular'||t==='anatomy'||t==='chemistry'?'science':t==='terrain'||t==='atlas'||t==='earth'||t==='climate'||t==='expedition'?'geography':t==='constitution'||t==='parliament'||t==='governance'||t==='republic'||t==='judiciary'?'polity':t==='finance'||t==='markets'||t==='development'||t==='trade'||t==='growth'?'economy':t==='mithila'||t==='magadh'||t==='nalanda'||t==='ganga'||t==='bihar-heritage'?'bihar':'history';
+-  const colors={history:['#A66A35','#A66A3518','#A66A3520'],science:['#35A9C8','#35A9C818','#35A9C820'],geography:['#3D9B78','#3D9B7818','#3D9B7820'],polity:['#687CCB','#687CCB18','#687CCB20'],economy:['#C58A35','#C58A3518','#C58A3520'],bihar:['#D16B3A','#D16B3A18','#D16B3A20']};
+-  const c=colors[family];document.body.style.setProperty('--quiz-accent',c[0]);document.body.style.setProperty('--quiz-wash',c[1]);document.body.style.setProperty('--quiz-shadow',c[2]);
+-}
++function applyPublishedQuizTheme(){document.body.classList.remove('quiz-theme-active');document.body.style.removeProperty('--quiz-accent');document.body.style.removeProperty('--quiz-wash');document.body.style.removeProperty('--quiz-shadow');}
++
+ function renderQuestion(){
+   if(!attempt||!attempt.questions.length)return;
+-  applyPublishedQuizTheme(attempt.subject_theme);
++  applyPublishedQuizTheme();
+   index=Math.max(0,Math.min(index,attempt.questions.length-1));
+   const q=attempt.questions[index],selected=answers[q.id];
+   startQuestionTimer(q);
+@@ -3049,39 +3001,33 @@
+ loadSubjectPracticeMeta();
+ 
+ // ============================================================
+-// SUBJECT MANAGEMENT (Create / Archive / Restore / Delete)
++// SUBJECT MANAGEMENT — permanent deletion (no user-facing Trash)
+ // ============================================================
+ document.addEventListener('click', async e => {
+-  const btn = e.target.closest('[data-subject-action]');
+-  if (!btn) return;
+-  const name   = btn.dataset.subjectName;
+-  const action = btn.dataset.subjectAction;
+-  if (action === 'delete') {
+-    alert('Use the Trash controls for permanent deletion.'); return;
+-  } else if (action === 'purge') {
+-    if (!confirm(`Permanently delete "${name}" and its trashed questions? This cannot be undone. Deletion is blocked if quiz or history records still reference it.`)) return;
+-  } else if (action === 'archive') {
+-    if (!confirm(`Move "${name}" and all its question banks to Trash? Questions and history will be preserved and can be restored together.`)) return;
+-  } else if (action === 'restore') {
+-    if (!confirm(`Restore "${name}" to active?`)) return;
+-  }
+-  btn.disabled = true;
+-  try {
+-    const d = await api('/api/admin/remove-subject', 'POST', { name, action });
+-    if (d.success) {
+-      showError(d.action === 'purge'
+-        ? `Permanently deleted "${d.name}" (${d.deleted_questions || 0} questions).`
+-        : d.action === 'delete'
+-          ? `Deleted "${d.name}".`
+-          : d.action === 'archive'
+-            ? `Moved "${d.name}" to Trash (preserved ${d.questions_preserved || 0} questions).`
+-            : `Restored "${d.name}".`);
++  const btn=e.target.closest('[data-subject-action="permanent-delete"]');
++  if(!btn)return;
++  const name=btn.dataset.subjectName,wasArchived=btn.dataset.subjectArchived==='true';
++  if(!confirm(`Permanently delete subject "${name}" and all its question-bank entries? This cannot be undone. Deletion will be refused if quizzes, attempts, history or test-series records still reference it.`))return;
++  btn.disabled=true;
++  let archivedByThisAction=false;
++  try{
++    if(!wasArchived){
++      await api('/api/admin/remove-subject','POST',{name,action:'archive'});
++      archivedByThisAction=true;
+     }
++    const result=await api('/api/admin/remove-subject','POST',{name,action:'purge'});
++    showError(`Permanently deleted "${result.name||name}" (${result.deleted_questions||0} questions).`);
+     await loadAdminCleanup();
+     await loadAdminImportSubjects().catch(()=>{});
+-  } catch (err) {
+-    alert(err.message);
+-  } finally { btn.disabled = false; }
++  }catch(err){
++    if(archivedByThisAction){
++      try{await api('/api/admin/remove-subject','POST',{name,action:'restore'});}catch(restoreErr){alert(`${err.message}
++
++Automatic restore also failed: ${restoreErr.message}. The subject may remain archived; use the backend restore operation.`);}
++    }
++    if(!archivedByThisAction||!String(err.message||'').includes('Automatic restore'))alert(err.message);
++    await loadAdminCleanup().catch(()=>{});
++  }finally{btn.disabled=false;}
+ });
+ 
+ // ============================================================
+@@ -3236,7 +3182,6 @@
+ loadThemePreference();
+ const greeting=$('greeting-title');
+ if(greeting&&tg?.initDataUnsafe?.user?.first_name)greeting.textContent='Welcome back, '+tg.initDataUnsafe.user.first_name+'.';const homeGreeting=$('nexus-home-greeting');if(homeGreeting&&tg?.initDataUnsafe?.user?.first_name)homeGreeting.textContent='Welcome back, '+tg.initDataUnsafe.user.first_name;
+-document.querySelectorAll('[data-theme-choice]').forEach(b=>b.addEventListener('click',()=>applyTheme(b.dataset.themeChoice)));
+ $('global-theme-toggle')?.addEventListener('click',()=>applyTheme(document.body.classList.contains('theme-amoled')?'arghya':'amoled'));
+ loadAdminSession().finally(()=>{loadAccess().catch(()=>{}).finally(()=>{loadQuizzes();loadTasks();loadHomeIntelligence();resumeStoredQuiz();loadNotifications(false).catch(()=>{});setInterval(()=>loadNotifications(false).catch(()=>{}),30000);});});
+ 
