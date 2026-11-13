@@ -215,7 +215,7 @@ def json_response(payload, status=200):
 
 async def _attempt_row(pool, attempt_id: int, telegram_id: int):
     async with pool.connection() as conn:
-        cur = await conn.execute("""SELECT a.*,q.title,q.subject,q.duration_minutes,q.positive_marks,q.negative_marks,q.question_time_seconds,q.shuffle_options,q.is_custom
+        cur = await conn.execute("""SELECT a.*,q.title,q.subject,q.duration_minutes,q.positive_marks,q.negative_marks,q.question_time_seconds,q.shuffle_options,q.is_custom,q.subject_theme
             FROM bank_quiz_attempts a JOIN bank_quizzes q ON q.id=a.quiz_id
             WHERE a.id=%s AND a.telegram_id=%s""", (attempt_id, telegram_id))
         return await cur.fetchone()
@@ -417,7 +417,7 @@ async def leaderboard_admin_exclude(request):
             await lb.rebuild_summaries(conn)
     return json_response({"excluded":True,"attempt_id":attempt_id})
 
-VALID_THEMES = {"arcade", "arghya", "nuclear-core", "alchemy-x"}
+VALID_THEMES = {"arcade", "arghya", "nuclear-core", "alchemy-x", "amoled"}
 LEGACY_THEME_ALIASES = {
     "obsidian":"nuclear-core","graphite":"nuclear-core","classic":"nuclear-core",
     "emerald":"arghya","ivory":"arghya","cobalt":"arcade","amethyst":"arcade","midnight":"arcade","frost":"alchemy-x",
@@ -428,7 +428,7 @@ async def get_theme_preference(request):
     async with request.app["pool"].connection() as conn:
         cur = await conn.execute("SELECT preference_value FROM bpsc_nexus_user_preferences WHERE telegram_id=%s AND preference_key='theme'", (user_id,))
         row = await cur.fetchone()
-    theme = row["preference_value"] if row else "arcade"
+    theme = row["preference_value"] if row else "arghya"
     theme = LEGACY_THEME_ALIASES.get(theme, theme)
     if theme not in VALID_THEMES:
         theme = "arcade"
@@ -1025,9 +1025,29 @@ async def _set_setting(conn, key: str, value: dict):
 
 
 async def ensure_access_schema(conn):
+    # Additive schema for Trash, quiz themes and persistent subject practice.
+    await conn.execute("ALTER TABLE bank_quizzes ADD COLUMN IF NOT EXISTS subject_theme TEXT NOT NULL DEFAULT ''")
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_trash_items (
+        id BIGSERIAL PRIMARY KEY, item_type TEXT NOT NULL CHECK(item_type IN ('subject','question')),
+        item_key TEXT NOT NULL, original_status TEXT, subject_name TEXT NOT NULL,
+        deleted_by BIGINT NOT NULL, deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        restored_at TIMESTAMPTZ, restored_by BIGINT,
+        UNIQUE(item_type,item_key,deleted_at)
+    )""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_nexus_trash_active_idx ON bpsc_nexus_trash_items(restored_at,deleted_at DESC)")
+    await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_subject_practice (
+        id BIGSERIAL PRIMARY KEY, telegram_id BIGINT NOT NULL, subject TEXT NOT NULL,
+        cycle_no INTEGER NOT NULL DEFAULT 1, requested_count INTEGER NOT NULL,
+        question_ids JSONB NOT NULL, answers JSONB NOT NULL DEFAULT '{}'::jsonb,
+        current_position INTEGER NOT NULL DEFAULT 0, completed BOOLEAN NOT NULL DEFAULT FALSE,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(telegram_id,subject,cycle_no)
+    )""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS bpsc_nexus_subject_practice_user_idx ON bpsc_nexus_subject_practice(telegram_id,subject,cycle_no DESC)")
     await conn.execute("ALTER TABLE bank_quizzes ADD COLUMN IF NOT EXISTS access_type VARCHAR(12) NOT NULL DEFAULT 'inherit'")
     await conn.execute("ALTER TABLE bank_quizzes ADD COLUMN IF NOT EXISTS admin_hidden BOOLEAN NOT NULL DEFAULT FALSE")
     await conn.execute("ALTER TABLE question_bank_subjects ADD COLUMN IF NOT EXISTS access_type VARCHAR(12) NOT NULL DEFAULT 'free'")
+    await conn.execute("ALTER TABLE question_bank_subjects ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT FALSE")
     await conn.execute("""CREATE TABLE IF NOT EXISTS bpsc_nexus_demo_config (
         singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK(singleton=TRUE),
         enabled BOOLEAN NOT NULL DEFAULT TRUE,
@@ -1331,7 +1351,8 @@ async def admin_banks(request):
         await ensure_access_schema(conn)
         cur=await conn.execute("""SELECT qb.subject AS name,COUNT(*) AS question_count,
             COALESCE(MAX(s.subject_type),'subject') AS subject_type,
-            COALESCE(MAX(s.access_type),'free') AS access_type
+            COALESCE(MAX(s.access_type),'free') AS access_type,
+            COALESCE(BOOL_OR(s.is_suspended),FALSE) AS is_suspended
             FROM question_bank qb LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) AND s.archived_at IS NULL
             GROUP BY qb.subject ORDER BY LOWER(qb.subject) LIMIT 500""")
         rows=[dict(r) for r in await cur.fetchall()]
@@ -1354,6 +1375,24 @@ async def admin_set_bank_access(request):
             await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id,subject_type,access_type) VALUES(%s,%s,'subject',%s)",(name,user['id'],access))
         await _write_admin_audit(conn,user['id'],'bank_access',name,{'access_type':access})
     return json_response({'name':name,'access_type':access,'updated':True})
+
+
+async def admin_set_subject_suspension(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try:
+        body=await request.json(); name=str(body.get('name') or '').strip(); suspended=body.get('is_suspended')
+        if not name or len(name)>180 or not isinstance(suspended,bool): raise ValueError()
+    except Exception: return json_response({'error':'Provide a valid subject and suspension state.'},400)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("SELECT id,name FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) AND archived_at IS NULL LIMIT 1",(name,)); row=await cur.fetchone()
+        if not row:
+            cur=await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id,subject_type,access_type,is_suspended) VALUES(%s,%s,'subject','free',%s) RETURNING id,name",(name,admin['id'],suspended)); row=await cur.fetchone()
+        else:
+            await conn.execute("UPDATE question_bank_subjects SET is_suspended=%s WHERE id=%s",(suspended,row['id']))
+        await _write_admin_audit(conn,admin['id'],'subject_suspend' if suspended else 'subject_activate',row['name'],{'is_suspended':suspended})
+    return json_response({'name':row['name'],'is_suspended':suspended,'updated':True})
 
 
 async def admin_quizzes(request):
@@ -1404,13 +1443,13 @@ async def admin_cleanup_catalog(request):
         await ensure_access_schema(conn)
         await ensure_test_series_schema(conn)
         cur=await conn.execute("""WITH subject_names AS (
-                SELECT id,name,subject_type,archived_at FROM question_bank_subjects
+                SELECT id,name,subject_type,archived_at,is_suspended FROM question_bank_subjects
                 UNION ALL
-                SELECT NULL::BIGINT, q.subject, 'subject'::TEXT, NULL::TIMESTAMPTZ
+                SELECT NULL::BIGINT, q.subject, 'subject'::TEXT, NULL::TIMESTAMPTZ,FALSE
                 FROM (SELECT DISTINCT subject FROM question_bank WHERE NULLIF(BTRIM(subject),'') IS NOT NULL) q
                 WHERE NOT EXISTS (SELECT 1 FROM question_bank_subjects s WHERE LOWER(BTRIM(s.name))=LOWER(BTRIM(q.subject)))
             )
-            SELECT n.id,n.name,n.subject_type,(n.archived_at IS NOT NULL) AS archived,
+            SELECT n.id,n.name,n.subject_type,(n.archived_at IS NOT NULL) AS archived,COALESCE(n.is_suspended,FALSE) AS is_suspended,
                 COALESCE(qc.ready_questions,0) AS ready_questions,COALESCE(qc.total_questions,0) AS total_questions,
                 COALESCE(qc.snapshot_count,0) AS snapshot_count,
                 COALESCE(qc.quiz_count,0) AS quiz_count,COALESCE(qc.series_count,0) AS series_count
@@ -1425,7 +1464,7 @@ async def admin_cleanup_catalog(request):
             ) qc ON TRUE
             ORDER BY (COALESCE(qc.ready_questions,0)=0) DESC,LOWER(n.name),n.name""")
         subjects=[dict(r) for r in await cur.fetchall()]
-        cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.is_published,q.admin_hidden,
+        cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.is_published,q.admin_hidden,q.subject_theme,
                 COALESCE(qc.ready_questions,0) AS ready_questions,COALESCE(qc.linked_questions,0) AS linked_questions,
                 COALESCE(at.attempt_count,0) AS attempt_count,COALESCE(ch.challenge_count,0) AS challenge_count,
                 COALESCE(st.series_count,0) AS series_count
@@ -1462,34 +1501,133 @@ async def admin_remove_subject(request):
     if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
     try:
         body=await request.json(); name=str(body.get('name') or '').strip(); action=str(body.get('action') or '').lower()
-        if not name or len(name)>180 or action not in ('archive','delete','restore'): raise ValueError()
+        if not name or len(name)>180 or action not in ('archive','delete','restore','trash','purge'): raise ValueError()
     except Exception: return json_response({'error':'Choose a valid subject and action.'},400)
     await qb.ensure_schema(request.app['pool'])
     async with request.app['pool'].connection() as conn:
-        await ensure_access_schema(conn)
-        await ensure_test_series_schema(conn)
+      async with conn.transaction():
+        await ensure_access_schema(conn); await ensure_test_series_schema(conn)
+        cur=await conn.execute("SELECT id,name,archived_at FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) LIMIT 1",(name,)); subject=await cur.fetchone()
+        canonical=subject['name'] if subject else name
+        if action in ('delete','purge'):
+            cur=await conn.execute("SELECT id FROM bank_quizzes WHERE LOWER(BTRIM(subject))=LOWER(BTRIM(%s))",(canonical,)); quiz_ids=[int(r['id']) for r in await cur.fetchall()]
+            if quiz_ids:
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_attempts WHERE quiz_id=ANY(%s)",(quiz_ids,)); attempts=int((await cur.fetchone())['n'])
+                cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_leaderboard_daily_challenges WHERE quiz_id=ANY(%s)",(quiz_ids,)); challenges=int((await cur.fetchone())['n'])
+                cur=await conn.execute("SELECT to_regclass('public.group_quiz_sessions') AS t"); gt=await cur.fetchone(); group_sessions=0
+                if gt and gt['t']:
+                    cur=await conn.execute("SELECT COUNT(*) AS n FROM group_quiz_sessions WHERE quiz_id=ANY(%s)",(quiz_ids,)); group_sessions=int((await cur.fetchone())['n'])
+            else: attempts=challenges=group_sessions=0
+            cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_attempt_question_snapshots WHERE LOWER(BTRIM(subject))=LOWER(BTRIM(%s))",(canonical,)); snapshots=int((await cur.fetchone())['n'])
+            cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_attempt_answers aa JOIN question_bank qb ON qb.id=aa.question_id WHERE LOWER(BTRIM(qb.subject))=LOWER(BTRIM(%s))",(canonical,)); answers=int((await cur.fetchone())['n'])
+            cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_revision_items ri JOIN question_bank qb ON qb.id=ri.question_id WHERE LOWER(BTRIM(qb.subject))=LOWER(BTRIM(%s))",(canonical,)); revisions=int((await cur.fetchone())['n'])
+            cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_attempt_polls p JOIN question_bank qb ON qb.id=p.question_id WHERE LOWER(BTRIM(qb.subject))=LOWER(BTRIM(%s))",(canonical,)); polls=int((await cur.fetchone())['n'])
+            if attempts or challenges or group_sessions or snapshots or answers or revisions or polls:
+                return json_response({'error':'Deletion blocked to protect existing student history. Suspend this subject instead; its tests will be hidden from students.','attempts':attempts,'challenges':challenges,'group_sessions':group_sessions,'snapshots':snapshots,'answers':answers,'revision_items':revisions,'attempt_polls':polls},409)
+            if quiz_ids:
+                await conn.execute("DELETE FROM bpsc_nexus_test_series_tests WHERE quiz_id=ANY(%s)",(quiz_ids,))
+                await conn.execute("DELETE FROM bank_quiz_questions WHERE quiz_id=ANY(%s)",(quiz_ids,))
+                await conn.execute("DELETE FROM bank_quizzes WHERE id=ANY(%s)",(quiz_ids,))
+            cur=await conn.execute("SELECT id FROM question_bank WHERE LOWER(BTRIM(subject))=LOWER(BTRIM(%s))",(canonical,)); qids=[int(r['id']) for r in await cur.fetchall()]
+            if qids:
+                await conn.execute("DELETE FROM bank_quiz_questions WHERE question_id=ANY(%s)",(qids,))
+                await conn.execute("DELETE FROM question_bank WHERE id=ANY(%s)",(qids,))
+            await conn.execute("DELETE FROM bpsc_nexus_trash_items WHERE LOWER(BTRIM(subject_name))=LOWER(BTRIM(%s))",(canonical,))
+            if subject: await conn.execute("DELETE FROM question_bank_subjects WHERE id=%s",(subject['id'],))
+            await _write_admin_audit(conn,admin['id'],'subject_delete',canonical,{'deleted_questions':len(qids),'deleted_quizzes':len(quiz_ids)})
+            return json_response({'name':canonical,'action':'delete','success':True,'deleted_questions':len(qids),'deleted_quizzes':len(quiz_ids)})
         if action=='restore':
-            cur=await conn.execute("UPDATE question_bank_subjects SET archived_at=NULL WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) RETURNING id,name",(name,)); row=await cur.fetchone()
-            if not row:return json_response({'error':'Registered subject not found to restore.'},404)
-            await _write_admin_audit(conn,admin['id'],'subject_restore',row['name'],{})
-            return json_response({'name':row['name'],'action':'restore','success':True})
-        cur=await conn.execute("""SELECT COUNT(*) FILTER (WHERE status='ready') AS ready_count,COUNT(*) AS total_count
-            FROM question_bank WHERE LOWER(BTRIM(subject))=LOWER(BTRIM(%s))""",(name,)); counts=dict(await cur.fetchone())
-        cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quizzes WHERE LOWER(BTRIM(subject))=LOWER(BTRIM(%s))",(name,)); quiz_count=int((await cur.fetchone())['n'])
-        cur=await conn.execute("SELECT COUNT(*) AS n FROM bank_quiz_attempt_question_snapshots WHERE LOWER(BTRIM(subject))=LOWER(BTRIM(%s))",(name,)); snapshot_count=int((await cur.fetchone())['n'])
-        cur=await conn.execute("SELECT COUNT(*) AS n FROM bpsc_nexus_test_series WHERE LOWER(BTRIM(subject))=LOWER(BTRIM(%s))",(name,)); series_count=int((await cur.fetchone())['n'])
-        if action=='delete':
-            if int(counts['total_count'] or 0) or quiz_count or snapshot_count or series_count:
-                return json_response({'error':'This subject still has questions, quizzes, historical attempts or test-series references. Archive it instead.','ready_questions':int(counts['ready_count'] or 0),'total_questions':int(counts['total_count'] or 0),'quizzes':quiz_count,'history_records':snapshot_count,'series':series_count},409)
-            cur=await conn.execute("DELETE FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) RETURNING name",(name,)); row=await cur.fetchone()
-            if not row:return json_response({'error':'Empty subject record not found.'},404)
-            await _write_admin_audit(conn,admin['id'],'subject_delete',row['name'],{'questions':0})
-            return json_response({'name':row['name'],'action':'delete','success':True})
-        cur=await conn.execute("UPDATE question_bank_subjects SET archived_at=NOW() WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) RETURNING name",(name,)); row=await cur.fetchone()
-        if not row:
-            cur=await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id,subject_type,access_type,archived_at) VALUES(%s,%s,'subject','free',NOW()) RETURNING name",(name,admin['id'])); row=await cur.fetchone()
-        await _write_admin_audit(conn,admin['id'],'subject_archive',row['name'],{'ready_questions':int(counts['ready_count'] or 0),'total_questions':int(counts['total_count'] or 0)})
-    return json_response({'name':row['name'],'action':'archive','success':True,'questions_preserved':int(counts['total_count'] or 0)})
+            if not subject: return json_response({'error':'Subject record not found.'},404)
+            await conn.execute("UPDATE question_bank_subjects SET archived_at=NULL,is_suspended=FALSE WHERE id=%s",(subject['id'],))
+            await _write_admin_audit(conn,admin['id'],'subject_restore',canonical,{})
+            return json_response({'name':canonical,'action':'restore','success':True})
+        if not subject:
+            cur=await conn.execute("INSERT INTO question_bank_subjects(name,created_by_telegram_id,subject_type,access_type) VALUES(%s,%s,'subject','free') RETURNING id,name",(canonical,admin['id'])); subject=await cur.fetchone()
+        await conn.execute("UPDATE question_bank_subjects SET archived_at=NOW() WHERE id=%s",(subject['id'],))
+        await _write_admin_audit(conn,admin['id'],'subject_archive',canonical,{})
+    return json_response({'name':canonical,'action':'archive','success':True})
+
+
+async def admin_trash(request):
+    if not _is_series_admin(request['telegram_user']): return json_response({'error':'Admin access required.'},403)
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("""SELECT t.subject_name,COUNT(*) AS question_count,MAX(t.deleted_at) AS deleted_at,
+            MAX(t.deleted_by) AS deleted_by FROM bpsc_nexus_trash_items t WHERE t.restored_at IS NULL
+            GROUP BY t.subject_name ORDER BY MAX(t.deleted_at) DESC""")
+        rows=[dict(r) for r in await cur.fetchall()]
+    for r in rows:
+        if r.get('deleted_at'): r['deleted_at']=r['deleted_at'].isoformat()
+    return json_response({'items':rows})
+
+
+async def admin_set_quiz_theme(request):
+    admin=request['telegram_user']
+    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
+    try:
+        qid=int(request.match_info['quiz_id']); body=await request.json(); theme=str(body.get('theme') or '').strip().lower()
+    except Exception: return json_response({'error':'Invalid quiz theme request.'},400)
+    allowed={'heritage','civilisation','colonial','freedom','chronicle','molecular','anatomy','chemistry','quantum','cosmos','terrain','atlas','earth','climate','expedition','constitution','parliament','governance','republic','judiciary','finance','markets','development','trade','growth','mithila','magadh','nalanda','ganga','bihar-heritage'}
+    if theme not in allowed: return json_response({'error':'Unsupported subject theme.'},400)
+    async with request.app['pool'].connection() as conn:
+        cur=await conn.execute("SELECT id,title,is_published,subject FROM bank_quizzes WHERE id=%s",(qid,)); quiz=await cur.fetchone()
+        if not quiz: return json_response({'error':'Quiz not found.'},404)
+        if quiz['is_published']: return json_response({'error':'Published quiz themes are locked. This setting applies to future publications only.'},409)
+        await conn.execute("UPDATE bank_quizzes SET subject_theme=%s WHERE id=%s",(theme,qid))
+        await _write_admin_audit(conn,admin['id'],'quiz_theme',str(qid),{'theme':theme,'subject':quiz['subject']})
+    return json_response({'quiz_id':qid,'theme':theme,'updated':True})
+
+
+async def subject_practice(request):
+    user=request['telegram_user']; uid=int(user['id'])
+    try:
+        body=await request.json() if request.method=='POST' else {}
+        subject=str(body.get('subject') or request.query.get('subject') or '').strip()
+        action=str(body.get('action') or 'progress').lower()
+        count=int(body.get('count') or 0)
+        if not subject or len(subject)>180: raise ValueError()
+        if action=='start' and not (1<=count<=20000): raise ValueError()
+    except Exception: return json_response({'error':'Provide a valid subject and question quantity.'},400)
+    await qb.ensure_schema(request.app['pool'])
+    async with request.app['pool'].connection() as conn:
+        await ensure_access_schema(conn)
+        cur=await conn.execute("SELECT is_suspended,archived_at FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) LIMIT 1",(subject,)); subject_state=await cur.fetchone()
+        if subject_state and (subject_state['is_suspended'] or subject_state['archived_at'] is not None) and not _is_series_admin(user): return json_response({'error':'This subject is currently suspended.'},403)
+        cur=await conn.execute("SELECT id,question_ids,answers,current_position,requested_count,cycle_no,completed FROM bpsc_nexus_subject_practice WHERE telegram_id=%s AND subject=%s ORDER BY cycle_no DESC LIMIT 1",(uid,subject)); current=await cur.fetchone()
+        if action=='progress':
+            cur=await conn.execute("SELECT COUNT(*) AS total FROM question_bank qb LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) WHERE qb.subject=%s AND qb.status='ready' AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE))",(subject,)); total=int((await cur.fetchone())['total'])
+            cur=await conn.execute("SELECT question_ids,answers FROM bpsc_nexus_subject_practice WHERE telegram_id=%s AND subject=%s ORDER BY cycle_no",(uid,subject)); history=await cur.fetchall()
+            attempted_ids=set(); aggregate={'correct':0,'incorrect':0,'skipped':0}
+            for cycle_row in history:
+                for qid,result in (cycle_row['answers'] or {}).items():
+                    attempted_ids.add(int(qid))
+                    if result in aggregate: aggregate[result]+=1
+            answered=len(attempted_ids)
+            return json_response({'subject':subject,'available':total,'attempted':answered,'remaining':max(0,total-answered),'correct':aggregate['correct'],'incorrect':aggregate['incorrect'],'skipped':aggregate['skipped'],'current_cycle':dict(current) if current else None})
+        if action=='start':
+            cur=await conn.execute("SELECT COUNT(*) AS total FROM question_bank qb LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) WHERE qb.subject=%s AND qb.status='ready' AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE))",(subject,)); total=int((await cur.fetchone())['total'])
+            if count>total: return json_response({'error':f'Only {total} ready questions are available.'},400)
+            cur=await conn.execute("SELECT COALESCE(MAX(cycle_no),0)+1 AS next FROM bpsc_nexus_subject_practice WHERE telegram_id=%s AND subject=%s",(uid,subject)); cycle=int((await cur.fetchone())['next'])
+            cur=await conn.execute("SELECT qb.id FROM question_bank qb LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) WHERE qb.subject=%s AND qb.status='ready' AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE)) ORDER BY qb.id LIMIT %s",(subject,count)); ids=[int(r['id']) for r in await cur.fetchall()]
+            cur=await conn.execute("INSERT INTO bpsc_nexus_subject_practice(telegram_id,subject,cycle_no,requested_count,question_ids) VALUES(%s,%s,%s,%s,%s::jsonb) RETURNING id,cycle_no,question_ids,current_position,answers,completed",(uid,subject,cycle,count,json.dumps(ids))); row=dict(await cur.fetchone())
+            cur=await conn.execute("SELECT id,question_en,question_hi,options,question_type,question_structure,question_flags,correct_option,explanation_en,explanation_hi FROM question_bank WHERE id=ANY(%s) ORDER BY id",(ids,)); qrows=[dict(r) for r in await cur.fetchall()]
+            return json_response({'cycle':row,'questions':qrows,'fresh':True})
+        if action=='resume':
+            if not current: return json_response({'error':'No previous practice cycle found.'},404)
+            ids=current['question_ids'] or []; cur=await conn.execute("SELECT id,question_en,question_hi,options,question_type,question_structure,question_flags,correct_option,explanation_en,explanation_hi FROM question_bank WHERE id=ANY(%s) ORDER BY id",(ids,)); qrows=[dict(r) for r in await cur.fetchall()]
+            return json_response({'cycle':dict(current),'questions':qrows,'resumed':True})
+        if action=='answer':
+            if not current or current['completed']: return json_response({'error':'No active practice cycle.'},404)
+            qid=int(body.get('question_id')); result=str(body.get('result') or 'skipped')
+            if result not in ('correct','incorrect','skipped'): return json_response({'error':'Invalid answer result.'},400)
+            ids=current['question_ids'] or []; answers=current['answers'] or {}
+            if qid not in ids: return json_response({'error':'Question is not part of this cycle.'},400)
+            expected_pos=int(current['current_position'])
+            if expected_pos>=len(ids) or int(ids[expected_pos])!=qid: return json_response({'error':'Answer the next question in sequence. Resume from the saved position.'},409)
+            answers[str(qid)]=result; pos=min(len(ids),int(current['current_position'])+1); complete=pos>=len(ids)
+            await conn.execute("UPDATE bpsc_nexus_subject_practice SET answers=%s::jsonb,current_position=%s,completed=%s,updated_at=NOW() WHERE id=%s",(json.dumps(answers),pos,complete,current['id']))
+            return json_response({'saved':True,'position':pos,'total':len(ids),'completed':complete,'remaining':max(0,len(ids)-pos)})
+    return json_response({'error':'Unsupported practice action.'},400)
 
 
 async def admin_remove_quiz(request):
@@ -1926,7 +2064,8 @@ async def admin_import_subjects(request):
     if not _is_series_admin(user): return json_response({'error':'Admin access required.'},403)
     async with request.app['pool'].connection() as conn:
         await qb.ensure_schema(request.app['pool'])
-        cur=await conn.execute("SELECT name,subject_type FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY LOWER(name),name")
+        await ensure_access_schema(conn)
+        cur=await conn.execute("SELECT name,subject_type FROM question_bank_subjects WHERE archived_at IS NULL AND COALESCE(is_suspended,FALSE)=FALSE ORDER BY LOWER(name),name")
         rows=[dict(r) for r in await cur.fetchall()]
     return json_response({'subjects':rows})
 
@@ -2289,7 +2428,8 @@ async def series_detail(request):
                 (SELECT COUNT(*) FROM bank_quiz_questions qq WHERE qq.quiz_id=q.id) AS total_questions,
                 q.is_published,st.position
             FROM bpsc_nexus_test_series_tests st JOIN bank_quizzes q ON q.id=st.quiz_id
-            WHERE st.series_id=%s ORDER BY st.position ASC,q.id ASC""",(sid,))
+            LEFT JOIN question_bank_subjects qs ON LOWER(BTRIM(qs.name))=LOWER(BTRIM(q.subject))
+            WHERE st.series_id=%s AND (qs.id IS NULL OR (qs.archived_at IS NULL AND COALESCE(qs.is_suspended,FALSE)=FALSE)) ORDER BY st.position ASC,q.id ASC""",(sid,))
         tests=[dict(r) for r in await cur.fetchall()]
     return json_response({'series':dict(series),'tests':tests})
 
@@ -2303,8 +2443,8 @@ async def browse_banks(request):
         cur=await conn.execute("""SELECT qb.subject AS name,COUNT(*) AS total,
             COUNT(*) FILTER (WHERE qb.status='ready') AS ready,
             COALESCE(MAX(s.access_type),'free') AS access_type
-            FROM question_bank qb LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) AND s.archived_at IS NULL
-            WHERE qb.status='ready' GROUP BY qb.subject HAVING COUNT(*) FILTER (WHERE qb.status='ready')>0
+            FROM question_bank qb LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject))
+            WHERE qb.status='ready' AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE)) GROUP BY qb.subject HAVING COUNT(*) FILTER (WHERE qb.status='ready')>0
             ORDER BY LOWER(qb.subject)""")
         banks=[]
         for r in await cur.fetchall():
@@ -2320,14 +2460,14 @@ async def browse_quizzes(request):
     async with request.app['pool'].connection() as conn:
         await ensure_access_schema(conn)
         if not subject:
-            cur=await conn.execute("SELECT DISTINCT subject FROM bank_quizzes WHERE is_published=TRUE AND is_custom=FALSE AND COALESCE(admin_hidden,FALSE)=FALSE ORDER BY subject")
+            cur=await conn.execute("SELECT DISTINCT q.subject FROM bank_quizzes q LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(q.subject)) WHERE q.is_published=TRUE AND q.is_custom=FALSE AND COALESCE(q.admin_hidden,FALSE)=FALSE AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE)) ORDER BY q.subject")
             subjects=[r['subject'] for r in await cur.fetchall() if r['subject']]
             return json_response({'subjects':subjects,'quizzes':[]})
         cur=await conn.execute("""SELECT q.id,q.title,q.subject,q.duration_minutes,
             COALESCE((SELECT COUNT(*) FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id WHERE qq.quiz_id=q.id AND qb.status='ready'),0) AS total_questions,
             q.access_type,q.is_custom,
             COALESCE((SELECT COUNT(*) FROM bank_quiz_questions qq JOIN question_bank qb ON qb.id=qq.question_id WHERE qq.quiz_id=q.id AND qb.status='ready'),0) AS ready_count
-            FROM bank_quizzes q WHERE q.is_published=TRUE AND q.subject=%s AND COALESCE(q.admin_hidden,FALSE)=FALSE
+            FROM bank_quizzes q LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(q.subject)) WHERE q.is_published=TRUE AND q.subject=%s AND COALESCE(q.admin_hidden,FALSE)=FALSE AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE))
             AND (q.is_custom=FALSE OR q.custom_owner_telegram_id=%s) ORDER BY q.id DESC LIMIT 200""",(subject,user['id']))
         quizzes=[dict(r) for r in await cur.fetchall()]
         cur=await conn.execute("SELECT access_type FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) AND archived_at IS NULL LIMIT 1",(subject,))
@@ -2358,7 +2498,9 @@ async def all_quizzes_alias(request):
                              JOIN question_bank qb ON qb.id = qq.question_id
                              WHERE qq.quiz_id = q.id AND qb.status = 'ready'), 0) AS ready_count
             FROM bank_quizzes q
+            LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(q.subject))
             WHERE q.is_published = TRUE
+              AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE))
               AND COALESCE(q.admin_hidden, FALSE) = FALSE
               AND (q.is_custom = FALSE OR q.custom_owner_telegram_id = %s)
             ORDER BY q.id DESC
@@ -2541,10 +2683,14 @@ async def _create_quiz_attempt(request, qid: int, mode: str):
         await ensure_access_schema(conn)
         # Published free quizzes are available without demo registration. Paid quizzes are
         # protected below by subject/pass entitlement checks; admins retain their normal bypass.
-        cur = await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks,question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,is_published,access_type FROM bank_quizzes WHERE id=%s", (qid,))
+        cur = await conn.execute("SELECT id,title,subject,duration_minutes,positive_marks,negative_marks,question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,is_published,access_type,subject_theme FROM bank_quizzes WHERE id=%s", (qid,))
         quiz = await cur.fetchone()
         if not quiz:
             return json_response({'error': 'Quiz not found.'}, 404)
+        cur = await conn.execute("SELECT archived_at,is_suspended FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) LIMIT 1", (quiz['subject'],))
+        subject_state = await cur.fetchone()
+        if subject_state and (subject_state['archived_at'] is not None or subject_state['is_suspended']) and not _is_series_admin(user):
+            return json_response({'error': 'This subject and its tests are currently unavailable.'}, 403)
         if quiz['is_custom'] and int(quiz['custom_owner_telegram_id'] or 0) != user['id'] and not _is_series_admin(user):
             return json_response({'error': 'This is a private quiz.'}, 403)
         if not quiz['is_published'] and not _is_series_admin(user):
@@ -2577,7 +2723,7 @@ async def _create_quiz_attempt(request, qid: int, mode: str):
                  json.dumps(q['question_structure'] or {}, ensure_ascii=False), json.dumps(q['question_flags'] or {}, ensure_ascii=False),
                  json.dumps(opts, ensure_ascii=False), q['correct_option'], q['explanation_en'], q['explanation_hi']))
     return json_response({'attempt_id': attempt_id, 'quiz_id': qid, 'title': quiz['title'], 'subject': quiz['subject'],
-        'mode': mode, 'mode_label': settings['mode_label'], 'total_questions': len(qids), 'duration_minutes': quiz['duration_minutes'],
+        'mode': mode, 'mode_label': settings['mode_label'], 'subject_theme': quiz['subject_theme'] or '', 'total_questions': len(qids), 'duration_minutes': quiz['duration_minutes'],
         'question_time_seconds': int(quiz['question_time_seconds'] or 0), 'positive_marks': float(quiz['positive_marks']),
         'negative_marks': float(quiz['negative_marks']), 'shuffle_options': bool(quiz['shuffle_options']),
         'started_at': attempt['started_at'].isoformat()}, 201)
@@ -2674,7 +2820,7 @@ async def attempt_state(request):
                 'options':opts,'selected_option':r['selected_option'],'marked_review':bool(r['is_marked_review'])})
     deadline = (attempt['started_at'] + timedelta(minutes=int(attempt['duration_minutes'] or 60))).isoformat() if attempt['mode'] == 'exam' else None
     settings = attempt['quiz_settings'] if isinstance(attempt['quiz_settings'], dict) else json.loads(attempt['quiz_settings'] or '{}')
-    return json_response({'attempt_id':aid,'quiz_id':int(attempt['quiz_id']),'title':attempt['title'],'subject':attempt['subject'],'mode':attempt['mode'],'mode_label':settings.get('mode_label', attempt['mode']),'deadline':deadline,
+    return json_response({'attempt_id':aid,'quiz_id':int(attempt['quiz_id']),'title':attempt['title'],'subject':attempt['subject'],'subject_theme':attempt['subject_theme'] or '', 'mode':attempt['mode'],'mode_label':settings.get('mode_label', attempt['mode']),'deadline':deadline,
         'total_questions':int(attempt['total_questions']),'duration_minutes':attempt['duration_minutes'],
         'question_time_seconds':int(attempt['question_time_seconds'] or 60),
         'positive_marks':float(attempt['positive_marks']),'negative_marks':float(attempt['negative_marks']),
@@ -2950,11 +3096,12 @@ async def admin_members_search_alias(request):
 async def quiz_builder_meta(request):
     await qb.ensure_schema(request.app['pool'])
     async with request.app['pool'].connection() as conn:
-        cur = await conn.execute("SELECT subject AS name,COUNT(*) AS count FROM question_bank WHERE status='ready' GROUP BY subject ORDER BY subject")
+        await ensure_access_schema(conn)
+        cur = await conn.execute("SELECT qb.subject AS name,COUNT(*) AS count FROM question_bank qb LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) WHERE qb.status='ready' AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE)) GROUP BY qb.subject ORDER BY qb.subject")
         subjects = [{'name': r['name'], 'count': int(r['count'])} for r in await cur.fetchall() if r['name']]
         cur = await conn.execute("SELECT DISTINCT topic FROM question_bank WHERE status='ready' AND topic IS NOT NULL ORDER BY topic LIMIT 200")
         topics = [r['topic'] for r in await cur.fetchall() if r['topic']]
-        cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank WHERE status='ready'")
+        cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank qb LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) WHERE qb.status='ready' AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE))")
         total = int((await cur.fetchone())['n'] or 0)
     return json_response({'subjects': subjects, 'topics': topics, 'total_ready': total})
 
@@ -2982,11 +3129,13 @@ async def quiz_builder_create(request):
     async with request.app['pool'].connection() as conn:
         await ensure_access_schema(conn)
         if subject and subject != 'All subjects' and not _is_series_admin(user):
-            cur = await conn.execute("SELECT access_type FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) AND archived_at IS NULL LIMIT 1", (subject,))
+            cur = await conn.execute("SELECT access_type,is_suspended,archived_at FROM question_bank_subjects WHERE LOWER(BTRIM(name))=LOWER(BTRIM(%s)) LIMIT 1", (subject,))
             subject_access = await cur.fetchone()
+            if subject_access and (subject_access['is_suspended'] or subject_access['archived_at'] is not None):
+                return json_response({'error':'This subject is currently suspended or archived.'},403)
             if subject_access and subject_access['access_type'] == 'paid' and not await _has_subject_entitlement(conn, int(user['id']), subject):
                 return json_response({'error':'This question bank requires paid access. Open membership options to continue.'},403)
-        clauses = ["status='ready'"]
+        clauses = ["status='ready'", "NOT EXISTS (SELECT 1 FROM question_bank_subjects s WHERE LOWER(BTRIM(s.name))=LOWER(BTRIM(question_bank.subject)) AND (s.archived_at IS NOT NULL OR COALESCE(s.is_suspended,FALSE)=TRUE))"]
         params = []
         if subject and subject != 'All subjects':
             clauses.append('subject=%s'); params.append(subject)
@@ -3168,7 +3317,8 @@ async def live_quizzes_public(request):
             CASE WHEN s.started_at IS NULL THEN s.duration_minutes*60 ELSE GREATEST(0,s.duration_minutes*60-EXTRACT(EPOCH FROM (NOW()-s.started_at))+s.paused_seconds+CASE WHEN s.status='paused' AND s.paused_at IS NOT NULL THEN EXTRACT(EPOCH FROM (NOW()-s.paused_at)) ELSE 0 END)::INTEGER END AS remaining_seconds,
             EXISTS(SELECT 1 FROM bpsc_nexus_live_quiz_participants p WHERE p.session_id=s.id AND p.telegram_id=%s) AS joined
             FROM bpsc_nexus_live_quiz_sessions s JOIN bank_quizzes q ON q.id=s.quiz_id
-            WHERE s.status IN ('scheduled','open','live','paused') OR (s.status='ended' AND s.updated_at>NOW()-INTERVAL '24 hours')
+            LEFT JOIN question_bank_subjects qs ON LOWER(BTRIM(qs.name))=LOWER(BTRIM(q.subject))
+            WHERE (qs.id IS NULL OR (qs.archived_at IS NULL AND COALESCE(qs.is_suspended,FALSE)=FALSE)) AND (s.status IN ('scheduled','open','live','paused') OR (s.status='ended' AND s.updated_at>NOW()-INTERVAL '24 hours'))
             ORDER BY CASE s.status WHEN 'live' THEN 0 WHEN 'open' THEN 1 WHEN 'scheduled' THEN 2 ELSE 3 END,
             s.starts_at NULLS LAST,s.created_at DESC LIMIT 100""",(uid,))
         rows=[]
@@ -3315,6 +3465,7 @@ def build_app() -> web.Application:
         web.get('/api/admin/overview', admin_overview),
         web.get('/api/admin/banks', admin_banks),
         web.post('/api/admin/banks/access', admin_set_bank_access),
+        web.post('/api/admin/banks/suspension', admin_set_subject_suspension),
         web.post('/api/admin/bank-access', admin_set_bank_access),
         web.get('/api/admin/quizzes', admin_quizzes),
         web.get('/api/admin/series', admin_series_list),
@@ -3328,6 +3479,8 @@ def build_app() -> web.Application:
         web.post('/api/admin/series/{series_id}/access', admin_set_series_access),
         web.get('/api/admin/cleanup-catalog', admin_cleanup_catalog),
         web.post('/api/admin/remove-subject', admin_remove_subject),
+        web.get('/api/admin/trash', admin_trash),
+        web.post('/api/admin/quizzes/{quiz_id}/theme', admin_set_quiz_theme),
         web.post('/api/admin/remove-quiz/{quiz_id}', admin_remove_quiz),
         web.delete('/api/admin/remove-series/{series_id}', admin_remove_series),
 
@@ -3411,6 +3564,8 @@ def build_app() -> web.Application:
         web.post('/api/attempts/{attempt_id}/submit', attempt_submit),
         web.get('/api/quiz-builder/meta', quiz_builder_meta),
         web.post('/api/quiz-builder/create', quiz_builder_create),
+        web.get('/api/practice/subject', subject_practice),
+        web.post('/api/practice/subject', subject_practice),
         web.get('/api/xray', cutoff_xray),
         web.get('/api/arsenal', weakness_arsenal),
         web.post('/api/arsenal', weakness_arsenal),
