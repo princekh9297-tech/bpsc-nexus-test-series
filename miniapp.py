@@ -3097,7 +3097,29 @@ async def quiz_builder_meta(request):
     await qb.ensure_schema(request.app['pool'])
     async with request.app['pool'].connection() as conn:
         await ensure_access_schema(conn)
-        cur = await conn.execute("SELECT qb.subject AS name,COUNT(*) AS count FROM question_bank qb LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) WHERE qb.status='ready' AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE)) GROUP BY qb.subject ORDER BY qb.subject")
+        # Build the student subject catalogue from the actual ready question rows,
+        # resolving subject names case/whitespace-insensitively against the registry.
+        # This prevents newly imported subjects from being omitted when the import
+        # label and the registered subject label differ only by casing or spaces.
+        cur = await conn.execute("""
+            WITH ready_subjects AS (
+                SELECT LOWER(BTRIM(qb.subject)) AS subject_key, COUNT(*) AS question_count
+                FROM question_bank qb
+                WHERE qb.status='ready' AND NULLIF(BTRIM(qb.subject),'') IS NOT NULL
+                GROUP BY LOWER(BTRIM(qb.subject))
+            )
+            SELECT COALESCE(s.name, MIN(BTRIM(qb.subject))) AS name,
+                   COUNT(*) AS count
+            FROM question_bank qb
+            LEFT JOIN question_bank_subjects s
+              ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject))
+            WHERE qb.status='ready'
+              AND NULLIF(BTRIM(qb.subject),'') IS NOT NULL
+              AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE))
+            GROUP BY LOWER(BTRIM(qb.subject)), s.name
+            HAVING COUNT(*) > 0
+            ORDER BY LOWER(COALESCE(s.name, MIN(BTRIM(qb.subject))))
+        """)
         subjects = [{'name': r['name'], 'count': int(r['count'])} for r in await cur.fetchall() if r['name']]
         cur = await conn.execute("SELECT DISTINCT topic FROM question_bank WHERE status='ready' AND topic IS NOT NULL ORDER BY topic LIMIT 200")
         topics = [r['topic'] for r in await cur.fetchall() if r['topic']]
@@ -3138,7 +3160,7 @@ async def quiz_builder_create(request):
         clauses = ["status='ready'", "NOT EXISTS (SELECT 1 FROM question_bank_subjects s WHERE LOWER(BTRIM(s.name))=LOWER(BTRIM(question_bank.subject)) AND (s.archived_at IS NOT NULL OR COALESCE(s.is_suspended,FALSE)=TRUE))"]
         params = []
         if subject and subject != 'All subjects':
-            clauses.append('subject=%s'); params.append(subject)
+            clauses.append('LOWER(BTRIM(subject))=LOWER(BTRIM(%s))'); params.append(subject)
         if topic:
             clauses.append('topic=%s'); params.append(topic)
         order = 'ORDER BY RANDOM()' if selection == 'random' else 'ORDER BY id'
