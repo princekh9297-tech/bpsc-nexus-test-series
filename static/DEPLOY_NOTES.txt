@@ -1,0 +1,40 @@
+BPSC NEXUS — SUBJECT VISIBILITY + CLASSIFIED FILE IMPORT FIX
+
+Files:
+- miniapp.py
+- question_bank.py
+- index.html
+
+Fixes:
+1. Student subject catalogue includes active registered subjects even before their first import. Legacy subjects with ready question rows remain visible.
+2. Student subject cards show new subjects with zero questions; Practice/Exam remain disabled until questions are imported.
+3. JSON parsing recursively discovers records and preserves parent exam/subject/category/section/chapter/topic/subtopic labels.
+4. Statement-based records with intro/items/tail are assembled into a question stem.
+5. Structured explanations are converted into readable text.
+6. Labelled option strings such as A) ... | B) ... are parsed.
+7. Answer labels such as "Correct Answer: A (1929)" are recognized.
+8. Legacy topic falls back to chapter/category to retain source grouping in existing topic-based browsing.
+9. Original classification labels remain separately preserved in classification_original.
+
+Deploy:
+1. Back up deployed miniapp.py, question_bank.py and index.html.
+2. Replace all THREE files with the files in this bundle.
+3. Restart/redeploy the Render service.
+4. No new SQL migration is required for these code changes. Keep the earlier additive import-classification schema migration already applied.
+5. Open Admin → Import. Newly created active subjects should appear in the destination selector.
+6. Student subject cards now show newly created subjects with zero questions; their Practice/Exam buttons remain disabled until questions are imported.
+7. Preview a chapter/classification JSON before confirming import.
+
+Validation performed:
+- Python syntax compilation passed for miniapp.py and question_bank.py.
+- Local parser tests against available sample datasets:
+  * Current Affairs: 3,106 / 3,106 valid
+  * Biology: 1,601 / 1,601 valid
+  * Chemistry: 716 / 716 valid
+  * Physics: 1,773 / 1,773 valid
+  * Bihar Special: 443 / 443 valid
+- Bihar Special answer strings and fifth option were checked; answer key resolves in the sample.
+- No live PostgreSQL or Render deployment test was possible here. Run a small live preview/import after deployment before bulk importing.
+
+Important:
+This patch fixes extraction and visibility. It preserves classification labels but does not add the complete admin taxonomy-mapping/review interface discussed earlier.
