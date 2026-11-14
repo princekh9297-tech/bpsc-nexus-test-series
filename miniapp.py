@@ -2105,32 +2105,32 @@ async def admin_bulk_import(request):
                 fields[part.name]=(await part.text())
         if raw is None: return json_response({'error':'Choose a question file to upload.'},400)
         if not raw: return json_response({'error':'The selected file is empty.'},400)
-        if len(raw)>20*1024*1024: return json_response({'error':'Import files are limited to 20 MB.'},413)
+        if len(raw)>64*1024*1024: return json_response({'error':'Import files are limited to 64 MB.'},413)
         subject=str(fields.get('subject','')).strip()
         if not subject: return json_response({'error':'Choose the destination subject/collection.'},400)
         records,diag=qb.parse_file(filename,raw,subject,int(admin['id']))
-        try:
-            mapping=json.loads(fields.get('classification_mapping') or '{}')
-            if not isinstance(mapping,dict): raise ValueError()
-        except Exception: return json_response({'error':'Classification mapping must be a valid JSON object.'},400)
-        for record in records:
-            old_chapter=str(record.get('chapter') or '').strip()
-            override=mapping.get(old_chapter)
-            if isinstance(override,str): record['chapter']=override.strip() or record.get('chapter')
-            elif isinstance(override,dict):
-                for key in ('exam','category','chapter','topic','subtopic'):
-                    if key in override: record[key]=str(override.get(key) or '').strip() or None
         classification_diag=await qb.enrich_import_classifications_with_ai(records)
         match=re.search(r'invalid=(\d+)',diag); invalid=int(match.group(1)) if match else 0
         preview=str(fields.get('preview','')).lower() in ('1','true','yes')
         if preview:
-            from collections import Counter
-            chapter_counts=Counter((str(r.get('chapter') or 'Unclassified chapter').strip(),str(r.get('topic') or '').strip()) for r in records)
-            subject_counts=Counter(str(r.get('subject') or subject).strip() for r in records)
-            hierarchy=[{'chapter':ch,'topic':tp or None,'count':n} for (ch,tp),n in sorted(chapter_counts.items(),key=lambda x:(x[0][0].casefold(),x[0][1].casefold()))]
-            return json_response({'preview':True,'filename':filename,'diagnostics':diag,'detected':len(records)+invalid,'valid':len(records),'invalid':invalid,'sample':[{k:v for k,v in r.items() if k not in ('owner_id',)} for r in records[:12]],'classification':classification_diag,'ready_to_import':bool(records),'hierarchy':hierarchy,'subject_breakdown':[{'subject':k,'count':v} for k,v in sorted(subject_counts.items(),key=lambda x:x[0].casefold())]})
+            def unique_values(key):
+                vals=[]; seen=set()
+                for row in records:
+                    value=str(row.get(key) or '').strip()
+                    norm=' '.join(value.casefold().split())
+                    if value and norm not in seen: seen.add(norm); vals.append(value)
+                return vals
+            detected_taxonomy={
+                'exam':unique_values('exam'), 'subject':unique_values('subject'),
+                'category':unique_values('category'), 'chapter':unique_values('chapter'),
+                'topic':unique_values('taxonomy_topic'), 'subtopic':unique_values('subtopic'),
+                'source_exam':unique_values('source'), 'source_pages':unique_values('source_page'),
+                'chapter_count':len(unique_values('chapter')),
+                'mapping':{'section':'chapter','source_text.Subject':'subject','source_text.Chapter':'chapter','source_text.Source exam':'source_exam','source_text.Source page':'source_page'}
+            }
+            return json_response({'preview':True,'filename':filename,'diagnostics':diag,'detected':len(records)+invalid,'valid':len(records),'invalid':invalid,'sample':[{k:v for k,v in r.items() if k not in ('owner_id',)} for r in records[:12]],'classification':classification_diag,'detected_taxonomy':detected_taxonomy,'ready_to_import':bool(records)})
         file_type=filename.rsplit('.',1)[-1].lower() if '.' in filename else 'unknown'
-        result=await qb.import_records(request.app['pool'],records,int(admin['id']),filename,file_type,subject,invalid,str(fields.get('import_mode','add_all')))
+        result=await qb.import_records(request.app['pool'],records,int(admin['id']),filename,file_type,subject,invalid)
         async with request.app['pool'].connection() as conn:
             await _write_admin_audit(conn,admin['id'],'bulk_question_import',filename,result)
         return json_response({'result':result,'filename':filename,'classification':classification_diag},201)
@@ -2139,79 +2139,6 @@ async def admin_bulk_import(request):
         log.exception('Mini App bulk question import failed')
         return json_response({'error':'Import failed safely. Check that the file uses the supported template and the destination subject still exists.'},500)
 
-
-async def admin_import_profiles(request):
-    admin=request['telegram_user']
-    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
-    async with request.app['pool'].connection() as conn:
-        await conn.execute("CREATE TABLE IF NOT EXISTS question_import_mapping_profiles(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,owner_telegram_id BIGINT NOT NULL,name TEXT NOT NULL,mapping JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(owner_telegram_id,name))")
-        cur=await conn.execute("SELECT id,name,mapping FROM question_import_mapping_profiles WHERE owner_telegram_id=%s ORDER BY name",(admin['id'],)); rows=[]
-        for r in await cur.fetchall():
-            d=dict(r); d['id']=int(d['id']);
-            if not isinstance(d.get('mapping'),dict): d['mapping']=json.loads(d.get('mapping') or '{}')
-            rows.append(d)
-    return json_response({'profiles':rows})
-
-async def admin_import_profile_save(request):
-    admin=request['telegram_user']
-    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
-    try:
-        b=await request.json(); name=str(b.get('name') or '').strip()[:100]; mapping=b.get('mapping') or {}
-        if not name or not isinstance(mapping,dict): raise ValueError()
-    except Exception: return json_response({'error':'Provide a profile name and valid mapping JSON.'},400)
-    async with request.app['pool'].connection() as conn:
-        await conn.execute("CREATE TABLE IF NOT EXISTS question_import_mapping_profiles(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,owner_telegram_id BIGINT NOT NULL,name TEXT NOT NULL,mapping JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(owner_telegram_id,name))")
-        await conn.execute("INSERT INTO question_import_mapping_profiles(owner_telegram_id,name,mapping) VALUES(%s,%s,%s::jsonb) ON CONFLICT(owner_telegram_id,name) DO UPDATE SET mapping=EXCLUDED.mapping,updated_at=NOW()",(admin['id'],name,json.dumps(mapping,ensure_ascii=False)))
-    return json_response({'name':name,'saved':True})
-
-async def admin_import_rollback(request):
-    admin=request['telegram_user']
-    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
-    try: bid=int(request.match_info['batch_id'])
-    except Exception: return json_response({'error':'Invalid batch ID.'},400)
-    async with request.app['pool'].connection() as conn:
-        async with conn.transaction():
-            cur=await conn.execute("SELECT id,status FROM question_import_batches WHERE id=%s AND owner_telegram_id=%s FOR UPDATE",(bid,admin['id'])); batch=await cur.fetchone()
-            if not batch: return json_response({'error':'Batch not found.'},404)
-            if batch['status']=='rolled_back': return json_response({'error':'Batch already rolled back.'},409)
-            cur=await conn.execute("SELECT q.id, (EXISTS(SELECT 1 FROM bank_quiz_questions x WHERE x.question_id=q.id) OR EXISTS(SELECT 1 FROM bank_quiz_attempt_question_snapshots x WHERE x.question_id=q.id) OR EXISTS(SELECT 1 FROM bpsc_nexus_revision_items x WHERE x.question_id=q.id)) AS used FROM question_bank q WHERE q.import_batch_id=%s FOR UPDATE",(bid,)); rows=await cur.fetchall()
-            used=[int(r['id']) for r in rows if r['used']]; unused=[int(r['id']) for r in rows if not r['used']]
-            if used: await conn.execute("UPDATE question_bank SET status='archived',updated_at=NOW() WHERE id=ANY(%s)",(used,))
-            if unused: await conn.execute("DELETE FROM question_bank WHERE id=ANY(%s)",(unused,))
-            await conn.execute("UPDATE question_import_batches SET status='rolled_back' WHERE id=%s",(bid,))
-    return json_response({'batch_id':bid,'deleted':len(unused),'archived':len(used),'rolled_back':True})
-
-async def admin_chapter_analytics(request):
-    if not _is_series_admin(request['telegram_user']): return json_response({'error':'Admin access required.'},403)
-    subject=str(request.query.get('subject') or '').strip(); params=[]; where="status<>'archived'"
-    if subject: where+=' AND subject=%s'; params.append(subject)
-    async with request.app['pool'].connection() as conn:
-        cur=await conn.execute(f"SELECT subject,COALESCE(chapter,'Unclassified') AS chapter,COALESCE(topic,'Unclassified') AS topic,COUNT(*) AS total,COUNT(*) FILTER(WHERE status='ready') AS ready,COUNT(*) FILTER(WHERE status='pending') AS pending,COUNT(*) FILTER(WHERE classification_review_required) AS review_required FROM question_bank WHERE {where} GROUP BY subject,chapter,topic ORDER BY subject,chapter,topic LIMIT 3000",tuple(params))
-        rows=[dict(r) for r in await cur.fetchall()]
-    return json_response({'chapters':rows,'count':len(rows)})
-
-async def admin_bulk_publish_chapters(request):
-    admin=request['telegram_user']
-    if not _is_series_admin(admin): return json_response({'error':'Admin access required.'},403)
-    try:
-        b=await request.json(); subject=str(b.get('subject') or '').strip(); chapters=[str(x).strip() for x in (b.get('chapters') or []) if str(x).strip()]
-        if not subject or not chapters or len(chapters)>100: raise ValueError()
-        prefix=str(b.get('title_prefix') or subject)[:100]; duration=max(1,min(720,int(b.get('duration_minutes',60))))
-    except Exception: return json_response({'error':'Choose a subject and 1–100 chapters.'},400)
-    await qb.ensure_schema(request.app['pool']); created=[]
-    async with request.app['pool'].connection() as conn:
-        async with conn.transaction():
-            for chapter in chapters:
-                cur=await conn.execute("SELECT id FROM question_bank WHERE subject=%s AND chapter=%s AND status='ready' ORDER BY id",(subject,chapter)); ids=[int(r['id']) for r in await cur.fetchall()]
-                if not ids: continue
-                title=f'{prefix} · {chapter}'[:180]
-                cur=await conn.execute("INSERT INTO bank_quizzes(title,description,subject,created_by_telegram_id,duration_minutes,positive_marks,negative_marks,question_time_seconds,shuffle_options,is_custom,custom_owner_telegram_id,is_published,access_type) VALUES(%s,%s,%s,%s,%s,1,0.33,0,TRUE,TRUE,%s,TRUE,'free') RETURNING id",(title,f'Chapterwise quiz · {len(ids)} questions',subject,admin['id'],duration,admin['id']))
-                qid=int((await cur.fetchone())['id'])
-                for pos,question_id in enumerate(ids,1): await conn.execute("INSERT INTO bank_quiz_questions(quiz_id,question_id,position) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",(qid,question_id,pos))
-                created.append({'quiz_id':qid,'chapter':chapter,'count':len(ids),'title':title})
-            if not created: return json_response({'error':'No ready questions found in selected chapters.'},404)
-            await _write_admin_audit(conn,admin['id'],'chapter_quizzes_bulk_publish',subject,{'quizzes':created})
-    return json_response({'created':created,'count':len(created)})
 
 async def admin_questions_search(request):
     if not _is_series_admin(request['telegram_user']): return json_response({'error':'Admin access required.'},403)
@@ -2225,13 +2152,13 @@ async def admin_questions_search(request):
     if query:
         if query.isdigit(): conditions.append('q.id=%s'); params.append(int(query))
         else:
-            conditions.append("(q.question_en ILIKE %s OR COALESCE(q.question_hi,'') ILIKE %s OR COALESCE(q.topic,'') ILIKE %s OR COALESCE(q.chapter,'') ILIKE %s OR COALESCE(q.category,'') ILIKE %s OR COALESCE(q.subtopic,'') ILIKE %s OR q.subject ILIKE %s)")
-            like='%'+query.replace('%','\\%').replace('_','\\_')+'%'; params.extend([like,like,like,like,like,like,like])
+            conditions.append("(q.question_en ILIKE %s OR COALESCE(q.question_hi,'') ILIKE %s OR COALESCE(q.topic,'') ILIKE %s OR q.subject ILIKE %s)")
+            like='%'+query.replace('%','\\%').replace('_','\\_')+'%'; params.extend([like,like,like,like])
     if subject: conditions.append('q.subject=%s'); params.append(subject)
     if status!='all': conditions.append('q.status=%s'); params.append(status)
     where=(' WHERE '+' AND '.join(conditions)) if conditions else ''
     async with request.app['pool'].connection() as conn:
-        cur=await conn.execute(f"SELECT q.id,q.question_en,q.question_hi,q.subject,q.category,q.chapter,q.topic,q.subtopic,q.status,q.correct_option,q.options FROM question_bank q{where} ORDER BY q.id DESC LIMIT %s",tuple(params+[limit]))
+        cur=await conn.execute(f"SELECT q.id,q.question_en,q.question_hi,q.subject,q.topic,q.status,q.correct_option,q.options FROM question_bank q{where} ORDER BY q.id DESC LIMIT %s",tuple(params+[limit]))
         rows=[]
         for r in await cur.fetchall():
             d=dict(r); opts=d.get('options') or {}; d['options']=opts if isinstance(opts,dict) else json.loads(opts); d['id']=int(d['id']); rows.append(d)
@@ -2243,7 +2170,7 @@ async def admin_question_detail(request):
     try: qid=int(request.match_info['question_id'])
     except ValueError: return json_response({'error':'Invalid question ID.'},400)
     async with request.app['pool'].connection() as conn:
-        cur=await conn.execute("SELECT id,question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,exam,category,chapter,topic,subtopic,source,source_url,attribution,status FROM question_bank WHERE id=%s",(qid,)); r=await cur.fetchone()
+        cur=await conn.execute("SELECT id,question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status FROM question_bank WHERE id=%s",(qid,)); r=await cur.fetchone()
     if not r: return json_response({'error':'Question not found.'},404)
     d=dict(r)
     for key in ('question_structure','question_flags','options'):
@@ -2266,7 +2193,7 @@ async def admin_question_update(request):
         status=str(body.get('status','pending')).lower()
         if status not in {'ready','pending','archived'}: raise ValueError('Choose ready, pending or archived status.')
         if status=='ready' and not correct: raise ValueError('A ready question must have a correct answer.')
-        subject=str(body.get('subject','')).strip(); category=str(body.get('category','')).strip()[:250]; chapter=str(body.get('chapter','')).strip()[:250]; topic=str(body.get('topic','')).strip()[:250]; subtopic=str(body.get('subtopic','')).strip()[:250]
+        subject=str(body.get('subject','')).strip(); topic=str(body.get('topic','')).strip()[:250]
         if not subject: raise ValueError('Choose a subject/collection.')
         explanation_en=str(body.get('explanation_en','')).strip(); explanation_hi=str(body.get('explanation_hi','')).strip(); source=str(body.get('source','')).strip()[:500]; source_url=str(body.get('source_url','')).strip()[:1000]; attribution=str(body.get('attribution','')).strip()[:500]
         digest=hashlib.sha256((q_en.casefold()+'|'+json.dumps(normalized,ensure_ascii=False,sort_keys=True)+'|'+str(correct or '')).encode('utf-8')).hexdigest()
@@ -2276,12 +2203,14 @@ async def admin_question_update(request):
         async with conn.transaction():
             cur=await conn.execute("SELECT id FROM question_bank_subjects WHERE name=%s AND archived_at IS NULL",(subject,))
             if not await cur.fetchone(): return json_response({'error':'The selected subject/collection is not active.'},400)
-            # Duplicate records are allowed; the hash is informational only.
+            cur=await conn.execute("SELECT id FROM question_bank WHERE question_hash=%s AND id<>%s LIMIT 1",(digest,qid))
+            dup=await cur.fetchone()
+            if dup: return json_response({'error':f'This question already exists as #{int(dup["id"])}.','duplicate_id':int(dup['id'])},409)
             cur=await conn.execute("""UPDATE question_bank SET question_en=%s,question_hi=%s,options=%s::jsonb,correct_option=%s,
-                explanation_en=%s,explanation_hi=%s,subject=%s,category=%s,chapter=%s,topic=%s,subtopic=%s,source=%s,source_url=%s,attribution=%s,
+                explanation_en=%s,explanation_hi=%s,subject=%s,topic=%s,source=%s,source_url=%s,attribution=%s,
                 status=%s,question_hash=%s,updated_at=NOW()
                 WHERE id=%s RETURNING id,status""",
-                (q_en,q_hi,json.dumps(normalized,ensure_ascii=False),correct,explanation_en or None,explanation_hi or None,subject,category or None,chapter or None,topic or None,subtopic or None,
+                (q_en,q_hi,json.dumps(normalized,ensure_ascii=False),correct,explanation_en or None,explanation_hi or None,subject,topic or None,
                  source or None,source_url or None,attribution or None,status,digest,qid))
             row=await cur.fetchone()
             if not row: return json_response({'error':'Question not found.'},404)
@@ -3207,15 +3136,11 @@ async def quiz_builder_meta(request):
             ORDER BY LOWER(COALESCE(s.name, MIN(BTRIM(qb.subject))))
         """)
         subjects = [{'name': r['name'], 'count': int(r['count'])} for r in await cur.fetchall() if r['name']]
-        cur = await conn.execute("SELECT DISTINCT topic FROM question_bank WHERE status='ready' AND NULLIF(BTRIM(topic),'') IS NOT NULL ORDER BY topic LIMIT 500")
+        cur = await conn.execute("SELECT DISTINCT topic FROM question_bank WHERE status='ready' AND topic IS NOT NULL ORDER BY topic LIMIT 200")
         topics = [r['topic'] for r in await cur.fetchall() if r['topic']]
-        cur = await conn.execute("SELECT chapter,COUNT(*) AS count FROM question_bank WHERE status='ready' AND NULLIF(BTRIM(chapter),'') IS NOT NULL GROUP BY chapter ORDER BY chapter LIMIT 500")
-        chapters = [{'name':r['chapter'],'count':int(r['count'])} for r in await cur.fetchall()]
-        cur = await conn.execute("SELECT chapter,topic,COUNT(*) AS count FROM question_bank WHERE status='ready' AND NULLIF(BTRIM(chapter),'') IS NOT NULL GROUP BY chapter,topic ORDER BY chapter,topic LIMIT 1000")
-        chapter_topics = [{'chapter':r['chapter'],'topic':r['topic'],'count':int(r['count'])} for r in await cur.fetchall()]
         cur = await conn.execute("SELECT COUNT(*) AS n FROM question_bank qb LEFT JOIN question_bank_subjects s ON LOWER(BTRIM(s.name))=LOWER(BTRIM(qb.subject)) WHERE qb.status='ready' AND (s.id IS NULL OR (s.archived_at IS NULL AND COALESCE(s.is_suspended,FALSE)=FALSE))")
         total = int((await cur.fetchone())['n'] or 0)
-    return json_response({'subjects': subjects, 'topics': topics, 'chapters':chapters, 'chapter_topics':chapter_topics, 'total_ready': total})
+    return json_response({'subjects': subjects, 'topics': topics, 'total_ready': total})
 
 
 async def quiz_builder_create(request):
@@ -3223,7 +3148,6 @@ async def quiz_builder_create(request):
     try:
         body = await request.json()
         subject = str(body.get('subject') or 'All subjects').strip()
-        chapter = str(body.get('chapter') or '').strip()
         topic = str(body.get('topic') or '').strip()
         count = max(1, min(20000, int(body.get('count', 10))))
         selection = str(body.get('selection') or 'random').lower()
@@ -3252,8 +3176,6 @@ async def quiz_builder_create(request):
         params = []
         if subject and subject != 'All subjects':
             clauses.append('LOWER(BTRIM(subject))=LOWER(BTRIM(%s))'); params.append(subject)
-        if chapter:
-            clauses.append('chapter=%s'); params.append(chapter)
         if topic:
             clauses.append('topic=%s'); params.append(topic)
         order = 'ORDER BY RANDOM()' if selection == 'random' else 'ORDER BY id'
@@ -3626,11 +3548,6 @@ def build_app() -> web.Application:
         web.get('/api/admin/import/subjects', admin_import_subjects),
         web.post('/api/admin/import/subjects', admin_create_import_subject),
         web.post('/api/admin/import/questions', admin_bulk_import),
-        web.get('/api/admin/import/profiles', admin_import_profiles),
-        web.post('/api/admin/import/profiles', admin_import_profile_save),
-        web.post('/api/admin/import/batches/{batch_id}/rollback', admin_import_rollback),
-        web.get('/api/admin/import/chapter-analytics', admin_chapter_analytics),
-        web.post('/api/admin/import/publish-chapters', admin_bulk_publish_chapters),
         web.post('/api/admin/bulk-import', admin_bulk_import),
 
         web.get('/api/admin/questions/search', admin_questions_search),

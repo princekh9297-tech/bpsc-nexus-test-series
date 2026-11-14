@@ -28,7 +28,7 @@ from telegram.ext import ContextTypes
 
 log = logging.getLogger("bpsc_nexus_question_bank")
 MAX_QUESTIONS_PER_IMPORT = 20000
-MAX_FILE_BYTES = 20 * 1024 * 1024
+MAX_FILE_BYTES = 64 * 1024 * 1024
 LETTERS = "ABCDE"
 SUBJECTS: list[str] = []  # Loaded only from explicitly created admin subjects; imports never add to this list.
 
@@ -82,9 +82,7 @@ DDL = [
         CONSTRAINT question_bank_status_check CHECK (status IN ('ready','pending','archived')),
         CONSTRAINT question_bank_correct_check CHECK (correct_option IS NULL OR correct_option IN ('A','B','C','D','E'))
     )""",
-    # Duplicate questions are valid separate bank records; retain hash only as a lookup aid.
-    "DROP INDEX IF EXISTS uq_question_bank_hash",
-    "CREATE INDEX IF NOT EXISTS idx_question_bank_hash ON question_bank(question_hash)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_question_bank_hash ON question_bank(question_hash)",
     "CREATE INDEX IF NOT EXISTS idx_question_bank_subject_status ON question_bank(subject, status, id DESC)",
     "CREATE INDEX IF NOT EXISTS idx_question_bank_batch ON question_bank(import_batch_id)",
     "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS question_type TEXT NOT NULL DEFAULT 'unknown'",
@@ -94,11 +92,6 @@ DDL = [
     "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS classification_source TEXT NOT NULL DEFAULT 'legacy'",
     "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS classification_review_required BOOLEAN NOT NULL DEFAULT TRUE",
     "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS original_question_type TEXT",
-    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS exam TEXT",
-    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS category TEXT",
-    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS chapter TEXT",
-    "ALTER TABLE question_bank ADD COLUMN IF NOT EXISTS subtopic TEXT",
-    "CREATE INDEX IF NOT EXISTS idx_question_bank_subject_chapter_topic ON question_bank(subject, chapter, topic, subtopic, status)",
     """CREATE TABLE IF NOT EXISTS bank_quizzes (
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         title TEXT NOT NULL,
@@ -370,6 +363,52 @@ def _answer_letter(answer: Any, options: dict[str, str]) -> str | None:
     return None
 
 
+def _classification_metadata(record: dict, default_subject: str = "") -> dict:
+    """Extract the source's explicit taxonomy without confusing source-exam attribution with target exam."""
+    meta = {}
+    for key in ("source_text", "source_metadata", "metadata"):
+        value = record.get(key)
+        if isinstance(value, dict):
+            meta.update(value)
+    source_text = str(record.get("source_text") or "")
+    for line in source_text.splitlines():
+        m = re.match(r"\s*(Subject|Category|Chapter|Topic|Subtopic|Source exam|Source page|Exam)\s*:\s*(.*?)\s*$", line, re.I)
+        if m:
+            k = m.group(1).strip().lower().replace(" ", "_")
+            meta.setdefault(k, m.group(2).strip())
+    def first(*keys):
+        for key in keys:
+            val = record.get(key)
+            if val not in (None, "", [], {}): return val
+            val = meta.get(key)
+            if val not in (None, "", [], {}): return val
+        return None
+    # `exam` and `source_exam` are provenance in many exports; only explicit target_exam is a destination taxonomy.
+    subject = meta.get("subject") or first("subject", "subject_name", "subjectName") or default_subject
+    chapter = first("chapter", "chapter_name", "chapterNameEn", "section", "section_name")
+    topic = first("topic", "topic_name", "unit")
+    subtopic = first("subtopic", "sub_topic")
+    category = first("category", "category_name", "categoryName")
+    target_exam = first("target_exam", "exam_name", "examName")
+    if not target_exam and "bpsc" in str(record.get("source_pdf") or "").lower(): target_exam = "BPSC"
+    if not category and str(subject).strip().lower() in {"physics", "chemistry", "biology"}:
+        category = "General Science"
+    source_exam = first("source_exam", "source exam")
+    source_page = first("source_page", "source page")
+    return {
+        "exam": str(target_exam).strip() if target_exam else None,
+        "subject": str(subject).strip() if subject else None,
+        "category": str(category).strip() if category else None,
+        "chapter": str(chapter).strip() if chapter else None,
+        "topic": str(topic).strip() if topic else None,
+        "subtopic": str(subtopic).strip() if subtopic else None,
+        "source_exam": str(source_exam).strip() if source_exam else None,
+        "source_page": str(source_page).strip() if source_page is not None else None,
+        "source_text": source_text or None,
+        "original": {k: v for k, v in meta.items() if v not in (None, "", [], {})},
+    }
+
+
 def _normalize_record(record: Any, default_subject: str, source_name: str, owner_id: int) -> dict | None:
     if not isinstance(record, dict): return None
     q_en = _norm(_get(record, "question_en", "question", "question_text", "questiontext", "questionenglish", "prompt", "stem", "ques", "text", "q", "question_english", "english_question"))
@@ -385,13 +424,10 @@ def _normalize_record(record: Any, default_subject: str, source_name: str, owner
     correct = _answer_letter(ans, options)
     explanation_en = _norm(_get(record, "explanation_en", "explanation", "solution", "reason", "explanation_english"))
     explanation_hi = _norm(_get(record, "explanation_hi", "hindi_explanation", "explanation_hindi", "व्याख्या"))
-    subject = _norm(_get(record, "subject", "subject_name", "subjectName", default=default_subject)) or default_subject
-    exam = _norm(_get(record, "exam", "exam_name", "examName", "exam_title")) or None
-    category = _norm(_get(record, "category", "category_name", "section", "section_name", "unit_group")) or None
-    chapter = _norm(_get(record, "chapter", "chapter_name", "chapterName", "chapterNameEn", "chapter_title", "unit")) or None
-    topic = _norm(_get(record, "topic", "topic_name", "topicName", "lesson")) or None
-    subtopic = _norm(_get(record, "subtopic", "sub_topic", "subtopic_name", "subTopicName")) or None
-    source = _norm(_get(record, "source", "book", "source_name", default=source_name)) or source_name
+    taxonomy = _classification_metadata(record, default_subject)
+    subject = _norm(taxonomy.get("subject") or _get(record, "subject", "subject_name", default=default_subject)) or default_subject
+    topic = _norm(taxonomy.get("topic") or taxonomy.get("chapter") or _get(record, "topic", "chapter", "unit")) or None
+    source = _norm(_get(record, "source", "book", "exam", "source_name", default=source_name)) or source_name
     source_url = _norm(_get(record, "source_url", "url", "link")) or None
     attribution = _norm(_get(record, "attribution", "author", "credit", "publisher")) or None
     canonical = _norm(q_en).casefold() + "|" + "|".join(_norm(options.get(k, "")).casefold() for k in LETTERS)
@@ -401,8 +437,10 @@ def _normalize_record(record: Any, default_subject: str, source_name: str, owner
     qtype, qstructure, qflags = classification["question_type"], classification["question_structure"], classification["question_flags"]
     return {"question_en": q_en, "question_hi": q_hi or None, "options": options, "correct_option": correct,
             "explanation_en": explanation_en or None, "explanation_hi": explanation_hi or None,
-            "subject": subject, "exam": exam, "category": category, "chapter": chapter,
-            "topic": topic, "subtopic": subtopic, "source": source, "source_url": source_url,
+            "subject": subject, "topic": topic, "source": source, "source_url": source_url,
+            "classification_original": taxonomy, "exam": taxonomy.get("exam"), "category": taxonomy.get("category"),
+            "chapter": taxonomy.get("chapter"), "taxonomy_topic": taxonomy.get("topic"), "subtopic": taxonomy.get("subtopic"),
+            "source_page": taxonomy.get("source_page"), "source_metadata": taxonomy.get("original", {}),
             "attribution": attribution, "status": status, "question_hash": qhash, "created_by_telegram_id": owner_id,
             "question_type": qtype, "question_structure": qstructure, "question_flags": qflags,
             "classification_confidence": classification["classification_confidence"],
@@ -468,13 +506,36 @@ async def enrich_import_classifications_with_ai(records: list[dict]) -> dict:
 
 
 def _extract_json_records(obj: Any) -> list:
-    """Extract flat or nested JSON question rows without discarding hierarchy labels."""
-    rows = _generic_question_rows(obj)
-    if rows:
-        return rows
-    if isinstance(obj, dict) and any(str(k).lower() in ("question", "question_en", "question_text", "q") for k in obj):
-        return [obj]
-    raise ValueError("JSON must contain question records in a question array or a labelled exam/subject/chapter/topic hierarchy.")
+    if isinstance(obj, list): return obj
+    if isinstance(obj, dict):
+        # Common nested exports: {chapters:[{name, questions:[...]}]} or
+        # a list of chapter records. Flatten without losing chapter/topic labels.
+        for key in ("questions", "items", "data", "results", "mcqs", "records"):
+            val = obj.get(key)
+            if isinstance(val, list): return val
+        for key in ("chapters", "sections", "subjects", "topics"):
+            val = obj.get(key)
+            if isinstance(val, list):
+                flattened=[]
+                for group in val:
+                    if not isinstance(group, dict): continue
+                    group_name = group.get("name") or group.get("title") or group.get("chapterNameEn") or group.get("section") or group.get("subject") or ""
+                    group_hi = group.get("hiName") or group.get("chapterNameHi") or ""
+                    for q in group.get("questions", group.get("items", [])) or []:
+                        if isinstance(q, dict):
+                            row=dict(q)
+                            if key == "subjects":
+                                row.setdefault("subject", group_name)
+                            else:
+                                row.setdefault("chapter", group_name)
+                                row.setdefault("topic", group_name)
+                            if group_hi: row.setdefault("chapter_hi", group_hi)
+                            flattened.append(row)
+                if flattened: return flattened
+        # One question object is also accepted.
+        if any(k in {str(x).lower() for x in obj} for k in ("question", "question_en", "question_text", "q")):
+            return [obj]
+    raise ValueError("JSON must contain a question array or a single question object.")
 
 
 class _TextExtractor(HTMLParser):
@@ -568,73 +629,44 @@ class _VisibleTextExtractor(HTMLParser):
         if not self.skip and data.strip(): self.parts.append(data.strip()+" ")
 
 
-def _generic_question_rows(obj: Any, inherited: dict | None = None) -> list[dict]:
-    """Recursively discover question rows while carrying exam/subject/chapter/topic context."""
-    inherited = dict(inherited or {})
+def _generic_question_rows(obj: Any) -> list[dict]:
+    """Recursively discover question records inside common export wrappers."""
     out=[]
     question_keys={"question","question_en","question_text","questiontext","questionenglish","q","prompt","stem","ques","प्रश्न"}
-    container_keys={"questions","questionlist","question_list","mcqs","items","data","results","records","quiz","quizdata","questionbank","question_bank","allquestions","all_questions","examquestions","exam_questions","list","chapters","sections","subjects","topics","units","lessons"}
-    aliases={
-        "exam":("exam","exam_name","examname","exam_title"),
-        "subject":("subject","subject_name","subjectname"),
-        "category":("category","category_name","section","section_name"),
-        "chapter":("chapter","chapter_name","chaptername","chapternameen","chapter_title","unit"),
-        "topic":("topic","topic_name","topicname","lesson"),
-        "subtopic":("subtopic","sub_topic","subtopic_name","subtopicname"),
-    }
-    def context_for(node, ctx):
-        result=dict(ctx)
-        if not isinstance(node,dict): return result
-        low={str(k).lower().replace("-","_").replace(" ","_"):v for k,v in node.items()}
-        for target,keys in aliases.items():
-            for key in keys:
-                val=low.get(key)
-                if isinstance(val,(str,int,float)) and str(val).strip():
-                    result[target]=str(val).strip(); break
-        # Common generic wrapper labels inherit the most specific available level.
-        label=node.get("name") or node.get("title")
-        if label:
-            if "chapter" in str(node.get("type","")).lower(): result.setdefault("chapter",str(label))
-            elif "topic" in str(node.get("type","")).lower(): result.setdefault("topic",str(label))
-        return result
-    if isinstance(obj,list):
+    container_keys=("questions","questionlist","question_list","mcqs","items","data","results","records","quiz","quizdata","questionbank","question_bank","allquestions","all_questions","examquestions","exam_questions","list")
+    if isinstance(obj, list):
+        # First flatten chapter/subject wrappers while retaining their labels.
         for item in obj:
-            if isinstance(item,dict):
-                ctx=context_for(item,inherited)
-                row_keys={str(k).lower().replace(" ","_") for k in item}
-                child_key=next((str(k).lower().replace("-","_").replace(" ","_") for k,v in item.items() if isinstance(v,(dict,list)) and str(k).lower().replace("-","_").replace(" ","_") in container_keys),None)
-                node_label=item.get("name") or item.get("title") or item.get("label")
-                if node_label and child_key:
-                    if child_key in {"questions","questionlist","question_list","mcqs","items","records","allquestions","all_questions"}:
-                        if not ctx.get("chapter"):
-                            ctx["chapter"]=str(node_label).strip()
-                        elif not ctx.get("topic"):
-                            ctx["topic"]=str(node_label).strip()
-                    elif child_key in {"topics","lessons"} and not ctx.get("chapter"):
-                        ctx["chapter"]=str(node_label).strip()
-                    elif child_key in {"chapters","units"} and not ctx.get("subject"):
-                        ctx["subject"]=str(node_label).strip()
-                    elif child_key in {"sections"} and not ctx.get("category"):
-                        ctx["category"]=str(node_label).strip()
-                if row_keys & question_keys:
-                    row=dict(item)
-                    for k,v in ctx.items(): row.setdefault(k,v)
-                    out.append(row)
+            if isinstance(item, dict):
+                child_key=next((k for k in item if str(k).lower() in container_keys and isinstance(item[k],list)),None)
+                if child_key:
+                    label=item.get("chapter") or item.get("chapterNameEn") or item.get("name") or item.get("title") or item.get("subject") or item.get("section") or item.get("topic") or ""
+                    hi_label=item.get("chapterNameHi") or item.get("hiName") or item.get("subject_hi") or ""
+                    children=_generic_question_rows(item[child_key])
+                    for row in children:
+                        row.setdefault("topic",label)
+                        if hi_label: row.setdefault("topic_hi",hi_label)
+                    out.extend(children)
+                elif any(str(k).lower().replace(" ","_") in question_keys for k in item):
+                    out.append(item)
                 else:
-                    out.extend(_generic_question_rows(item,ctx))
+                    nested=_generic_question_rows(item)
+                    out.extend(nested)
+            else:
+                continue
         return out
-    if isinstance(obj,dict):
-        ctx=context_for(obj,inherited)
+    if isinstance(obj, dict):
         keys={str(k).lower().replace(" ","_") for k in obj}
         if keys & question_keys:
-            row=dict(obj)
-            for k,v in ctx.items(): row.setdefault(k,v)
-            return [row]
+            return [obj]
         for key,val in obj.items():
-            normkey=str(key).lower().replace("-","_").replace(" ","_")
-            if isinstance(val,(dict,list)) and (normkey in container_keys or isinstance(val,list)):
-                out.extend(_generic_question_rows(val,ctx))
-        return out
+            if isinstance(val,(dict,list)) and (str(key).lower().replace("-","_") in container_keys or isinstance(val,list)):
+                got=_generic_question_rows(val)
+                if got:
+                    # A wrapper label is useful as a topic/subject fallback.
+                    label=obj.get("name") or obj.get("title") or obj.get("subject") or obj.get("section") or obj.get("chapter") or ""
+                    for row in got: row.setdefault("topic",label)
+                    return got
     return out
 
 
@@ -688,18 +720,12 @@ def _adapt_generic_row(row: dict, default_subject: str, source: str) -> dict:
     if isinstance(exp,dict):
         exp_hi=exp_hi or exp.get("hi") or exp.get("hindi")
         exp=exp.get("en") or exp.get("english") or exp.get("text") or ""
-    exam=first("exam","examName","exam_name","paper")
-    subject=first("subject","subjectName","subject_name") or default_subject or "Other / Unclassified"
-    category=first("category","categoryName","category_name","section","sectionName","section_name","group")
-    chapter=first("chapter","chapterName","chapterNameEn","chapter_name","chapterTitle","unit")
-    topic=first("topic","topicName","topic_name","lesson","page","tag")
-    subtopic=first("subtopic","subTopic","sub_topic","subtopic_name")
+    subject=first("subject","subjectName","category","categoryName","section","paper","exam","group") or default_subject or "Other / Unclassified"
+    topic=first("topic","subtopic","chapter","chapterNameEn","unit","lesson","sectionName","page","tag")
     if isinstance(q,list): q="\n".join(map(str,q))
     if isinstance(qhi,list): qhi="\n".join(map(str,qhi))
     return {"question":str(q or ""),"question_hi":str(qhi or ""),"options":opts,"correct_answer":ans,
-            "explanation":str(exp or ""),"explanation_hi":str(exp_hi or ""),"exam":str(exam or ""),
-            "subject":str(subject),"category":str(category or ""),"chapter":str(chapter or ""),
-            "topic":str(topic or ""),"subtopic":str(subtopic or ""),"source":source}
+            "explanation":str(exp or ""),"explanation_hi":str(exp_hi or ""),"subject":str(subject),"topic":str(topic or ""),"source":source}
 
 
 def _html_to_records(raw: str) -> list[dict]:
@@ -722,7 +748,7 @@ def _html_to_records(raw: str) -> list[dict]:
             if isinstance(exp_parts,str): exp_parts=[exp_parts]
             explanation="\n".join(str(x) for x in exp_parts if x is not None)
             converted.append({"question":qtext or str(item.get("id") or "Question"),"options":opts,"correct_answer":correct,"explanation":explanation,
-                "subject":item.get("s") or "Other / Unclassified","chapter":item.get("c") or None,"topic":item.get("t") or None,"source":"BPSCVEERS HTML import"})
+                "subject":item.get("s") or "Other / Unclassified","topic":item.get("c") or item.get("s") or None,"source":"BPSCVEERS HTML import"})
         if converted: candidates.append(converted)
 
     # Try all embedded data scripts, not only scripts with a specific ID/type.
@@ -925,11 +951,20 @@ def _parse_member(filename: str, raw: bytes):
     ext=filename.rsplit('.',1)[-1].lower() if '.' in filename else ''
     if ext in ('json',):
         obj=json.loads(raw.decode('utf-8-sig'))
-        try: return _extract_json_records(obj)
+        try: rows=_extract_json_records(obj)
         except ValueError:
             rows=_generic_question_rows(obj)
-            if rows: return [_adapt_generic_row(r, 'Other / Unclassified', filename) for r in rows]
-            raise
+            if rows: rows=[_adapt_generic_row(r, 'Other / Unclassified', filename) for r in rows]
+            else: raise
+        if isinstance(obj, dict):
+            source_pdf=obj.get('source_pdf') or obj.get('source_file') or filename
+            root_sections=obj.get('sections') if isinstance(obj.get('sections'),list) else []
+            section_names=[str(x.get('name') or x.get('section') or x.get('title') or x).strip() for x in root_sections]
+            for row in rows:
+                if isinstance(row,dict):
+                    row.setdefault('source_pdf',source_pdf)
+                    if section_names: row.setdefault('_available_sections',section_names)
+        return rows
     if ext in ('csv','tsv'):
         text=raw.decode('utf-8-sig',errors='replace')
         sample='\n'.join(text.splitlines()[:12])
@@ -1009,7 +1044,7 @@ def _parse_member(filename: str, raw: bytes):
     raise ValueError(f'{filename}: unsupported file type.')
 
 def parse_file(filename: str, raw: bytes, subject: str, owner_id: int) -> tuple[list[dict], str]:
-    if len(raw) > MAX_FILE_BYTES: raise ValueError("File exceeds the 20 MB import limit.")
+    if len(raw) > MAX_FILE_BYTES: raise ValueError("File exceeds the 64 MB import limit.")
     ext=filename.rsplit('.',1)[-1].lower() if '.' in filename else ''
     source_files=[]
     if ext=='zip':
@@ -1110,10 +1145,37 @@ async def ensure_schema(pool):
     log.info("Question bank schema verified.")
 
 
-async def import_records(pool, records: list[dict], owner_id: int, filename: str, file_type: str, subject: str, invalid_count: int, import_mode: str = "add_all") -> dict:
+async def _upsert_taxonomy_node(conn, node_type: str, name: str, parent_id=None, exam_id=None, owner_id=None):
+    name = str(name or "").strip()
+    if not name: return None
+    norm = re.sub(r"\s+", " ", name).casefold()
+    cur = await conn.execute("SELECT id FROM taxonomy_nodes WHERE node_type=%s AND normalized_name=%s AND parent_id IS NOT DISTINCT FROM %s AND is_active=TRUE ORDER BY id LIMIT 1", (node_type,norm,parent_id))
+    row = await cur.fetchone()
+    if row: return int(row["id"])
+    cur = await conn.execute("INSERT INTO taxonomy_nodes(parent_id,exam_id,node_type,name,normalized_name,created_by_telegram_id) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id", (parent_id,exam_id,node_type,name,norm,owner_id))
+    return int((await cur.fetchone())["id"])
+
+
+async def _persist_question_taxonomy(conn, question_id: int, item: dict, owner_id: int, batch_id: int, filename: str):
+    meta=item.get("classification_original") or {}
+    exam=item.get("exam") or "BPSC"
+    exam_norm=re.sub(r"\s+"," ",str(exam)).strip().casefold()
+    cur=await conn.execute("INSERT INTO exam_catalog(name,normalized_name,created_by_telegram_id) VALUES(%s,%s,%s) ON CONFLICT(normalized_name) DO UPDATE SET name=EXCLUDED.name RETURNING id",(exam,exam_norm,owner_id))
+    exam_id=int((await cur.fetchone())["id"])
+    parent=await _upsert_taxonomy_node(conn,"exam",exam,None,exam_id,owner_id)
+    for node_type,key in (("subject","subject"),("category","category"),("chapter","chapter"),("topic","taxonomy_topic"),("subtopic","subtopic")):
+        val=item.get(key)
+        if not val: continue
+        parent=await _upsert_taxonomy_node(conn,node_type,val,parent,exam_id,owner_id)
+    cur=await conn.execute("UPDATE question_bank SET classification_original=%s::jsonb,classification_status=%s,classification_node_id=%s,source_metadata=%s::jsonb,source_page=%s WHERE id=%s RETURNING id",(json.dumps(meta,ensure_ascii=False),"classified" if item.get("chapter") or item.get("category") else "unresolved",parent,json.dumps(item.get("source_metadata") or {},ensure_ascii=False),item.get("source_page"),question_id))
+    # Keep a separate provenance row, including the original source exam (not the target exam).
+    await conn.execute("INSERT INTO question_sources(question_id,import_batch_id,source_file,source_page,source_name,source_url,attribution,original_metadata) VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",(question_id,batch_id,filename,item.get("source_page"),item.get("source"),item.get("source_url"),item.get("attribution"),json.dumps(meta,ensure_ascii=False)))
+    if parent:
+        await conn.execute("INSERT INTO question_classifications(question_id,taxonomy_node_id,is_primary,approval_status) VALUES(%s,%s,TRUE,%s) ON CONFLICT(question_id,taxonomy_node_id) DO NOTHING",(question_id,parent,"approved" if item.get("chapter") else "suggested"))
+
+
+async def import_records(pool, records: list[dict], owner_id: int, filename: str, file_type: str, subject: str, invalid_count: int) -> dict:
     if pool is None: raise RuntimeError("Database is unavailable.")
-    import_mode = str(import_mode or "add_all").lower()
-    if import_mode not in {"add_all", "add_new", "update_existing"}: raise ValueError("Invalid import mode.")
     async with pool.connection() as conn:
         async with conn.transaction():
             cur = await conn.execute("SELECT name, subject_type FROM question_bank_subjects WHERE archived_at IS NULL ORDER BY name")
@@ -1126,23 +1188,8 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
             selected_type = types.get(selected.casefold(), "subject")
             cur=await conn.execute("INSERT INTO question_import_batches(owner_telegram_id,file_name,file_type,selected_subject,total_detected,invalid_count) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id", (owner_id,filename,file_type,selected,len(records)+invalid_count,invalid_count))
             batch_id=(await cur.fetchone())["id"]
-            imported=duplicates=updated=skipped=0
-            # Hashes are used for duplicate reporting, never as a uniqueness constraint.
-            # Seed with existing bank hashes, then include repeated hashes within this file.
-            hashes=[str(item.get("question_hash") or "") for item in records if item.get("question_hash")]
-            seen_hashes=set()
-            if hashes:
-                cur=await conn.execute("SELECT question_hash FROM question_bank WHERE question_hash = ANY(%s)",(hashes,))
-                seen_hashes={str(row["question_hash"]) for row in await cur.fetchall()}
+            imported=duplicates=0
             for item in records:
-                item_hash=str(item.get("question_hash") or "")
-                existing_id=None
-                if item_hash:
-                    cur=await conn.execute("SELECT id FROM question_bank WHERE question_hash=%s ORDER BY id LIMIT 1",(item_hash,)); found=await cur.fetchone()
-                    existing_id=int(found["id"]) if found else None
-                if item_hash and item_hash in seen_hashes: duplicates+=1
-                elif item_hash: seen_hashes.add(item_hash)
-                if existing_id and import_mode == "add_new": skipped+=1; continue
                 # Imports never create taxonomy records. Unknown embedded labels map to the selected
                 # destination. For a collection, preserve labels such as "Set 001" as child topics.
                 embedded_label = str(item.get("subject") or "").strip()
@@ -1155,18 +1202,17 @@ async def import_records(pool, records: list[dict], owner_id: int, filename: str
                 else:
                     mapped_subject = allowed.get(embedded_label.casefold(), selected)
                 item["subject"] = mapped_subject
-                if existing_id and import_mode == "update_existing":
-                    await conn.execute("""UPDATE question_bank SET question_en=%s,question_hi=%s,options=%s::jsonb,correct_option=%s,explanation_en=%s,explanation_hi=%s,subject=%s,exam=%s,category=%s,chapter=%s,topic=%s,subtopic=%s,source=%s,source_url=%s,attribution=%s,updated_at=NOW() WHERE id=%s""",
-                        (item["question_en"],item["question_hi"],json.dumps(item["options"],ensure_ascii=False),item["correct_option"],item["explanation_en"],item["explanation_hi"],item["subject"],item.get("exam"),item.get("category"),item.get("chapter"),item.get("topic"),item.get("subtopic"),item["source"],item["source_url"],item["attribution"],existing_id))
-                    updated+=1; continue
-                cur=await conn.execute("""INSERT INTO question_bank(question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status,question_hash,import_batch_id,created_by_telegram_id,classification_confidence,classification_source,classification_review_required,original_question_type,exam,category,chapter,subtopic)
-                    VALUES(%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    RETURNING id""",
-                    (item["question_en"],item["question_hi"],item.get("question_type","standard"),json.dumps(item.get("question_structure",{}),ensure_ascii=False),json.dumps(item.get("question_flags",{}),ensure_ascii=False),json.dumps(item["options"],ensure_ascii=False),item["correct_option"],item["explanation_en"],item["explanation_hi"],item["subject"],item["topic"],item["source"],item["source_url"],item["attribution"],item["status"],item["question_hash"],batch_id,owner_id,item.get("classification_confidence",0.48),item.get("classification_source","needs_review"),item.get("classification_review_required",True),item.get("original_question_type",item.get("question_type","standard")),item.get("exam"),item.get("category"),item.get("chapter"),item.get("subtopic")))
-                await cur.fetchone()
-                imported+=1
+                cur=await conn.execute("""INSERT INTO question_bank(question_en,question_hi,question_type,question_structure,question_flags,options,correct_option,explanation_en,explanation_hi,subject,topic,source,source_url,attribution,status,question_hash,import_batch_id,created_by_telegram_id,classification_confidence,classification_source,classification_review_required,original_question_type)
+                    VALUES(%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(question_hash) DO NOTHING RETURNING id""",
+                    (item["question_en"],item["question_hi"],item.get("question_type","standard"),json.dumps(item.get("question_structure",{}),ensure_ascii=False),json.dumps(item.get("question_flags",{}),ensure_ascii=False),json.dumps(item["options"],ensure_ascii=False),item["correct_option"],item["explanation_en"],item["explanation_hi"],item["subject"],item["topic"],item["source"],item["source_url"],item["attribution"],item["status"],item["question_hash"],batch_id,owner_id,item.get("classification_confidence",0.48),item.get("classification_source","needs_review"),item.get("classification_review_required",True),item.get("original_question_type",item.get("question_type","standard"))))
+                inserted = await cur.fetchone()
+                if inserted:
+                    imported+=1
+                    await _persist_question_taxonomy(conn, int(inserted["id"]), item, owner_id, int(batch_id), filename)
+                else: duplicates+=1
             await conn.execute("UPDATE question_import_batches SET imported_count=%s,duplicate_count=%s WHERE id=%s",(imported,duplicates,batch_id))
-    return {"batch_id":batch_id,"detected":len(records)+invalid_count,"imported":imported,"updated":updated,"skipped":skipped,"duplicates":duplicates,"invalid":invalid_count,"pending":sum(1 for r in records if r["status"]=="pending"),"mode":import_mode}
+    return {"batch_id":batch_id,"detected":len(records)+invalid_count,"imported":imported,"duplicates":duplicates,"invalid":invalid_count,"pending":sum(1 for r in records if r["status"]=="pending")}
 
 
 def admin_keyboard():
@@ -1839,7 +1885,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, po
             subjects=await cur.fetchall()
         lines=["🧪 Question Bank Quality Audit","",f"Total records: {r['total']}",f"Verified and usable: {r['ready']}",f"Pending review: {r['pending']}",f"Archived: {r['archived']}",f"Ready without any explanation: {r['no_explanation']}",f"Ready but unclassified: {r['unclassified']}",f"Ready with invalid option count: {r['invalid_options']}","","Verified questions by subject:"]
         lines.extend(f"• {x['subject']}: {x['n']}" for x in subjects)
-        lines += ["","Note: repeated question text is allowed; each import creates a separate question-bank record. Review pending answers before publishing tests."]
+        lines += ["","Note: duplicate imports are prevented by the question hash. Review pending answers before publishing tests."]
         await q.edit_message_text("\n".join(lines)[:4000],reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Review pending",callback_data="qb:pending")],[InlineKeyboardButton("Manage questions",callback_data="qb:browse")],[InlineKeyboardButton("Back",callback_data="qb:home")]])); return
     if data == "qb:manage":
         async with pool.connection() as conn:
@@ -2268,7 +2314,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE, pool,
     if ext not in ("html","htm","json","csv","txt"):
         await message.reply_text("Unsupported file. Send .txt, .html, .htm, .json or .csv. Photo/PDF import is intentionally disabled in this phase."); return True
     if doc.file_size and doc.file_size>MAX_FILE_BYTES:
-        await message.reply_text("File exceeds the 20 MB import limit."); return True
+        await message.reply_text("File exceeds the 64 MB import limit."); return True
     try:
         tgfile=await context.bot.get_file(doc.file_id); raw=bytes(await tgfile.download_as_bytearray())
         default_subject=flow.get("subject") or (SUBJECTS[-1] if SUBJECTS else "")
@@ -2301,7 +2347,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE, pool,
         if len(source_counts)>15: mapping_lines.append(f"• … and {len(source_counts)-15} more source labels")
         mapping_text="\n".join(mapping_lines) if mapping_lines else f"• All questions → {default_subject}"
         context.user_data["qb_import_preview"]={"filename":filename,"records":records,"subject":default_subject,"invalid":invalid,"expected_duplicates":expected_duplicates}
-        await message.reply_text(f"📋 Import preview\n\nFile: {filename}\nDestination selected: {default_subject}\n\nSubject mapping (only your created subjects are accepted):\n{mapping_text}\n\nDetected: {len(records)+invalid}\nRecognized: {len(records)}\nReady for scored quizzes: {ready}\nPending answer/options verification: {pending}\nPotential duplicates (will also be imported): {expected_duplicates}\nInvalid rows skipped: {invalid}\n\nDuplicate questions are allowed and will be added as separate records. No questions have been saved yet. Confirm to import, or cancel.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm Import",callback_data="qb:confirmimport"),InlineKeyboardButton("✖ Cancel",callback_data="qb:cancelimport")]]))
+        await message.reply_text(f"📋 Import preview\n\nFile: {filename}\nDestination selected: {default_subject}\n\nSubject mapping (only your created subjects are accepted):\n{mapping_text}\n\nDetected: {len(records)+invalid}\nRecognized: {len(records)}\nReady for scored quizzes: {ready}\nPending answer/options verification: {pending}\nPotential duplicates: {expected_duplicates}\nInvalid rows skipped: {invalid}\n\nNo questions have been saved yet. Confirm to import, or cancel.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm Import",callback_data="qb:confirmimport"),InlineKeyboardButton("✖ Cancel",callback_data="qb:cancelimport")]]))
     except Exception as e:
         log.exception("Question import preview failed")
         await message.reply_text(f"Could not parse this file: {str(e)[:500]}")
@@ -2317,7 +2363,7 @@ async def confirm_import(q,context,pool,owner_id):
         invalid=int(preview.get("invalid",0))
         result=await import_records(pool,records,owner_id,preview["filename"],preview["filename"].rsplit(".",1)[-1].lower(),preview["subject"],invalid)
         context.user_data.pop("qb_import_preview",None); context.user_data.pop("qb_flow",None)
-        await q.edit_message_text("✅ Import complete\n\n"+f"Batch: #{result['batch_id']}\nDetected: {result['detected']}\nAdded: {result['imported']}\nDuplicate records also added: {result['duplicates']}\nInvalid rows: {result['invalid']}\nPending verification: {result['pending']}\n\nQuestions are stored permanently. Pending questions are excluded from scored quizzes.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Verify pending answers",callback_data="qb:pending")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]]))
+        await q.edit_message_text("✅ Import complete\n\n"+f"Batch: #{result['batch_id']}\nDetected: {result['detected']}\nAdded: {result['imported']}\nDuplicates skipped: {result['duplicates']}\nInvalid rows: {result['invalid']}\nPending verification: {result['pending']}\n\nQuestions are stored permanently. Pending questions are excluded from scored quizzes.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Verify pending answers",callback_data="qb:pending")],[InlineKeyboardButton("Question Bank menu",callback_data="qb:home")]]))
     except Exception as e:
         log.exception("Question import commit failed")
         await q.edit_message_text(f"Import failed; the database transaction was rolled back.\n\n{str(e)[:400]}",reply_markup=admin_keyboard())

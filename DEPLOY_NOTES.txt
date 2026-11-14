@@ -1,54 +1,32 @@
-BPSC NEXUS — CHAPTERWISE / TOPICWISE IMPORT UPDATE
+BPSC NEXUS — AUTO CLASSIFICATION & CHAPTER DETECTION FIX
 
-Included files:
-- question_bank.py: hierarchical classification extraction and persistence; duplicate questions remain importable.
-- miniapp.py: preview hierarchy summary, chapter/topic-aware quiz selection, and admin question search/detail/edit fields.
-- index.html: chapter filter in the quiz builder and chapter/topic breakdown in Import Studio preview.
-- 001_chapterwise_classification.sql: optional idempotent PostgreSQL migration.
+FILES IN THIS PATCH
+- question_bank.py: extracts taxonomy metadata from JSON records and source_text; detects section as chapter; persists taxonomy nodes and source provenance for newly imported questions.
+- miniapp.py: returns detected taxonomy in preview, reports unique chapter names and field mappings, and accepts 64 MB uploads.
+- index.html: shows the detected hierarchy and auto-mapping in Question Import Studio before import; updates upload limit text and validation.
+- 001_import_classification_schema.sql: additive, idempotent PostgreSQL schema migration for taxonomy and provenance tables/columns.
 
-WHAT CHANGED
-1. JSON nested structures now carry exam, subject, category, chapter, topic and subtopic context down to each question.
-2. CSV rows can supply these as separate columns; common aliases such as chapterName, chapterNameEn, topicName and subTopic are recognized.
-3. Questions are stored with separate exam/category/chapter/topic/subtopic fields. Existing topic remains available for backward compatibility.
-4. Import preview shows question counts by detected chapter and topic before confirmation.
-5. Quiz Builder now has a Chapter filter as well as Subject and Topic. Selecting a chapter creates a quiz from that chapter; adding a topic narrows it further.
-6. Duplicate questions continue to be inserted as separate records. The duplicate count is informational only.
-7. Existing questions, IDs, quiz links and attempt history are not deleted or rewritten by this update.
+AUTO-DETECTION RULES
+- target exam: explicit target_exam/exam_name when present; otherwise BPSC when source_pdf identifies a BPSC import file.
+- subject: explicit subject field or `Subject:` in source_text.
+- category: explicit category field; defaults to General Science for Physics, Chemistry and Biology.
+- chapter: explicit chapter field, otherwise `section`, otherwise `Chapter:` in source_text.
+- topic/subtopic: only populated when explicitly present.
+- `Source exam:` is retained as source provenance. It is NOT treated as the target exam.
+- `Source page:` is retained in source metadata and question_sources.
+- Existing question IDs, quiz links, attempts and question text are not rewritten. Duplicate question hashes continue to be skipped as before.
 
-DEPLOY
-1. Back up the current app and PostgreSQL database.
-2. Replace question_bank.py, miniapp.py and the frontend index.html.
-3. IMPORTANT: miniapp.py serves static/index.html if that file exists; otherwise it serves root index.html. Put the updated HTML in the active served location. If your repository has both, update both or confirm which one is deployed.
-4. Restart/redeploy the service. qb.ensure_schema() applies the additive columns and indexes on startup.
-5. Optional: run 001_chapterwise_classification.sql manually if you prefer an explicit migration. Do not needlessly run both; the SQL is idempotent.
-6. Preview a nested chapter JSON and a CSV with chapter/topic columns. Confirm the preview breakdown before import.
-7. Open Quiz Builder, select subject, chapter and optionally topic, then create/publish the quiz using the existing flow.
+DEPLOY STEPS
+1. Back up the current deployed files and PostgreSQL database.
+2. Replace deployed question_bank.py, miniapp.py and index.html with these exact files.
+3. Run 001_import_classification_schema.sql against the same PostgreSQL database. It is additive and idempotent. The application startup schema routine also contains the same additions.
+4. Restart/redeploy the service.
+5. Open Admin → Question Import Studio, select the destination subject, upload a JSON file, and click Preview extraction.
+6. Verify detected Exam / Subject / Category / Chapter values and the unique chapter count before Confirm & Import.
+7. Test with a small file first. Do not re-import the same questions expecting duplicates to be added; the existing question_hash uniqueness behavior is preserved.
 
-VALIDATION
+VALIDATION PERFORMED
 - Python syntax compilation passed for question_bank.py and miniapp.py.
-- Local parser fixture passed for a nested BPSC > General Science > Physics/Chemistry > topic > question JSON structure, including inherited chapter/topic labels and answer normalization.
-- SQL placeholder count was reviewed for the extended question insert.
-- No live PostgreSQL, browser end-to-end or Render deployment test was available. Test a small sample before bulk import.
-
-IMPORTANT LIMITS
-- Automatic detection relies on explicit labels or conventional nested wrappers. If a file has unlabelled arrays or arbitrary field names, preview may show “Unclassified chapter”; admin must correct the source or classification before import.
-- This update adds chapter/topic filtering to the existing Quiz Builder. It does not yet add a dedicated chapter catalogue management screen, drag-and-drop remapping, or a separate one-click “publish all chapters as individual quizzes” batch wizard.
-
-ADDITIONAL ADMIN IMPORT TOOLS IN THIS BUILD
-8. Import modes are available in Import Studio:
-   - Add Everything: inserts every valid row, including duplicates.
-   - Add New Only: skips rows whose normalized question hash already exists.
-   - Update Existing: updates the first matching existing record while retaining its question ID and linked history. Review carefully before using this mode.
-9. Classification Editor accepts a JSON mapping keyed by the detected chapter label. Example:
-   {"Old chapter":{"chapter":"Correct chapter","topic":"Correct topic"}}
-   The mapping is applied to preview and again at import confirmation. Named mapping profiles can be saved and reloaded in the UI.
-10. Chapterwise publishing accepts exact chapter names, one per line, and creates one published quiz for each selected chapter with ready questions.
-11. Chapter analytics reports total, ready, pending and review-required counts grouped by subject/chapter/topic.
-12. Import rollback deletes unreferenced questions from a selected batch and archives questions already linked to quizzes, attempts or revision history. It does not reverse rows updated by the Update Existing mode; use a database backup before that mode.
-13. Manual question editing no longer blocks saving a duplicate question; hashes remain useful for reporting, not uniqueness.
-
-LIMITATIONS / TESTING
-- ZIP remains the supported way to submit multiple source files in one import. The file picker accepts one file at a time.
-- Classification mapping is chapter-label based. It supports renaming/mapping chapter and its topic metadata, but it is not a full drag-and-drop taxonomy tree editor.
-- Bulk chapter publishing creates quizzes for the exact chapter names entered; it does not infer chapter selection from the preview automatically.
-- The update-existing mode and bulk publishing have passed syntax/static checks only. No live database or browser/Render end-to-end test was available. Test with a small sample and a database backup first.
+- JavaScript syntax checks passed for all inline scripts in index.html.
+- Parser tests passed against the available Physics (1,773 questions), Biology (1,601 questions), and Chemistry (716 questions) JSON files: zero invalid rows in each; chapter names detected; subject/category/target exam mapped as above.
+- Live PostgreSQL migration and production end-to-end deployment were not available in this environment. Back up before deployment and run the staged test import.
